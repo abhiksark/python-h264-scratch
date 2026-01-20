@@ -6,12 +6,18 @@ An educational H.264 Baseline profile decoder implemented in Python/NumPy.
 
 This project implements an H.264 video decoder from scratch for educational purposes. The goal is to understand video compression by building each component of the decoding pipeline.
 
-**Scope:**
+**Current Status:**
 - Decoder only (no encoder)
 - Baseline profile (CAVLC entropy coding)
-- I-frames fully supported, P-frames planned
+- **I_16x16 macroblocks only** (I_4x4 not yet implemented)
+- I-frames only (P/B-frames not implemented)
 - Input: Raw Annex B bitstream (`.264`/`.h264` files)
 - Output: NumPy arrays (YUV 4:2:0 and RGB)
+
+**Limitations:**
+- Cannot decode most real-world videos (which use P/B-frames)
+- Complex gradients may have artifacts (~33% accuracy)
+- No deblocking filter
 
 ## Project Structure
 

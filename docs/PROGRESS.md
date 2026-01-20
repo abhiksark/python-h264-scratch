@@ -1,116 +1,116 @@
-# h264/docs/PROGRESS.md
 # Implementation Progress
+
+## Current Status
+
+**Working:** I-frame only decoder for Baseline profile (I_16x16 macroblocks)
+**Tests:** 423 passing
+
+## What Works
+
+| Feature | Status | Notes |
+|---------|--------|-------|
+| NAL unit parsing | ✅ | Start codes, emulation prevention |
+| SPS/PPS parsing | ✅ | Baseline through High profile syntax |
+| Slice header parsing | ✅ | I-slices fully supported |
+| CAVLC entropy decoding | ✅ | All VLC tables |
+| Inverse quantization | ✅ | QP 0-51, DC/AC scaling |
+| 4x4 Integer IDCT | ✅ | Spec-compliant |
+| Hadamard transforms | ✅ | 4x4 (luma DC), 2x2 (chroma DC) |
+| I_16x16 prediction | ✅ | All 4 modes (V, H, DC, Plane) |
+| Chroma prediction | ✅ | All 4 modes |
+| YCbCr → RGB | ✅ | BT.601 and BT.709 |
+| Multi-MB frames | ✅ | Neighbor pixel handling |
+
+## What Does NOT Work
+
+| Feature | Status | Notes |
+|---------|--------|-------|
+| I_4x4 macroblocks | ❌ | 9 prediction modes not implemented |
+| I_8x8 macroblocks | ❌ | High profile only |
+| P-frames | ❌ | Motion compensation not implemented |
+| B-frames | ❌ | Bi-directional prediction not implemented |
+| CABAC entropy | ❌ | Main/High profile only |
+| Deblocking filter | ❌ | Post-processing not implemented |
+| Multiple slices | ⚠️ | Untested |
+| Multiple frames | ⚠️ | Only first frame decoded |
+| Interlaced video | ❌ | Frame-only |
+
+## Known Issues
+
+| Issue | Severity | Description |
+|-------|----------|-------------|
+| Gradient DC coefficients | Medium | Complex horizontal gradients decode at ~33% accuracy. DC coefficient scan order issue for I_16x16 blocks with internal variation. Simple uniform blocks work 100%. |
 
 ## Module Status
 
-| Module | Status | Functions Done | Tests | Notes |
-|--------|--------|----------------|-------|-------|
-| bitstream/ | ✅ Complete | nal_parser, bit_reader, numpy_bit_reader | 106 ✅ | NAL parsing, pure NumPy |
-| parameters/ | ✅ Complete | sps.py, pps.py | 45 ✅ | SPS/PPS parsing |
-| slice/ | ✅ Complete | slice_header.py | 28 ✅ | Slice header parsing |
-| entropy/ | ✅ Complete | cavlc.py, tables.py | 35 ✅ | CAVLC decoding |
-| dequant/ | ✅ Complete | dequant_4x4, dequant_dc_4x4, dequant_dc_2x2 | 25 ✅ | QP 0-51 |
-| transform/ | ✅ Complete | idct_4x4, hadamard_4x4, hadamard_2x2 | 26 ✅ | Integer IDCT |
-| intra/ | ✅ Complete | predict_intra_16x16 (4 modes) | 33 ✅ | All I16x16 modes |
-| inter/ | 🔒 Future | - | - | P-frame support |
-| reconstruct/ | ✅ Complete | decode_macroblock, reconstruct_i16x16_luma, reconstruct_chroma | 34 ✅ | I_16x16 reconstruction |
-| color/ | ✅ Complete | ycbcr_to_rgb, rgb_to_ycbcr, upsample, subsample | 15 ✅ | BT.601 & BT.709 |
-| decoder/ | ✅ Complete | H264Decoder, decode_h264_file, decode_h264_bytes | 18 ✅ | I-frame decoder |
+| Module | Status | Key Functions |
+|--------|--------|---------------|
+| bitstream/ | ✅ Complete | `extract_nal_units`, `BitReader`, `NumpyBitReader` |
+| parameters/ | ✅ Complete | `parse_sps`, `parse_pps` |
+| slice/ | ✅ Complete | `parse_slice_header` |
+| entropy/ | ✅ Complete | `decode_residual_block`, `decode_coeff_token` |
+| dequant/ | ✅ Complete | `dequant_4x4`, `dequant_dc_4x4` |
+| transform/ | ✅ Complete | `idct_4x4`, `hadamard_4x4`, `hadamard_2x2` |
+| intra/ | 🟡 Partial | `predict_intra_16x16` (I_4x4 missing) |
+| inter/ | ❌ Not Started | Motion compensation |
+| reconstruct/ | 🟡 Partial | `reconstruct_i16x16_luma` (I_4x4 missing) |
+| color/ | ✅ Complete | `ycbcr_to_rgb`, `upsample_420` |
+| decoder/ | 🟡 Partial | `decode_h264_bytes` (I-frames only) |
+| test_utils/ | ✅ Complete | `compare_with_jm`, `load_yuv_420` |
 
-**Total: 365 tests passing**
+## Decoder Accuracy
 
-### Status Legend
-- ⬜ Not Started
-- 🟡 In Progress
-- ✅ Complete
-- 🔒 Future (not in current scope)
+Tested against JM reference decoder:
 
-## Phase Progress
+| Test Video | Resolution | Match | Notes |
+|------------|------------|-------|-------|
+| quadrant_32x32 | 32×32 | ✅ 100% | 4 uniform regions |
+| double_gray_32x16 | 32×16 | ✅ 100% | 2 uniform regions |
+| gradient_128x128 | 128×128 | ❌ 33% | Complex gradient |
 
-### Track A: NumPy Components ✅
-- [x] A.1: color/yuv_to_rgb.py ✅ (15 tests)
-- [x] A.2: dequant/dequant.py ✅ (25 tests)
-- [x] A.3: transform/idct_4x4.py ✅ (26 tests)
-- [x] A.4: intra/intra_16x16.py ✅ (33 tests)
+## Implementation Phases
 
-### Track B: Bitstream Parsing ✅
-- [x] B.1: bitstream/nal_parser.py ✅ (34 tests)
-- [x] B.2: bitstream/bit_reader.py ✅ (29 tests)
-- [x] B.3: parameters/sps.py ✅ (28 tests)
-- [x] B.4: parameters/pps.py ✅ (17 tests)
-- [x] B.5: slice/slice_header.py ✅ (28 tests)
+### ✅ Phase 1: Core Components
+- [x] NAL parsing
+- [x] SPS/PPS parsing
+- [x] Slice header parsing
+- [x] CAVLC decoding
+- [x] Dequantization
+- [x] IDCT transforms
+- [x] I_16x16 prediction
+- [x] Color conversion
 
-### Phase 2: Pipeline Integration ✅
-- [x] 2.1: entropy/cavlc.py ✅ (35 tests)
-- [x] 2.2: reconstruct/macroblock.py ✅ (34 tests)
-- [x] 2.3: decoder/decoder.py ✅ (18 tests)
+### 🟡 Phase 2: Complete I-frame Support
+- [ ] I_4x4 prediction (9 modes)
+- [ ] Fix gradient DC coefficient issue
+- [ ] I_PCM macroblocks
 
-### Phase 3: Replace Libraries ✅
-- [x] 3.1: bitstream/numpy_bit_reader.py ✅ (43 tests)
-- [x] 3.2: NumPy Exp-Golomb ✅ (built into NumpyBitReader)
-- [x] 3.3: NumPy CAVLC ✅ (uses BitReader interface)
+### ❌ Phase 3: P-frame Support
+- [ ] Motion vector prediction
+- [ ] Motion compensation
+- [ ] Reference frame buffer
+- [ ] Inter prediction modes
 
-## Test Coverage
+### ❌ Phase 4: Polish
+- [ ] Deblocking filter
+- [ ] Multiple slice support
+- [ ] Streaming decoder API
+- [ ] Error resilience
 
-| Module | Unit Tests | Reference Tests | Edge Cases |
-|--------|------------|-----------------|------------|
-| color/ | 15 ✅ | - | ✅ |
-| dequant/ | 25 ✅ | - | ✅ |
-| transform/ | 26 ✅ | - | ✅ |
-| intra/ | 33 ✅ | - | ✅ |
-| bitstream/ | 106 ✅ | - | ✅ |
-| parameters/ | 45 ✅ | - | ✅ |
-| slice/ | 28 ✅ | - | ✅ |
-| entropy/ | 35 ✅ | - | ✅ |
-| reconstruct/ | 34 ✅ | - | ✅ |
-| decoder/ | 18 ✅ | - | ✅ |
+## Test Breakdown
 
-## Component Details
-
-### bitstream/nal_parser.py
-- `find_start_codes()` - Detect 3/4-byte start codes
-- `remove_emulation_prevention_bytes()` - RBSP extraction
-- `parse_nal_header()` - NAL header byte parsing
-- `extract_nal_units()` - Full NAL extraction from bitstream
-- `NALUnit` dataclass with type/VCL/IDR properties
-
-### bitstream/bit_reader.py
-- `BitReader` - Bit-level reading with position tracking
-- `read_ue()` / `read_se()` / `read_te()` - Exp-Golomb decoding
-- `BitWriter` - Test data generation
-- Uses bitstring library (to be replaced with NumPy)
-
-### parameters/sps.py
-- `SPS` dataclass - All SPS fields with derived properties
-- `VUIParameters` - Video Usability Information
-- `parse_sps()` - Full SPS parsing (Baseline through High profile)
-- Dimension calculations with cropping support
-
-### parameters/pps.py
-- `PPS` dataclass - All PPS fields
-- `parse_pps()` - Full PPS parsing
-- Entropy coding mode, QP settings, deblocking config
-
-### slice/slice_header.py
-- `SliceType` enum with normalize, is_i/p/b helpers
-- `SliceHeader` dataclass with slice-level parameters
-- `parse_slice_header()` - Full slice header parsing
-- POC parsing (type 0, 1, 2), reference picture management
-- Deblocking filter parameters
-
-### entropy/cavlc.py
-- `decode_coeff_token()` - Context-adaptive VLC decoding
-- `decode_trailing_ones_signs()` - Sign bits for trailing ±1s
-- `decode_levels()` - Adaptive level decoding with suffix length
-- `decode_total_zeros()` - Zero count before last coefficient
-- `decode_run_before()` - Zero runs between coefficients
-- `decode_residual_block()` - Complete block decoding
-- `decode_residual_4x4()` - 4x4 block with zigzag reordering
-- `decode_chroma_dc()` - 2x2 chroma DC block
-- `calculate_nC()` - Context calculation from neighbors
-
-### entropy/tables.py
-- `COEFF_TOKEN_*` - VLC tables for coeff_token (nC ranges)
-- `TOTAL_ZEROS_*` - VLC tables for total_zeros
-- `RUN_BEFORE` - VLC tables for run_before
-- `ZIGZAG_4x4` / `ZIGZAG_2x2` - Scan order arrays
+```
+bitstream/     106 tests
+parameters/     45 tests
+slice/          28 tests
+entropy/        35 tests
+dequant/        25 tests
+transform/      26 tests
+intra/          33 tests
+reconstruct/    34 tests
+color/          15 tests
+decoder/        27 tests (includes JM comparison)
+test_utils/      9 tests
+─────────────────────────
+Total:         423 tests
+```
