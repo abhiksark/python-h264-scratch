@@ -1,0 +1,15 @@
+# h264/requirements.txt
+# H.264 Baseline Decoder - Dependencies
+
+# Core
+numpy>=1.24.0
+
+# Scaffolding (to be replaced with NumPy later)
+bitstring>=4.0.0
+
+# Visualization
+Pillow>=10.0.0
+
+# Testing
+pytest>=7.0.0
+pytest-cov>=4.0.0
