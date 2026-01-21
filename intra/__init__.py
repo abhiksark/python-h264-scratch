@@ -42,6 +42,15 @@ from .intra_8x8 import (
     intra_8x8_horizontal_down,
     intra_8x8_vertical_left,
     intra_8x8_horizontal_up,
+    # Lowpass filtering (High profile)
+    lowpass_filter_8x8,
+    # Filtered diagonal modes
+    intra_8x8_diagonal_down_left_filtered,
+    intra_8x8_diagonal_down_right_filtered,
+    # Availability-safe variants
+    intra_8x8_vertical_safe,
+    intra_8x8_horizontal_safe,
+    intra_8x8_diagonal_down_right_safe,
 )
 
 __all__ = [
@@ -79,4 +88,13 @@ __all__ = [
     "intra_8x8_horizontal_down",
     "intra_8x8_vertical_left",
     "intra_8x8_horizontal_up",
+    # 8x8 lowpass filtering
+    "lowpass_filter_8x8",
+    # 8x8 filtered diagonal modes
+    "intra_8x8_diagonal_down_left_filtered",
+    "intra_8x8_diagonal_down_right_filtered",
+    # 8x8 availability-safe variants
+    "intra_8x8_vertical_safe",
+    "intra_8x8_horizontal_safe",
+    "intra_8x8_diagonal_down_right_safe",
 ]

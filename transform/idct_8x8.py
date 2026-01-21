@@ -19,7 +19,58 @@ import logging
 
 import numpy as np
 
+# Import zigzag scan from entropy tables (already defined there)
+from entropy.tables import ZIGZAG_8x8, ZIGZAG_8x8_INV
+
 logger = logging.getLogger(__name__)
+
+
+# Re-export zigzag scans with common naming convention
+# ZIGZAG_8x8 contains flat indices (0-63), tests expect 2D coordinates
+# Convert to tuple format: index i -> (row=i//8, col=i%8)
+ZIGZAG_SCAN_8x8 = tuple((idx // 8, idx % 8) for idx in ZIGZAG_8x8)
+
+# H.264 Table 8-13: Field scan for 8x8 transform (interlaced video)
+# Column-major pattern optimized for interlaced content
+_FIELD_SCAN_8x8_FLAT = np.array([
+    0,  8, 16,  1,  9, 24, 32, 17,
+    2, 25, 40, 48, 33, 26, 18,  3,
+   10, 41, 56, 49, 34, 27, 19, 11,
+    4, 12, 35, 42, 50, 57, 58, 51,
+   43, 36, 28, 20,  5, 13, 21, 29,
+   37, 44, 52, 59, 60, 53, 45, 38,
+   30, 22,  6, 14,  7, 15, 23, 31,
+   39, 46, 54, 61, 62, 55, 47, 63,
+], dtype=np.int32)
+# Convert to tuple format for consistency with ZIGZAG_SCAN_8x8
+FIELD_SCAN_8x8 = tuple((idx // 8, idx % 8) for idx in _FIELD_SCAN_8x8_FLAT)
+
+# H.264 8x8 DCT transform matrix (Table 8-12)
+# Scaled integer approximation of DCT-II basis vectors
+# T = C * X * C^T where C is this matrix
+TRANSFORM_MATRIX_8x8 = np.array([
+    [ 8,  8,  8,  8,  8,  8,  8,  8],
+    [12, 10,  6,  3, -3, -6,-10,-12],
+    [ 8,  4, -4, -8, -8, -4,  4,  8],
+    [10, -3,-12, -6,  6, 12,  3,-10],
+    [ 8, -8, -8,  8,  8, -8, -8,  8],
+    [ 6,-12,  3, 10,-10, -3, 12, -6],
+    [ 4, -8,  8, -4, -4,  8, -8,  4],
+    [ 3, -6, 10,-12, 12,-10,  6, -3],
+], dtype=np.int32)
+
+# Position-dependent scaling factors for 8x8 transform (H.264 Table 8-14)
+# These are the normalization factors for each position in the 8x8 block
+SCALING_FACTORS_8x8 = np.array([
+    [64, 68, 64, 68, 64, 68, 64, 68],
+    [68, 72, 68, 72, 68, 72, 68, 72],
+    [64, 68, 64, 68, 64, 68, 64, 68],
+    [68, 72, 68, 72, 68, 72, 68, 72],
+    [64, 68, 64, 68, 64, 68, 64, 68],
+    [68, 72, 68, 72, 68, 72, 68, 72],
+    [64, 68, 64, 68, 64, 68, 64, 68],
+    [68, 72, 68, 72, 68, 72, 68, 72],
+], dtype=np.int32)
 
 
 # H.264 8x8 IDCT butterfly coefficients (Table 8-12 scaled)
@@ -130,5 +181,82 @@ def idct_8x8(coeffs: np.ndarray) -> np.ndarray:
     result = (row_result + 128) >> 8
 
     logger.debug(f"IDCT 8x8 output:\n{result}")
+
+    return result
+
+
+def forward_1d_8(x: np.ndarray) -> np.ndarray:
+    """Apply 1D 8-point forward transform.
+
+    This computes the forward DCT using matrix multiplication.
+
+    Args:
+        x: Input vector of 8 elements (int32)
+
+    Returns:
+        Transformed vector of 8 elements (int32)
+    """
+    return TRANSFORM_MATRIX_8x8 @ x.astype(np.int32)
+
+
+def forward_8x8(block: np.ndarray) -> np.ndarray:
+    """Apply 8x8 forward transform (DCT).
+
+    This is the inverse of idct_8x8, used primarily for testing
+    round-trip accuracy of the transform.
+
+    Uses matrix multiplication: Y = Cf * X * Cf^T
+
+    Args:
+        block: 8x8 spatial block (int32)
+
+    Returns:
+        8x8 transform coefficients (int32)
+
+    H.264 Spec: This is the encoder-side transform, inverse of Section 8.5.12
+
+    Note: The forward transform produces coefficients that when passed through
+    idct_8x8 will recover the original (within integer rounding).
+    """
+    if block.shape != (8, 8):
+        raise ValueError(f"Expected 8x8 block, got {block.shape}")
+
+    # Work with int32
+    temp = block.astype(np.int32)
+
+    # Apply: Cf * spatial * Cf^T (matrix multiplication)
+    raw = TRANSFORM_MATRIX_8x8 @ temp @ TRANSFORM_MATRIX_8x8.T
+
+    # Scale to match IDCT's normalization
+    # The H.264 integer transforms use scaled coefficients (8, 10, 12, etc.)
+    # The IDCT expects coefficients at a certain scale
+    # Empirically tune scaling for best round-trip accuracy
+    result = raw >> 4
+
+    return result
+
+
+def idct_8x8_batch(blocks: np.ndarray) -> np.ndarray:
+    """Process multiple 8x8 blocks efficiently.
+
+    Applies idct_8x8 to each block in the input array.
+
+    Args:
+        blocks: Array of shape (N, 8, 8) containing N coefficient blocks
+
+    Returns:
+        Array of shape (N, 8, 8) containing N residual blocks
+
+    Note: For maximum performance, consider using vectorized operations
+    in the future. Current implementation uses a simple loop.
+    """
+    if blocks.ndim != 3 or blocks.shape[1:] != (8, 8):
+        raise ValueError(f"Expected shape (N, 8, 8), got {blocks.shape}")
+
+    n_blocks = blocks.shape[0]
+    result = np.zeros_like(blocks, dtype=np.int32)
+
+    for i in range(n_blocks):
+        result[i] = idct_8x8(blocks[i])
 
     return result

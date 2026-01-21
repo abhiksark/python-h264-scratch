@@ -451,6 +451,210 @@ def intra_8x8_horizontal_up(left: np.ndarray) -> np.ndarray:
     return np.clip(pred, 0, 255).astype(np.uint8)
 
 
+def lowpass_filter_8x8(
+    top: np.ndarray,
+    left: np.ndarray,
+    top_left: int,
+    top_right: Optional[np.ndarray] = None,
+) -> dict:
+    """Apply 3-tap lowpass filter to reference samples for 8x8 intra prediction.
+
+    H.264 Spec Reference: Section 8.3.4.2.2 - Reference sample filtering
+
+    The lowpass filter smooths reference samples before diagonal prediction modes.
+    This reduces blocking artifacts at block boundaries.
+
+    Filter formula: filtered[i] = (p[i-1] + 2*p[i] + p[i+1] + 2) >> 2
+
+    Args:
+        top: Top neighbors (8 pixels)
+        left: Left neighbors (8 pixels)
+        top_left: Corner pixel M
+        top_right: Top-right neighbors (8 pixels) or None
+
+    Returns:
+        dict with keys:
+            'top': Filtered top samples (8 pixels)
+            'left': Filtered left samples (8 pixels)
+            'top_left': Filtered corner sample
+    """
+    # Convert to int32 for computation
+    t = np.array(top[:8], dtype=np.int32)
+    l = np.array(left[:8], dtype=np.int32)
+    M = int(top_left)
+
+    # Handle top-right availability
+    if top_right is not None:
+        tr = np.array(top_right[:8], dtype=np.int32)
+    else:
+        # Replicate top[7] if top-right not available
+        tr = np.full(8, t[7], dtype=np.int32)
+
+    # Filtered arrays
+    filtered_top = np.zeros(8, dtype=np.int32)
+    filtered_left = np.zeros(8, dtype=np.int32)
+
+    # Filter corner sample: (left[0] + 2*M + top[0] + 2) >> 2
+    filtered_corner = (l[0] + 2 * M + t[0] + 2) >> 2
+
+    # Filter top samples
+    # Top[0]: (M + 2*top[0] + top[1] + 2) >> 2
+    filtered_top[0] = (M + 2 * t[0] + t[1] + 2) >> 2
+    # Top[1..6]: (top[i-1] + 2*top[i] + top[i+1] + 2) >> 2
+    for i in range(1, 7):
+        filtered_top[i] = (t[i - 1] + 2 * t[i] + t[i + 1] + 2) >> 2
+    # Top[7]: (top[6] + 2*top[7] + top_right[0] + 2) >> 2
+    filtered_top[7] = (t[6] + 2 * t[7] + tr[0] + 2) >> 2
+
+    # Filter left samples
+    # Left[0]: (M + 2*left[0] + left[1] + 2) >> 2
+    filtered_left[0] = (M + 2 * l[0] + l[1] + 2) >> 2
+    # Left[1..6]: (left[i-1] + 2*left[i] + left[i+1] + 2) >> 2
+    for i in range(1, 7):
+        filtered_left[i] = (l[i - 1] + 2 * l[i] + l[i + 1] + 2) >> 2
+    # Left[7]: (left[6] + 3*left[7] + 2) >> 2 (replicate edge)
+    filtered_left[7] = (l[6] + 3 * l[7] + 2) >> 2
+
+    return {
+        'top': np.clip(filtered_top, 0, 255).astype(np.uint8),
+        'left': np.clip(filtered_left, 0, 255).astype(np.uint8),
+        'top_left': int(np.clip(filtered_corner, 0, 255)),
+    }
+
+
+def intra_8x8_diagonal_down_left_filtered(
+    top: np.ndarray,
+    top_right: Optional[np.ndarray] = None,
+    left: Optional[np.ndarray] = None,
+    top_left: int = DEFAULT_PIXEL_VALUE,
+) -> np.ndarray:
+    """Mode 3: Diagonal Down-Left with filtered reference samples.
+
+    Applies lowpass filtering before prediction as per High profile requirements.
+
+    Args:
+        top: Top neighbors (8 pixels)
+        top_right: Top-right neighbors (8 pixels) or None
+        left: Left neighbors (8 pixels), used only for filtering
+        top_left: Corner pixel, used only for filtering
+
+    Returns:
+        8x8 prediction block
+    """
+    # Use left for filtering, default to DC if not provided
+    if left is None:
+        left = np.full(8, DEFAULT_PIXEL_VALUE, dtype=np.uint8)
+
+    filtered = lowpass_filter_8x8(top, left, top_left, top_right)
+
+    # DDL uses filtered top samples
+    return intra_8x8_diagonal_down_left(filtered['top'], top_right)
+
+
+def intra_8x8_diagonal_down_right_filtered(
+    top: np.ndarray,
+    left: np.ndarray,
+    top_left: int,
+    top_right: Optional[np.ndarray] = None,
+) -> np.ndarray:
+    """Mode 4: Diagonal Down-Right with filtered reference samples.
+
+    Applies lowpass filtering before prediction as per High profile requirements.
+
+    Args:
+        top: Top neighbors (8 pixels)
+        left: Left neighbors (8 pixels)
+        top_left: Corner pixel
+        top_right: Top-right neighbors (8 pixels) or None
+
+    Returns:
+        8x8 prediction block
+    """
+    filtered = lowpass_filter_8x8(top, left, top_left, top_right)
+
+    # DDR uses filtered top, left, and corner
+    return intra_8x8_diagonal_down_right(
+        filtered['top'],
+        filtered['left'],
+        filtered['top_left'],
+    )
+
+
+def intra_8x8_vertical_safe(
+    top: Optional[np.ndarray] = None,
+    top_available: bool = True,
+) -> np.ndarray:
+    """Mode 0: Vertical prediction with availability check.
+
+    Returns DC prediction (128) if top neighbors are unavailable.
+
+    Args:
+        top: Top neighbors (8 pixels) or None
+        top_available: Whether top neighbors are available
+
+    Returns:
+        8x8 prediction block
+    """
+    if not top_available or top is None:
+        return np.full((8, 8), DEFAULT_PIXEL_VALUE, dtype=np.uint8)
+    return intra_8x8_vertical(top)
+
+
+def intra_8x8_horizontal_safe(
+    left: Optional[np.ndarray] = None,
+    left_available: bool = True,
+) -> np.ndarray:
+    """Mode 1: Horizontal prediction with availability check.
+
+    Returns DC prediction (128) if left neighbors are unavailable.
+
+    Args:
+        left: Left neighbors (8 pixels) or None
+        left_available: Whether left neighbors are available
+
+    Returns:
+        8x8 prediction block
+    """
+    if not left_available or left is None:
+        return np.full((8, 8), DEFAULT_PIXEL_VALUE, dtype=np.uint8)
+    return intra_8x8_horizontal(left)
+
+
+def intra_8x8_diagonal_down_right_safe(
+    top: Optional[np.ndarray] = None,
+    left: Optional[np.ndarray] = None,
+    top_left: Optional[int] = None,
+    top_available: bool = True,
+    left_available: bool = True,
+    top_left_available: bool = True,
+) -> np.ndarray:
+    """Mode 4: DDR prediction with availability check.
+
+    DDR requires all three neighbor sets (top, left, corner).
+    Returns DC prediction (128) if any required neighbor is unavailable.
+
+    Args:
+        top: Top neighbors (8 pixels) or None
+        left: Left neighbors (8 pixels) or None
+        top_left: Corner pixel or None
+        top_available: Whether top neighbors are available
+        left_available: Whether left neighbors are available
+        top_left_available: Whether corner is available
+
+    Returns:
+        8x8 prediction block
+    """
+    if not (top_available and left_available and top_left_available):
+        return np.full((8, 8), DEFAULT_PIXEL_VALUE, dtype=np.uint8)
+    if top is None or left is None:
+        return np.full((8, 8), DEFAULT_PIXEL_VALUE, dtype=np.uint8)
+
+    # Use provided top_left or default
+    tl = top_left if top_left is not None else DEFAULT_PIXEL_VALUE
+
+    return intra_8x8_diagonal_down_right(top, left, tl)
+
+
 def predict_intra_8x8(
     mode: Intra8x8Mode,
     top: np.ndarray,
