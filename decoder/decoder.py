@@ -6,6 +6,7 @@ Main decoder orchestration that ties together:
 - SPS/PPS parsing (parameters/)
 - Slice header parsing (slice/)
 - Macroblock reconstruction (reconstruct/)
+- Inter prediction (inter/)
 - Color conversion (color/)
 
 H.264 Spec Reference:
@@ -14,7 +15,7 @@ H.264 Spec Reference:
 
 This decoder supports:
 - Baseline profile (no CABAC, no B-frames)
-- I-slices only (no P/B inter prediction yet)
+- I-slices and P-slices
 - 4:2:0 chroma format
 """
 
@@ -35,6 +36,10 @@ from parameters import SPS, PPS, parse_sps, parse_pps
 from slice import SliceHeader, SliceType, parse_slice_header
 from reconstruct import decode_macroblock, MacroblockData
 from color import ycbcr_to_rgb, ColorMatrix
+from inter.reference import ReferenceFrame, ReferenceFrameBuffer
+from inter.mv_prediction import MVCache, predict_mv_16x16
+from inter.p_macroblock import parse_p_mb_type, PMacroblockInfo
+from inter.p_reconstruct import reconstruct_p_skip, reconstruct_p_16x16
 
 logger = logging.getLogger(__name__)
 
@@ -98,6 +103,12 @@ class DecoderState:
     # Non-zero coefficient counts for CAVLC context
     nz_counts: Optional[np.ndarray] = None
 
+    # Reference frame buffer for inter prediction
+    ref_buffer: Optional[ReferenceFrameBuffer] = None
+
+    # MV cache for current frame
+    mv_cache: Optional[MVCache] = None
+
     def get_sps(self, sps_id: int) -> SPS:
         """Get SPS by ID."""
         if sps_id not in self.sps_dict:
@@ -124,9 +135,20 @@ class DecoderState:
         mb_count = sps.frame_height_in_mbs * sps.pic_width_in_mbs
         self.nz_counts = np.zeros((mb_count, 24), dtype=np.int32)
 
+        # Initialize reference frame buffer
+        max_refs = sps.max_num_ref_frames if hasattr(sps, 'max_num_ref_frames') else 4
+        self.ref_buffer = ReferenceFrameBuffer(max_frames=max(1, max_refs))
+
         logger.debug(
             f"Allocated frame buffers: {width}x{height} "
             f"({sps.pic_width_in_mbs}x{sps.frame_height_in_mbs} MBs)"
+        )
+
+    def init_mv_cache(self, sps: SPS) -> None:
+        """Initialize MV cache for a new frame."""
+        self.mv_cache = MVCache(
+            width_in_mbs=sps.pic_width_in_mbs,
+            height_in_mbs=sps.frame_height_in_mbs
         )
 
 
@@ -246,10 +268,19 @@ class H264Decoder:
             f"frame_num={slice_header.frame_num}"
         )
 
-        # Check if this is an I-slice
-        if not slice_header.is_i_slice:
-            logger.warning(f"Skipping non-I slice: {slice_header.slice_type_name}")
+        # Check slice type
+        is_i_slice = slice_header.is_i_slice
+        is_p_slice = slice_header.is_p_slice if hasattr(slice_header, 'is_p_slice') else False
+
+        if not is_i_slice and not is_p_slice:
+            logger.warning(f"Skipping unsupported slice: {slice_header.slice_type_name}")
             return None
+
+        # P-slices need reference frames
+        if is_p_slice:
+            if self.state.ref_buffer is None or len(self.state.ref_buffer) == 0:
+                logger.warning("P-slice but no reference frames available")
+                return None
 
         # Update current parameter sets
         self.state.current_sps = sps
@@ -263,12 +294,19 @@ class H264Decoder:
         slice_qp = 26 + pps.pic_init_qp_minus26 + slice_header.slice_qp_delta
         logger.debug(f"Slice QP: {slice_qp}")
 
+        # Initialize MV cache for P-slices
+        if is_p_slice:
+            self.state.init_mv_cache(sps)
+
         # Create BitReader for slice data (positioned after slice header)
         reader = BitReader(nal.rbsp)
         reader.position = slice_header.header_bit_size
 
         # Decode macroblocks
-        self._decode_slice_data(reader, slice_header, sps, pps, slice_qp)
+        if is_i_slice:
+            self._decode_slice_data(reader, slice_header, sps, pps, slice_qp)
+        else:
+            self._decode_p_slice_data(reader, slice_header, sps, pps, slice_qp)
 
         # Return completed frame
         # For simplicity, assume each slice is a complete frame
@@ -281,6 +319,17 @@ class H264Decoder:
             width=sps.pic_width_in_mbs * 16,
             height=sps.frame_height_in_mbs * 16,
         )
+
+        # Add to reference buffer if this is a reference frame
+        if nal.nal_ref_idc > 0:
+            ref_frame = ReferenceFrame(
+                luma=self.state.frame_luma.copy(),
+                cb=self.state.frame_cb.copy(),
+                cr=self.state.frame_cr.copy(),
+                frame_num=slice_header.frame_num,
+            )
+            self.state.ref_buffer.add_frame(ref_frame)
+            logger.debug(f"Added frame {slice_header.frame_num} to reference buffer")
 
         return frame
 
@@ -382,6 +431,189 @@ class H264Decoder:
             neighbors["left_luma"] = None
 
         return neighbors
+
+    def _decode_p_slice_data(
+        self,
+        reader: BitReader,
+        slice_header: SliceHeader,
+        sps: SPS,
+        pps: PPS,
+        slice_qp: int,
+    ) -> None:
+        """Decode P-slice data (macroblocks with inter prediction).
+
+        P-slices can contain:
+        - P_Skip macroblocks (mb_skip_run)
+        - P_L0_16x16, P_L0_L0_16x8, P_L0_L0_8x16, P_8x8 macroblocks
+        - I-macroblocks (intra in P-slice)
+
+        Args:
+            reader: BitReader positioned at slice data
+            slice_header: Parsed slice header
+            sps: Active SPS
+            pps: Active PPS
+            slice_qp: Slice-level QP
+        """
+        mb_width = sps.pic_width_in_mbs
+        mb_height = sps.frame_height_in_mbs
+        total_mbs = mb_width * mb_height
+
+        logger.debug(f"Decoding P-slice: {total_mbs} macroblocks")
+
+        current_qp = slice_qp
+        mb_idx = slice_header.first_mb_in_slice
+
+        while mb_idx < total_mbs:
+            mb_x = mb_idx % mb_width
+            mb_y = mb_idx // mb_width
+
+            # Read mb_skip_run for P-slices
+            mb_skip_run = reader.read_ue()
+            logger.debug(f"mb_skip_run={mb_skip_run} at MB {mb_idx}")
+
+            # Process skipped macroblocks
+            for _ in range(mb_skip_run):
+                if mb_idx >= total_mbs:
+                    break
+
+                mb_x = mb_idx % mb_width
+                mb_y = mb_idx // mb_width
+
+                # Reconstruct P_Skip macroblock
+                luma, cb, cr = reconstruct_p_skip(
+                    ref_buffer=self.state.ref_buffer,
+                    mv_cache=self.state.mv_cache,
+                    mb_x=mb_x,
+                    mb_y=mb_y,
+                )
+
+                # Write to frame buffers
+                ly, lx = mb_y * 16, mb_x * 16
+                cy, cx = mb_y * 8, mb_x * 8
+                self.state.frame_luma[ly:ly + 16, lx:lx + 16] = luma
+                self.state.frame_cb[cy:cy + 8, cx:cx + 8] = cb
+                self.state.frame_cr[cy:cy + 8, cx:cx + 8] = cr
+
+                logger.debug(f"P_Skip MB ({mb_x}, {mb_y})")
+                mb_idx += 1
+
+            # After skip run, decode regular macroblock if not at end
+            if mb_idx >= total_mbs:
+                break
+
+            mb_x = mb_idx % mb_width
+            mb_y = mb_idx // mb_width
+
+            # Read mb_type
+            mb_type_code = reader.read_ue()
+            mb_type = parse_p_mb_type(mb_type_code)
+
+            logger.debug(f"MB ({mb_x}, {mb_y}): type={mb_type.name}")
+
+            if mb_type.is_intra:
+                # I-macroblock in P-slice - use I-MB decoder
+                # Need to parse using I-MB syntax
+                mb_data = decode_macroblock(
+                    reader=reader,
+                    sps=sps,
+                    pps=pps,
+                    slice_qp=current_qp,
+                    mb_x=mb_x,
+                    mb_y=mb_y,
+                    frame_luma=self.state.frame_luma,
+                    frame_cb=self.state.frame_cb,
+                    frame_cr=self.state.frame_cr,
+                    is_i_slice=False,
+                )
+                # Clear MV cache for intra MB
+                self.state.mv_cache.set_mv_16x16(mb_x, mb_y, 0, 0)
+
+            else:
+                # P-macroblock
+                self._decode_p_macroblock(
+                    reader, mb_type, mb_x, mb_y, current_qp, sps, pps
+                )
+
+            mb_idx += 1
+
+    def _decode_p_macroblock(
+        self,
+        reader: BitReader,
+        mb_type,
+        mb_x: int,
+        mb_y: int,
+        qp: int,
+        sps: SPS,
+        pps: PPS,
+    ) -> None:
+        """Decode a single P-macroblock.
+
+        Args:
+            reader: BitReader
+            mb_type: Parsed PMBType
+            mb_x, mb_y: Macroblock position
+            qp: Current QP
+            sps, pps: Parameter sets
+        """
+        # For P_L0_16x16 (simplest case)
+        if mb_type.name == "P_L0_16x16":
+            # Read ref_idx if more than one reference
+            ref_idx = 0
+            if self.state.ref_buffer is not None and len(self.state.ref_buffer) > 1:
+                ref_idx = reader.read_te(len(self.state.ref_buffer) - 1)
+
+            # Read MVD
+            mvd_x = reader.read_se()
+            mvd_y = reader.read_se()
+
+            # Get predicted MV
+            mvp_x, mvp_y = predict_mv_16x16(self.state.mv_cache, mb_x, mb_y)
+
+            # Final MV = prediction + difference
+            mvx = mvp_x + mvd_x
+            mvy = mvp_y + mvd_y
+
+            # Update MV cache
+            self.state.mv_cache.set_mv_16x16(mb_x, mb_y, mvx, mvy)
+
+            # TODO: Parse and decode residual if present
+            # For now, no residual
+            luma, cb, cr = reconstruct_p_16x16(
+                ref_buffer=self.state.ref_buffer,
+                ref_idx=ref_idx,
+                mvx=mvx,
+                mvy=mvy,
+                residual_luma=None,
+                residual_cb=None,
+                residual_cr=None,
+                mb_x=mb_x,
+                mb_y=mb_y,
+            )
+
+            # Write to frame buffers
+            ly, lx = mb_y * 16, mb_x * 16
+            cy, cx = mb_y * 8, mb_x * 8
+            self.state.frame_luma[ly:ly + 16, lx:lx + 16] = luma
+            self.state.frame_cb[cy:cy + 8, cx:cx + 8] = cb
+            self.state.frame_cr[cy:cy + 8, cx:cx + 8] = cr
+
+            logger.debug(f"P_16x16 MB ({mb_x}, {mb_y}): MV=({mvx}, {mvy})")
+
+        else:
+            # Other partition types - simplified handling
+            logger.warning(f"Unsupported P-MB type: {mb_type.name}, treating as skip")
+            # Fall back to skip behavior
+            luma, cb, cr = reconstruct_p_skip(
+                ref_buffer=self.state.ref_buffer,
+                mv_cache=self.state.mv_cache,
+                mb_x=mb_x,
+                mb_y=mb_y,
+            )
+            ly, lx = mb_y * 16, mb_x * 16
+            cy, cx = mb_y * 8, mb_x * 8
+            self.state.frame_luma[ly:ly + 16, lx:lx + 16] = luma
+            self.state.frame_cb[cy:cy + 8, cx:cx + 8] = cb
+            self.state.frame_cr[cy:cy + 8, cx:cx + 8] = cr
 
 
 def decode_h264_file(path: str) -> list:
