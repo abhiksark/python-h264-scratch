@@ -409,9 +409,11 @@ def decode_residual_block(
     # Step 3: Decode levels
     levels = decode_levels(reader, total_coeff, trailing_ones)
 
-    # Combine levels and trailing ones (in reverse scan order)
-    # levels[0] is highest freq, t1_signs[-1] is highest freq T1
-    all_coeffs = levels + [s for s in t1_signs]
+    # Combine levels and trailing ones in SCAN order (low position to high)
+    # levels are in decode order (high to low), so reverse them
+    # t1_signs are already in scan order after reversal in decode_trailing_ones_signs
+    # T1s are at higher scan positions than non-T1s, so they come after
+    all_coeffs = list(reversed(levels)) + list(t1_signs)
 
     # Step 4: Decode total_zeros
     if total_coeff < max_coeffs:
@@ -434,16 +436,17 @@ def decode_residual_block(
     # Last coefficient gets remaining zeros
     run_befores.append(zeros_left)
 
-    # Build output array
+    # Build output array by placing coefficients from high to low scan position
+    # H.264 Spec: Coefficients are placed starting at highest position, working down
     coefficients = np.zeros(max_coeffs, dtype=np.int32)
 
-    # Place coefficients in reverse scan order
-    pos = 0
-    for i in range(total_coeff - 1, -1, -1):
-        pos += run_befores[total_coeff - 1 - i]
-        if pos < max_coeffs:
-            coefficients[pos] = all_coeffs[i]
-        pos += 1
+    pos = total_coeff + total_zeros - 1  # Start at highest position
+    for i in range(total_coeff):
+        # all_coeffs is in scan order (low to high), so index TC-1-i gives decode order
+        coeff_idx = total_coeff - 1 - i
+        if 0 <= pos < max_coeffs:
+            coefficients[pos] = all_coeffs[coeff_idx]
+        pos -= 1 + run_befores[i]  # Move left by 1 + zeros before this coeff
 
     logger.debug(f"Decoded block: TC={total_coeff}, T1={trailing_ones}, "
                 f"TZ={total_zeros}, coeffs={coefficients[:total_coeff+total_zeros]}")

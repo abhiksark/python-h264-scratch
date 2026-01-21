@@ -738,12 +738,12 @@ def reconstruct_i16x16_luma(
     nz_counts[0] = dc_block.total_coeff  # Store for context
 
     # Arrange DC coefficients in 4x4 for inverse Hadamard
-    # CAVLC decode_residual_block() already places coefficients in spatial order
-    # using run_before values - no zigzag reordering needed here
+    # CAVLC places coefficients in scan order - apply zigzag to convert to raster
     dc_4x4 = np.zeros((4, 4), dtype=np.int32)
-    for i in range(16):
-        row, col = i // 4, i % 4
-        dc_4x4[row, col] = dc_block.coefficients[i]
+    for scan_idx in range(16):
+        raster_pos = ZIGZAG_4x4[scan_idx]
+        row, col = raster_pos // 4, raster_pos % 4
+        dc_4x4[row, col] = dc_block.coefficients[scan_idx]
 
     # Inverse Hadamard transform
     # Note: No division here - normalization is in dequant and IDCT
