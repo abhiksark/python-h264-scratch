@@ -3,7 +3,7 @@
 ## Current Status
 
 **Working:** I-frame, P-frame, and B-frame decoder with CAVLC and CABAC support
-**Tests:** 938 passing
+**Tests:** 1,378 passing (2,435 total with TDD red tests)
 
 ## What Works
 
@@ -14,11 +14,13 @@
 | Slice header parsing | ✅ | I, P, and B slices supported |
 | CAVLC entropy decoding | ✅ | All VLC tables, correct scan order |
 | CABAC entropy decoding | ✅ | Context models, arithmetic decoder, all syntax elements |
-| Inverse quantization | ✅ | QP 0-51, DC/AC scaling |
+| Inverse quantization | ✅ | QP 0-51, DC/AC scaling, 4x4 and 8x8 |
 | 4x4 Integer IDCT | ✅ | Spec-compliant |
+| 8x8 Integer IDCT | ✅ | High profile support |
 | Hadamard transforms | ✅ | 4x4 (luma DC), 2x2 (chroma DC) |
 | I_16x16 prediction | ✅ | All 4 modes (V, H, DC, Plane) |
 | I_4x4 prediction | ✅ | All 9 modes |
+| I_8x8 prediction | ✅ | All 9 modes + lowpass filtering |
 | Chroma prediction | ✅ | All 4 modes |
 | YCbCr → RGB | ✅ | BT.601 and BT.709 |
 | Multi-MB frames | ✅ | Neighbor pixel handling |
@@ -33,27 +35,29 @@
 | Bi-directional prediction | ✅ | Average + weighted bipred |
 | Direct mode | ✅ | Spatial and temporal |
 | Deblocking filter | ✅ | Core filter and decoder integration |
+| Scaling lists | ✅ | 4x4/8x8 default + custom lists |
 
 ## What Does NOT Work
 
 | Feature | Status | Notes |
 |---------|--------|-------|
-| I_8x8 macroblocks | ❌ | High profile only |
+| I_8x8 decoder integration | ⚠️ | Prediction done, decoder integration pending |
 | I_PCM macroblocks | ⚠️ | Partial support |
-| Multiple slices | ⚠️ | Basic support, untested |
-| Interlaced video | ❌ | Frame-only |
+| Multiple slices (FMO/ASO) | ⚠️ | Basic support, untested |
+| Interlaced video (MBAFF) | ❌ | Frame-only |
+| Weighted prediction | ⚠️ | Implicit weights only |
 
 ## Module Status
 
 | Module | Status | Key Functions |
 |--------|--------|---------------|
 | bitstream/ | ✅ Complete | `extract_nal_units`, `BitReader` |
-| parameters/ | ✅ Complete | `parse_sps`, `parse_pps` |
+| parameters/ | ✅ Complete | `parse_sps`, `parse_pps`, scaling lists |
 | slice/ | ✅ Complete | `parse_slice_header` |
 | entropy/ | ✅ Complete | CAVLC + CABAC (contexts, arith, binarize, syntax, residual) |
-| dequant/ | ✅ Complete | `dequant_4x4`, `dequant_dc_4x4` |
-| transform/ | ✅ Complete | `idct_4x4`, `hadamard_4x4`, `hadamard_2x2` |
-| intra/ | ✅ Complete | `predict_intra_16x16`, `predict_intra_4x4` |
+| dequant/ | ✅ Complete | `dequant_4x4`, `dequant_8x8`, DC scaling |
+| transform/ | ✅ Complete | `idct_4x4`, `idct_8x8`, `forward_8x8`, Hadamard |
+| intra/ | ✅ Complete | I_16x16, I_4x4, I_8x8 (all 9 modes + lowpass filter) |
 | inter/ | ✅ Complete | P-frame + B-frame reconstruction, bipred, direct mode |
 | reconstruct/ | ✅ Complete | `reconstruct_i16x16_luma`, `reconstruct_i4x4_luma` |
 | color/ | ✅ Complete | `ycbcr_to_rgb`, `upsample_420` |
@@ -108,21 +112,32 @@
 - [x] Residual block decoding
 - [x] Decoder integration
 
+### ✅ Phase 7: High Profile I_8x8 Support
+- [x] 8x8 IDCT transform (`idct_8x8`, `forward_8x8`)
+- [x] 8x8 zigzag and field scan patterns
+- [x] I_8x8 prediction (all 9 modes)
+- [x] Lowpass filter for 8x8 reference samples
+- [x] Filtered diagonal modes (DDL, DDR)
+- [x] Availability-safe prediction variants
+- [x] Scaling list module (4x4 and 8x8)
+- [x] Default scaling lists (H.264 Tables 7-3, 7-4)
+- [ ] I_8x8 decoder integration (in progress)
+
 ## Test Breakdown
 
 ```
-bitstream/     106 tests
-inter/         239 tests (P + B frame support)
-entropy/       145 tests (CAVLC + CABAC)
-reconstruct/   102 tests
-decoder/        89 tests
-intra/          62 tests
-parameters/     45 tests
-slice/          28 tests
-transform/      26 tests
-dequant/        25 tests
-deblock/        22 tests
-color/          15 tests
-─────────────────────────
-Total:         938 tests (1 skipped)
+Total:         2,435 tests collected
+Passing:       1,378 tests
+xfailed:         742 tests (TDD red tests for unimplemented features)
+Failed:          248 tests (TDD red tests, in progress)
+Skipped:          48 tests
+xpassed:          19 tests
+
+Key modules with TDD red tests for future features:
+- I_8x8 decoder integration
+- FMO/ASO slice ordering
+- MBAFF interlaced support
+- Explicit weighted prediction
+- Error concealment
+- Reference picture management
 ```
