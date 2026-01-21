@@ -85,11 +85,13 @@ class TestDeblockingOutput:
     def test_deblock_reduces_blocking_artifacts(self):
         """Deblocking should smooth artificial block edges."""
         # Create frame with artificial blocking
+        # Use small differences (< alpha threshold) to simulate real blocking artifacts
+        # H.264 alpha at QP=26 is 15, so differences must be smaller
         frame_luma = np.zeros((32, 32), dtype=np.uint8)
-        # Create checkerboard of 8x8 blocks
+        # Create checkerboard of 8x8 blocks with small differences
         for y in range(0, 32, 8):
             for x in range(0, 32, 8):
-                val = 100 if ((x // 8) + (y // 8)) % 2 == 0 else 200
+                val = 120 if ((x // 8) + (y // 8)) % 2 == 0 else 130
                 frame_luma[y:y+8, x:x+8] = val
 
         from deblock.deblock import deblock_frame
@@ -104,9 +106,9 @@ class TestDeblockingOutput:
         )
 
         # After deblocking, edges should be smoother
-        # Check that edge pixels are no longer exactly 100 or 200
+        # Check that edge pixels are no longer exactly the original values
         edge_pixel = deblocked[0][7, 8]  # Luma at block boundary
-        assert edge_pixel != 100 and edge_pixel != 200, \
+        assert edge_pixel != 120 and edge_pixel != 130, \
             "Edge pixels should be smoothed by deblocking"
 
 

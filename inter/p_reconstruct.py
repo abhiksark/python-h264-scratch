@@ -516,6 +516,161 @@ def reconstruct_p_8x8(
     return luma, cb, cr
 
 
+def reconstruct_p_8x8_sub(
+    ref_buffer: ReferenceFrameBuffer,
+    mv_cache: MVCache,
+    ref_idx: int,
+    sub_mb_type: int,
+    mvs: list,
+    mb_x: int,
+    mb_y: int,
+    sub_idx: int,
+    residual: Optional[np.ndarray],
+) -> np.ndarray:
+    """Reconstruct a single 8x8 sub-macroblock with sub-partitions.
+
+    Sub-MB types:
+        0: 8x8 (1 partition, 1 MV)
+        1: 8x4 (2 partitions, 2 MVs - top/bottom)
+        2: 4x8 (2 partitions, 2 MVs - left/right)
+        3: 4x4 (4 partitions, 4 MVs)
+
+    Args:
+        ref_buffer: Reference frame buffer
+        mv_cache: MV cache
+        ref_idx: Reference frame index
+        sub_mb_type: Sub-MB partition type (0-3)
+        mvs: List of MVs for this sub-MB (1, 2, or 4 depending on type)
+        mb_x, mb_y: Macroblock position
+        sub_idx: Sub-MB index within macroblock (0-3)
+        residual: 8x8 residual or None
+
+    Returns:
+        8x8 reconstructed block
+    """
+    # Sub-MB position within macroblock
+    sub_offsets = [(0, 0), (8, 0), (0, 8), (8, 8)]
+    sub_x, sub_y = sub_offsets[sub_idx]
+
+    result = np.zeros((8, 8), dtype=np.uint8)
+    ref_frame = ref_buffer.get_frame(ref_idx)
+
+    if sub_mb_type == 0:
+        # 8x8: single partition
+        mvx, mvy = mvs[0]
+        int_mvx, int_mvy = mvx >> 2, mvy >> 2
+        frac_x, frac_y = mvx & 3, mvy & 3
+        ref_x = mb_x * 16 + sub_x + int_mvx
+        ref_y = mb_y * 16 + sub_y + int_mvy
+
+        result = apply_inter_prediction(
+            ref_frame.luma, ref_x, ref_y, frac_x, frac_y, 8, 8
+        )
+
+    elif sub_mb_type == 1:
+        # 8x4: two horizontal partitions
+        for part in range(2):
+            mvx, mvy = mvs[part]
+            int_mvx, int_mvy = mvx >> 2, mvy >> 2
+            frac_x, frac_y = mvx & 3, mvy & 3
+            ref_x = mb_x * 16 + sub_x + int_mvx
+            ref_y = mb_y * 16 + sub_y + part * 4 + int_mvy
+
+            part_result = apply_inter_prediction(
+                ref_frame.luma, ref_x, ref_y, frac_x, frac_y, 8, 4
+            )
+            result[part * 4:(part + 1) * 4, :] = part_result
+
+    elif sub_mb_type == 2:
+        # 4x8: two vertical partitions
+        for part in range(2):
+            mvx, mvy = mvs[part]
+            int_mvx, int_mvy = mvx >> 2, mvy >> 2
+            frac_x, frac_y = mvx & 3, mvy & 3
+            ref_x = mb_x * 16 + sub_x + part * 4 + int_mvx
+            ref_y = mb_y * 16 + sub_y + int_mvy
+
+            part_result = apply_inter_prediction(
+                ref_frame.luma, ref_x, ref_y, frac_x, frac_y, 4, 8
+            )
+            result[:, part * 4:(part + 1) * 4] = part_result
+
+    elif sub_mb_type == 3:
+        # 4x4: four partitions
+        part_offsets = [(0, 0), (4, 0), (0, 4), (4, 4)]
+        for part, (px, py) in enumerate(part_offsets):
+            mvx, mvy = mvs[part]
+            int_mvx, int_mvy = mvx >> 2, mvy >> 2
+            frac_x, frac_y = mvx & 3, mvy & 3
+            ref_x = mb_x * 16 + sub_x + px + int_mvx
+            ref_y = mb_y * 16 + sub_y + py + int_mvy
+
+            part_result = apply_inter_prediction(
+                ref_frame.luma, ref_x, ref_y, frac_x, frac_y, 4, 4
+            )
+            result[py:py + 4, px:px + 4] = part_result
+
+    # Add residual if present
+    if residual is not None:
+        result = np.clip(
+            result.astype(np.int32) + residual, 0, 255
+        ).astype(np.uint8)
+
+    return result
+
+
+def update_mv_cache_sub_mb(
+    mv_cache: MVCache,
+    mb_x: int,
+    mb_y: int,
+    sub_idx: int,
+    sub_mb_type: int,
+    mvs: list,
+) -> None:
+    """Update MV cache for a sub-macroblock with sub-partitions.
+
+    Args:
+        mv_cache: MV cache to update
+        mb_x, mb_y: Macroblock position
+        sub_idx: Sub-MB index (0-3)
+        sub_mb_type: Sub-MB partition type (0-3)
+        mvs: List of MVs for this sub-MB
+    """
+    # Sub-MB base position in 4x4 blocks within macroblock
+    sub_bx = (sub_idx % 2) * 2
+    sub_by = (sub_idx // 2) * 2
+
+    if sub_mb_type == 0:
+        # 8x8: all 4 blocks get same MV
+        mvx, mvy = mvs[0]
+        for dy in range(2):
+            for dx in range(2):
+                mv_cache.set_mv(mb_x, mb_y, sub_bx + dx, sub_by + dy, mvx, mvy)
+
+    elif sub_mb_type == 1:
+        # 8x4: top row gets mvs[0], bottom row gets mvs[1]
+        mvx0, mvy0 = mvs[0]
+        mvx1, mvy1 = mvs[1]
+        for dx in range(2):
+            mv_cache.set_mv(mb_x, mb_y, sub_bx + dx, sub_by, mvx0, mvy0)
+            mv_cache.set_mv(mb_x, mb_y, sub_bx + dx, sub_by + 1, mvx1, mvy1)
+
+    elif sub_mb_type == 2:
+        # 4x8: left col gets mvs[0], right col gets mvs[1]
+        mvx0, mvy0 = mvs[0]
+        mvx1, mvy1 = mvs[1]
+        for dy in range(2):
+            mv_cache.set_mv(mb_x, mb_y, sub_bx, sub_by + dy, mvx0, mvy0)
+            mv_cache.set_mv(mb_x, mb_y, sub_bx + 1, sub_by + dy, mvx1, mvy1)
+
+    elif sub_mb_type == 3:
+        # 4x4: each block gets its own MV
+        block_offsets = [(0, 0), (1, 0), (0, 1), (1, 1)]
+        for part, (dx, dy) in enumerate(block_offsets):
+            mvx, mvy = mvs[part]
+            mv_cache.set_mv(mb_x, mb_y, sub_bx + dx, sub_by + dy, mvx, mvy)
+
+
 def _reconstruct_chroma_16x16(
     ref_buffer: ReferenceFrameBuffer,
     ref_idx: int,

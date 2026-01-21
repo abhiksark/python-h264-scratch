@@ -21,7 +21,7 @@ This decoder supports:
 
 import logging
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Optional, Tuple
 
 import numpy as np
 
@@ -121,6 +121,13 @@ class DecoderState:
     # MV cache for current frame
     mv_cache: Optional[MVCache] = None
 
+    # Current macroblock QP (updated by mb_qp_delta)
+    current_mb_qp: int = 26
+
+    # Per-MB info for deblocking filter
+    mb_types: Optional[np.ndarray] = None  # MB type per MB
+    mb_coeffs: Optional[np.ndarray] = None  # Has non-zero coeffs per 4x4 block
+
     def get_sps(self, sps_id: int) -> SPS:
         """Get SPS by ID."""
         if sps_id not in self.sps_dict:
@@ -151,6 +158,11 @@ class DecoderState:
         max_refs = sps.max_num_ref_frames if hasattr(sps, 'max_num_ref_frames') else 4
         self.ref_buffer = ReferenceFrameBuffer(max_frames=max(1, max_refs))
 
+        # Per-MB info for deblocking
+        self.mb_types = np.zeros(mb_count, dtype=np.int32)
+        # 16 luma + 8 chroma 4x4 blocks per MB
+        self.mb_coeffs = np.zeros((mb_count, 24), dtype=bool)
+
         logger.debug(
             f"Allocated frame buffers: {width}x{height} "
             f"({sps.pic_width_in_mbs}x{sps.frame_height_in_mbs} MBs)"
@@ -176,9 +188,14 @@ class H264Decoder:
             # Display or save rgb array
     """
 
-    def __init__(self):
-        """Initialize decoder."""
+    def __init__(self, deblocking_enabled: bool = True):
+        """Initialize decoder.
+
+        Args:
+            deblocking_enabled: Whether to apply deblocking filter (default True)
+        """
         self.state = DecoderState()
+        self.deblocking_enabled = deblocking_enabled
 
     def decode_file(self, path: str):
         """Decode H.264 file and yield frames.
@@ -762,6 +779,220 @@ class H264Decoder:
             self.state.frame_luma[ly:ly + 16, lx:lx + 16] = luma
             self.state.frame_cb[cy:cy + 8, cx:cx + 8] = cb
             self.state.frame_cr[cy:cy + 8, cx:cx + 8] = cr
+
+    def _parse_p_mb_residual(
+        self,
+        reader: 'BitReader',
+        cbp: int,
+        qp: int,
+    ) -> Tuple[Optional[np.ndarray], Optional[np.ndarray], Optional[np.ndarray]]:
+        """Parse residual data for a P-macroblock.
+
+        Args:
+            reader: BitReader positioned at residual data
+            cbp: Coded block pattern
+            qp: Quantization parameter
+
+        Returns:
+            Tuple of (luma, cb, cr) residual arrays or None if no residual
+        """
+        from inter.p_macroblock import parse_p_residual
+        return parse_p_residual(reader, cbp, qp)
+
+    def _apply_p_residual(
+        self,
+        prediction: np.ndarray,
+        residual: Optional[np.ndarray],
+    ) -> np.ndarray:
+        """Apply residual to prediction to get reconstructed block.
+
+        Args:
+            prediction: Predicted block from motion compensation
+            residual: Residual block or None
+
+        Returns:
+            Reconstructed block (clipped to [0, 255])
+        """
+        if residual is None:
+            return prediction
+        return np.clip(
+            prediction.astype(np.int32) + residual, 0, 255
+        ).astype(np.uint8)
+
+    def _decode_p_luma_residual(
+        self,
+        reader: 'BitReader',
+        cbp_luma: int,
+        qp: int,
+    ) -> Optional[np.ndarray]:
+        """Decode luma residual blocks for P-macroblock.
+
+        Args:
+            reader: BitReader
+            cbp_luma: Lower 4 bits of CBP indicating which 8x8 blocks have residual
+            qp: Quantization parameter
+
+        Returns:
+            16x16 luma residual or None if CBP indicates no luma residual
+        """
+        if cbp_luma == 0:
+            return None
+
+        from entropy import decode_residual_block
+        from dequant import dequant_4x4
+        from transform import idct_4x4
+
+        residual = np.zeros((16, 16), dtype=np.int32)
+
+        # Process each 8x8 block
+        for i8x8 in range(4):
+            if not (cbp_luma & (1 << i8x8)):
+                continue
+
+            # 8x8 block position
+            bx8 = (i8x8 % 2) * 8
+            by8 = (i8x8 // 2) * 8
+
+            # Process four 4x4 blocks within this 8x8
+            for i4x4 in range(4):
+                bx4 = bx8 + (i4x4 % 2) * 4
+                by4 = by8 + (i4x4 // 2) * 4
+
+                # Decode coefficients
+                coeffs = decode_residual_block(reader, 16, 'luma_ac')
+                if coeffs is not None:
+                    dequant = dequant_4x4(coeffs, qp)
+                    block = idct_4x4(dequant)
+                    residual[by4:by4+4, bx4:bx4+4] = block
+
+        return residual
+
+    def _decode_p_chroma_residual(
+        self,
+        reader: 'BitReader',
+        cbp_chroma: int,
+        qp: int,
+    ) -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]:
+        """Decode chroma residual blocks for P-macroblock.
+
+        Args:
+            reader: BitReader
+            cbp_chroma: Upper bits of CBP for chroma (0=none, 1=DC only, 2=DC+AC)
+            qp: Quantization parameter
+
+        Returns:
+            Tuple of (cb, cr) 8x8 residual arrays or None
+        """
+        if cbp_chroma == 0:
+            return None, None
+
+        from entropy import decode_residual_block
+        from dequant import dequant_4x4, dequant_dc_2x2
+        from transform import idct_4x4, hadamard_2x2_inverse
+
+        cb_residual = np.zeros((8, 8), dtype=np.int32)
+        cr_residual = np.zeros((8, 8), dtype=np.int32)
+
+        qp_c = min(qp, 51)  # Chroma QP
+
+        for chroma_idx, residual in enumerate([cb_residual, cr_residual]):
+            # Decode DC coefficients (2x2)
+            dc_coeffs = decode_residual_block(reader, 4, 'chroma_dc')
+            if dc_coeffs is not None:
+                dc_dequant = dequant_dc_2x2(dc_coeffs, qp_c)
+                dc_transform = hadamard_2x2_inverse(dc_dequant)
+
+            # Decode AC coefficients if cbp_chroma == 2
+            if cbp_chroma >= 2:
+                for i4x4 in range(4):
+                    bx = (i4x4 % 2) * 4
+                    by = (i4x4 // 2) * 4
+
+                    ac_coeffs = decode_residual_block(reader, 15, 'chroma_ac')
+                    block = np.zeros((4, 4), dtype=np.int32)
+                    if dc_coeffs is not None:
+                        block[0, 0] = dc_transform[i4x4 // 2, i4x4 % 2]
+                    if ac_coeffs is not None:
+                        # Fill in AC coefficients
+                        pass  # Simplified for now
+                    dequant = dequant_4x4(block, qp_c)
+                    residual[by:by+4, bx:bx+4] = idct_4x4(dequant)
+
+        return cb_residual, cr_residual
+
+    def _deblock_frame(self) -> None:
+        """Apply deblocking filter to the entire frame."""
+        if not self.deblocking_enabled:
+            return
+
+        from deblock.deblock import deblock_frame
+
+        self.state.frame_luma, self.state.frame_cb, self.state.frame_cr = deblock_frame(
+            luma=self.state.frame_luma,
+            cb=self.state.frame_cb,
+            cr=self.state.frame_cr,
+            mb_info=None,  # TODO: Pass per-MB info
+            qp=self.state.current_mb_qp,
+        )
+
+    def _get_deblock_params(self, slice_header: 'SliceHeader') -> dict:
+        """Get deblocking filter parameters from slice header.
+
+        Args:
+            slice_header: Parsed slice header
+
+        Returns:
+            Dictionary with deblocking parameters
+        """
+        return {
+            'disable_deblocking_filter_idc': getattr(
+                slice_header, 'disable_deblocking_filter_idc', 0
+            ),
+            'slice_alpha_c0_offset_div2': getattr(
+                slice_header, 'slice_alpha_c0_offset_div2', 0
+            ),
+            'slice_beta_offset_div2': getattr(
+                slice_header, 'slice_beta_offset_div2', 0
+            ),
+        }
+
+    def _should_deblock_slice(self, slice_header: 'SliceHeader') -> bool:
+        """Check if deblocking should be applied for this slice.
+
+        Args:
+            slice_header: Parsed slice header
+
+        Returns:
+            True if deblocking should be applied
+        """
+        if not self.deblocking_enabled:
+            return False
+
+        disable_idc = getattr(slice_header, 'disable_deblocking_filter_idc', 0)
+        # 0 = deblock all edges
+        # 1 = disable all deblocking
+        # 2 = disable at slice boundaries
+        return disable_idc != 1
+
+    def _is_slice_boundary(
+        self,
+        mb_x: int,
+        mb_y: int,
+        neighbor_mb_x: int,
+        neighbor_mb_y: int,
+    ) -> bool:
+        """Check if an edge is at a slice boundary.
+
+        Args:
+            mb_x, mb_y: Current macroblock position
+            neighbor_mb_x, neighbor_mb_y: Neighbor macroblock position
+
+        Returns:
+            True if the edge between these MBs is a slice boundary
+        """
+        # For single-slice frames, no boundaries
+        # Full implementation would track which slice each MB belongs to
+        return False
 
 
 def decode_h264_file(path: str) -> list:

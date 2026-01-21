@@ -3,7 +3,7 @@
 ## Current Status
 
 **Working:** I-frame and P-frame decoder for Baseline profile
-**Tests:** 659 passing
+**Tests:** 680 passing
 
 ## What Works
 
@@ -27,6 +27,7 @@
 | P_Skip macroblocks | ✅ | Zero-residual inter prediction |
 | P_L0_16x16 macroblocks | ✅ | Single partition inter |
 | P_16x8, P_8x16, P_8x8 | ✅ | Multiple partition modes |
+| P_8x8 sub-partitions | ✅ | 8x4, 4x8, 4x4 sub-MB modes |
 
 ## What Does NOT Work
 
@@ -36,7 +37,7 @@
 | I_PCM macroblocks | ❌ | Raw sample blocks not implemented |
 | B-frames | ❌ | Bi-directional prediction not implemented |
 | CABAC entropy | ❌ | Main/High profile only |
-| Deblocking filter | ⚠️ | Core filter implemented, integration pending |
+| Deblocking filter | ✅ | Core filter and decoder integration |
 | Multiple slices | ⚠️ | Untested |
 | Interlaced video | ❌ | Frame-only |
 
@@ -102,8 +103,9 @@ Tested against JM reference decoder:
 
 ### ⚠️ Phase 4: Polish
 - [x] P_16x8, P_8x16, P_8x8 partitions
+- [x] P_8x8 sub-partitions (8x4, 4x8, 4x4)
 - [x] Residual decoding for P-macroblocks
-- [ ] Deblocking filter
+- [x] Deblocking filter
 - [ ] Multiple slice support
 - [ ] Streaming decoder API
 - [ ] Error resilience
@@ -112,10 +114,10 @@ Tested against JM reference decoder:
 
 ```
 bitstream/     106 tests
-inter/         148 tests
+inter/         155 tests
 reconstruct/   102 tests
 intra/          62 tests
-decoder/        45 tests (includes JM comparison)
+decoder/        60 tests (includes JM comparison)
 parameters/     45 tests
 entropy/        35 tests
 slice/          28 tests
@@ -124,5 +126,5 @@ dequant/        25 tests
 deblock/        22 tests
 color/          15 tests
 ─────────────────────────
-Total:         659 tests
+Total:         680 tests (1 skipped)
 ```
