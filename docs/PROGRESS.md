@@ -3,7 +3,7 @@
 ## Current Status
 
 **Working:** I-frame and P-frame decoder for Baseline profile
-**Tests:** 602 passing
+**Tests:** 659 passing
 
 ## What Works
 
@@ -34,10 +34,9 @@
 |---------|--------|-------|
 | I_8x8 macroblocks | ❌ | High profile only |
 | I_PCM macroblocks | ❌ | Raw sample blocks not implemented |
-| P_16x8, P_8x16, P_8x8 | ✅ | Luma reconstruction working |
 | B-frames | ❌ | Bi-directional prediction not implemented |
 | CABAC entropy | ❌ | Main/High profile only |
-| Deblocking filter | ❌ | Post-processing not implemented |
+| Deblocking filter | ⚠️ | Core filter implemented, integration pending |
 | Multiple slices | ⚠️ | Untested |
 | Interlaced video | ❌ | Frame-only |
 
@@ -113,16 +112,17 @@ Tested against JM reference decoder:
 
 ```
 bitstream/     106 tests
-inter/         131 tests
+inter/         148 tests
 reconstruct/   102 tests
 intra/          62 tests
+decoder/        45 tests (includes JM comparison)
 parameters/     45 tests
 entropy/        35 tests
 slice/          28 tests
-decoder/        27 tests (includes JM comparison)
 transform/      26 tests
 dequant/        25 tests
+deblock/        22 tests
 color/          15 tests
 ─────────────────────────
-Total:         602 tests
+Total:         659 tests
 ```

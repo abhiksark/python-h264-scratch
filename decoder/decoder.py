@@ -37,9 +37,21 @@ from slice import SliceHeader, SliceType, parse_slice_header
 from reconstruct import decode_macroblock, MacroblockData
 from color import ycbcr_to_rgb, ColorMatrix
 from inter.reference import ReferenceFrame, ReferenceFrameBuffer
-from inter.mv_prediction import MVCache, predict_mv_16x16
-from inter.p_macroblock import parse_p_mb_type, PMacroblockInfo
-from inter.p_reconstruct import reconstruct_p_skip, reconstruct_p_16x16
+from inter.mv_prediction import (
+    MVCache,
+    predict_mv_16x16,
+    predict_mv_16x8,
+    predict_mv_8x16,
+    predict_mv_8x8,
+)
+from inter.p_macroblock import parse_p_mb_type, parse_sub_mb_type, PMacroblockInfo
+from inter.p_reconstruct import (
+    reconstruct_p_skip,
+    reconstruct_p_16x16,
+    reconstruct_p_16x8,
+    reconstruct_p_8x16,
+    reconstruct_p_8x8,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -599,10 +611,146 @@ class H264Decoder:
 
             logger.debug(f"P_16x16 MB ({mb_x}, {mb_y}): MV=({mvx}, {mvy})")
 
+        elif mb_type.name == "P_L0_L0_16x8":
+            # Two 16x8 partitions (top and bottom)
+            ref_idx = [0, 0]
+            mvx = [0, 0]
+            mvy = [0, 0]
+
+            # Read ref_idx for each partition if multiple references
+            num_refs = len(self.state.ref_buffer) if self.state.ref_buffer else 1
+            if num_refs > 1:
+                ref_idx[0] = reader.read_te(num_refs - 1)
+                ref_idx[1] = reader.read_te(num_refs - 1)
+
+            # Read MVD for each partition
+            for part in range(2):
+                mvd_x = reader.read_se()
+                mvd_y = reader.read_se()
+
+                # Get predicted MV for this partition
+                mvp_x, mvp_y = predict_mv_16x8(self.state.mv_cache, mb_x, mb_y, part)
+
+                mvx[part] = mvp_x + mvd_x
+                mvy[part] = mvp_y + mvd_y
+
+            # TODO: Parse residual
+
+            luma, cb, cr = reconstruct_p_16x8(
+                ref_buffer=self.state.ref_buffer,
+                mv_cache=self.state.mv_cache,
+                ref_idx=ref_idx,
+                mvx=mvx,
+                mvy=mvy,
+                residual_luma=None,
+                residual_cb=None,
+                residual_cr=None,
+                mb_x=mb_x,
+                mb_y=mb_y,
+            )
+
+            ly, lx = mb_y * 16, mb_x * 16
+            cy, cx = mb_y * 8, mb_x * 8
+            self.state.frame_luma[ly:ly + 16, lx:lx + 16] = luma
+            self.state.frame_cb[cy:cy + 8, cx:cx + 8] = cb
+            self.state.frame_cr[cy:cy + 8, cx:cx + 8] = cr
+
+            logger.debug(f"P_16x8 MB ({mb_x}, {mb_y}): MVs={list(zip(mvx, mvy))}")
+
+        elif mb_type.name == "P_L0_L0_8x16":
+            # Two 8x16 partitions (left and right)
+            ref_idx = [0, 0]
+            mvx = [0, 0]
+            mvy = [0, 0]
+
+            num_refs = len(self.state.ref_buffer) if self.state.ref_buffer else 1
+            if num_refs > 1:
+                ref_idx[0] = reader.read_te(num_refs - 1)
+                ref_idx[1] = reader.read_te(num_refs - 1)
+
+            for part in range(2):
+                mvd_x = reader.read_se()
+                mvd_y = reader.read_se()
+
+                mvp_x, mvp_y = predict_mv_8x16(self.state.mv_cache, mb_x, mb_y, part)
+
+                mvx[part] = mvp_x + mvd_x
+                mvy[part] = mvp_y + mvd_y
+
+            luma, cb, cr = reconstruct_p_8x16(
+                ref_buffer=self.state.ref_buffer,
+                mv_cache=self.state.mv_cache,
+                ref_idx=ref_idx,
+                mvx=mvx,
+                mvy=mvy,
+                residual_luma=None,
+                residual_cb=None,
+                residual_cr=None,
+                mb_x=mb_x,
+                mb_y=mb_y,
+            )
+
+            ly, lx = mb_y * 16, mb_x * 16
+            cy, cx = mb_y * 8, mb_x * 8
+            self.state.frame_luma[ly:ly + 16, lx:lx + 16] = luma
+            self.state.frame_cb[cy:cy + 8, cx:cx + 8] = cb
+            self.state.frame_cr[cy:cy + 8, cx:cx + 8] = cr
+
+            logger.debug(f"P_8x16 MB ({mb_x}, {mb_y}): MVs={list(zip(mvx, mvy))}")
+
+        elif mb_type.name in ("P_8x8", "P_8x8ref0"):
+            # Four 8x8 sub-macroblocks
+            sub_mb_types = []
+            ref_idx = [0, 0, 0, 0]
+            mvx = [0, 0, 0, 0]
+            mvy = [0, 0, 0, 0]
+
+            # Read sub_mb_type for each 8x8 block
+            for i in range(4):
+                sub_type_code = reader.read_ue()
+                sub_mb_types.append(sub_type_code)
+
+            # Read ref_idx for each sub-MB (unless P_8x8ref0)
+            num_refs = len(self.state.ref_buffer) if self.state.ref_buffer else 1
+            if mb_type.name == "P_8x8" and num_refs > 1:
+                for i in range(4):
+                    ref_idx[i] = reader.read_te(num_refs - 1)
+
+            # Read MVD for each sub-MB (assuming 8x8 sub-type for simplicity)
+            for sub_idx in range(4):
+                mvd_x = reader.read_se()
+                mvd_y = reader.read_se()
+
+                mvp_x, mvp_y = predict_mv_8x8(self.state.mv_cache, mb_x, mb_y, sub_idx)
+
+                mvx[sub_idx] = mvp_x + mvd_x
+                mvy[sub_idx] = mvp_y + mvd_y
+
+            luma, cb, cr = reconstruct_p_8x8(
+                ref_buffer=self.state.ref_buffer,
+                mv_cache=self.state.mv_cache,
+                ref_idx=ref_idx,
+                mvx=mvx,
+                mvy=mvy,
+                sub_mb_types=sub_mb_types,
+                residual_luma=None,
+                residual_cb=None,
+                residual_cr=None,
+                mb_x=mb_x,
+                mb_y=mb_y,
+            )
+
+            ly, lx = mb_y * 16, mb_x * 16
+            cy, cx = mb_y * 8, mb_x * 8
+            self.state.frame_luma[ly:ly + 16, lx:lx + 16] = luma
+            self.state.frame_cb[cy:cy + 8, cx:cx + 8] = cb
+            self.state.frame_cr[cy:cy + 8, cx:cx + 8] = cr
+
+            logger.debug(f"P_8x8 MB ({mb_x}, {mb_y}): MVs={list(zip(mvx, mvy))}")
+
         else:
-            # Other partition types - simplified handling
+            # Unknown type - fall back to skip
             logger.warning(f"Unsupported P-MB type: {mb_type.name}, treating as skip")
-            # Fall back to skip behavior
             luma, cb, cr = reconstruct_p_skip(
                 ref_buffer=self.state.ref_buffer,
                 mv_cache=self.state.mv_cache,
