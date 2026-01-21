@@ -410,7 +410,8 @@ def decode_residual_block(
     levels = decode_levels(reader, total_coeff, trailing_ones)
 
     # Combine levels and trailing ones (in reverse scan order)
-    all_coeffs = levels + [s for s in t1_signs]  # levels first, then T1s
+    # levels[0] is highest freq, t1_signs[-1] is highest freq T1
+    all_coeffs = levels + [s for s in t1_signs]
 
     # Step 4: Decode total_zeros
     if total_coeff < max_coeffs:

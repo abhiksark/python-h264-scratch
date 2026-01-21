@@ -737,12 +737,11 @@ def reconstruct_i16x16_luma(
     dc_block = decode_residual_block(reader, dc_nC, max_coeffs=16)
     nz_counts[0] = dc_block.total_coeff  # Store for context
 
-    # Arrange DC coefficients in 4x4 and apply inverse Hadamard
-    # The DC block coefficients are in scan order (position in array = scan index)
-    # Place directly in raster order - the scan order for I_16x16 DC
-    # matches the spatial block arrangement
+    # Arrange DC coefficients in 4x4 for inverse Hadamard
+    # CAVLC decode_residual_block() already places coefficients in spatial order
+    # using run_before values - no zigzag reordering needed here
     dc_4x4 = np.zeros((4, 4), dtype=np.int32)
-    for i in range(min(16, len(dc_block.coefficients))):
+    for i in range(16):
         row, col = i // 4, i % 4
         dc_4x4[row, col] = dc_block.coefficients[i]
 
@@ -1055,13 +1054,13 @@ def decode_macroblock(
 
                 # Dequantize and inverse transform
                 if block.total_coeff > 0:
-                    coeffs = np.zeros(16, dtype=np.int32)
-                    for i, (level, pos) in enumerate(zip(block.levels, block.run_before)):
-                        coeffs[pos] = level
-                    # Reorder from zigzag to raster
+                    # CAVLC already placed coefficients in scan order
+                    # Apply zigzag to convert scan position -> raster position
                     coeffs_2d = np.zeros((4, 4), dtype=np.int32)
-                    for i in range(16):
-                        coeffs_2d[ZIGZAG_4x4[i] // 4, ZIGZAG_4x4[i] % 4] = coeffs[i]
+                    for scan_idx in range(16):
+                        raster_pos = ZIGZAG_4x4[scan_idx]
+                        r, c = raster_pos // 4, raster_pos % 4
+                        coeffs_2d[r, c] = block.coefficients[scan_idx]
                     dequant = dequant_4x4(coeffs_2d, qp)
                     residual = idct_4x4(dequant)
                 else:
