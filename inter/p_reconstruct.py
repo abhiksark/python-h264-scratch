@@ -286,3 +286,290 @@ def reconstruct_p_partition(
         result = pred
 
     return result
+
+
+def reconstruct_p_16x8(
+    ref_buffer: ReferenceFrameBuffer,
+    mv_cache: MVCache,
+    ref_idx: list,
+    mvx: list,
+    mvy: list,
+    residual_luma: Optional[list],
+    residual_cb: Optional[np.ndarray],
+    residual_cr: Optional[np.ndarray],
+    mb_x: int,
+    mb_y: int,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Reconstruct P_L0_L0_16x8 macroblock (two 16x8 partitions).
+
+    Args:
+        ref_buffer: Reference frame buffer
+        mv_cache: MV cache for prediction and storage
+        ref_idx: List of 2 reference frame indices [top, bottom]
+        mvx, mvy: Lists of 2 motion vectors in quarter-pixel units
+        residual_luma: List of 2 residual blocks (8x16 each) or None
+        residual_cb, residual_cr: 8x8 chroma residuals or None
+        mb_x, mb_y: Macroblock position
+
+    Returns:
+        Tuple of (luma, cb, cr) reconstructed blocks
+    """
+    luma = np.zeros((16, 16), dtype=np.uint8)
+
+    # Partition 0: top 16x8 (rows 0-7)
+    part0 = reconstruct_p_partition(
+        ref_buffer=ref_buffer,
+        ref_idx=ref_idx[0],
+        mvx=mvx[0],
+        mvy=mvy[0],
+        mb_x=mb_x,
+        mb_y=mb_y,
+        part_x=0,
+        part_y=0,
+        width=16,
+        height=8,
+        residual_luma=residual_luma[0] if residual_luma else None,
+    )
+    luma[0:8, :] = part0
+
+    # Partition 1: bottom 16x8 (rows 8-15)
+    part1 = reconstruct_p_partition(
+        ref_buffer=ref_buffer,
+        ref_idx=ref_idx[1],
+        mvx=mvx[1],
+        mvy=mvy[1],
+        mb_x=mb_x,
+        mb_y=mb_y,
+        part_x=0,
+        part_y=8,
+        width=16,
+        height=8,
+        residual_luma=residual_luma[1] if residual_luma else None,
+    )
+    luma[8:16, :] = part1
+
+    # Update MV cache: top partition covers rows 0-1, bottom covers rows 2-3
+    for bx in range(4):
+        for by in range(2):
+            mv_cache.set_mv(mb_x, mb_y, bx, by, mvx[0], mvy[0])
+        for by in range(2, 4):
+            mv_cache.set_mv(mb_x, mb_y, bx, by, mvx[1], mvy[1])
+
+    # Chroma reconstruction (simplified - use partition 0 MV for whole MB)
+    cb, cr = _reconstruct_chroma_16x16(
+        ref_buffer, ref_idx[0], mvx[0], mvy[0], residual_cb, residual_cr, mb_x, mb_y
+    )
+
+    logger.debug(f"P_16x8 MB({mb_x},{mb_y}): MVs=[({mvx[0]},{mvy[0]}),({mvx[1]},{mvy[1]})]")
+
+    return luma, cb, cr
+
+
+def reconstruct_p_8x16(
+    ref_buffer: ReferenceFrameBuffer,
+    mv_cache: MVCache,
+    ref_idx: list,
+    mvx: list,
+    mvy: list,
+    residual_luma: Optional[list],
+    residual_cb: Optional[np.ndarray],
+    residual_cr: Optional[np.ndarray],
+    mb_x: int,
+    mb_y: int,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Reconstruct P_L0_L0_8x16 macroblock (two 8x16 partitions).
+
+    Args:
+        ref_buffer: Reference frame buffer
+        mv_cache: MV cache for prediction and storage
+        ref_idx: List of 2 reference frame indices [left, right]
+        mvx, mvy: Lists of 2 motion vectors in quarter-pixel units
+        residual_luma: List of 2 residual blocks (16x8 each) or None
+        residual_cb, residual_cr: 8x8 chroma residuals or None
+        mb_x, mb_y: Macroblock position
+
+    Returns:
+        Tuple of (luma, cb, cr) reconstructed blocks
+    """
+    luma = np.zeros((16, 16), dtype=np.uint8)
+
+    # Partition 0: left 8x16 (cols 0-7)
+    part0 = reconstruct_p_partition(
+        ref_buffer=ref_buffer,
+        ref_idx=ref_idx[0],
+        mvx=mvx[0],
+        mvy=mvy[0],
+        mb_x=mb_x,
+        mb_y=mb_y,
+        part_x=0,
+        part_y=0,
+        width=8,
+        height=16,
+        residual_luma=residual_luma[0] if residual_luma else None,
+    )
+    luma[:, 0:8] = part0
+
+    # Partition 1: right 8x16 (cols 8-15)
+    part1 = reconstruct_p_partition(
+        ref_buffer=ref_buffer,
+        ref_idx=ref_idx[1],
+        mvx=mvx[1],
+        mvy=mvy[1],
+        mb_x=mb_x,
+        mb_y=mb_y,
+        part_x=8,
+        part_y=0,
+        width=8,
+        height=16,
+        residual_luma=residual_luma[1] if residual_luma else None,
+    )
+    luma[:, 8:16] = part1
+
+    # Update MV cache: left partition covers cols 0-1, right covers cols 2-3
+    for by in range(4):
+        for bx in range(2):
+            mv_cache.set_mv(mb_x, mb_y, bx, by, mvx[0], mvy[0])
+        for bx in range(2, 4):
+            mv_cache.set_mv(mb_x, mb_y, bx, by, mvx[1], mvy[1])
+
+    # Chroma reconstruction
+    cb, cr = _reconstruct_chroma_16x16(
+        ref_buffer, ref_idx[0], mvx[0], mvy[0], residual_cb, residual_cr, mb_x, mb_y
+    )
+
+    logger.debug(f"P_8x16 MB({mb_x},{mb_y}): MVs=[({mvx[0]},{mvy[0]}),({mvx[1]},{mvy[1]})]")
+
+    return luma, cb, cr
+
+
+def reconstruct_p_8x8(
+    ref_buffer: ReferenceFrameBuffer,
+    mv_cache: MVCache,
+    ref_idx: list,
+    mvx: list,
+    mvy: list,
+    sub_mb_types: list,
+    residual_luma: Optional[list],
+    residual_cb: Optional[np.ndarray],
+    residual_cr: Optional[np.ndarray],
+    mb_x: int,
+    mb_y: int,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Reconstruct P_8x8 macroblock (four 8x8 sub-macroblocks).
+
+    Sub-MB layout:
+        0 | 1
+        -----
+        2 | 3
+
+    Args:
+        ref_buffer: Reference frame buffer
+        mv_cache: MV cache for prediction and storage
+        ref_idx: List of 4 reference frame indices
+        mvx, mvy: Lists of 4 motion vectors in quarter-pixel units
+        sub_mb_types: List of 4 sub-MB types (0=8x8, 1=8x4, 2=4x8, 3=4x4)
+        residual_luma: List of 4 residual blocks (8x8 each) or None
+        residual_cb, residual_cr: 8x8 chroma residuals or None
+        mb_x, mb_y: Macroblock position
+
+    Returns:
+        Tuple of (luma, cb, cr) reconstructed blocks
+    """
+    luma = np.zeros((16, 16), dtype=np.uint8)
+
+    # Sub-MB positions within the macroblock
+    sub_mb_offsets = [(0, 0), (8, 0), (0, 8), (8, 8)]
+
+    for sub_idx in range(4):
+        part_x, part_y = sub_mb_offsets[sub_idx]
+
+        # For now, only handle sub_mb_type 0 (8x8)
+        part = reconstruct_p_partition(
+            ref_buffer=ref_buffer,
+            ref_idx=ref_idx[sub_idx],
+            mvx=mvx[sub_idx],
+            mvy=mvy[sub_idx],
+            mb_x=mb_x,
+            mb_y=mb_y,
+            part_x=part_x,
+            part_y=part_y,
+            width=8,
+            height=8,
+            residual_luma=residual_luma[sub_idx] if residual_luma else None,
+        )
+        luma[part_y:part_y+8, part_x:part_x+8] = part
+
+        # Update MV cache for this 8x8 sub-MB (covers 2x2 4x4 blocks)
+        bx_start = part_x // 4
+        by_start = part_y // 4
+        for by in range(by_start, by_start + 2):
+            for bx in range(bx_start, bx_start + 2):
+                mv_cache.set_mv(mb_x, mb_y, bx, by, mvx[sub_idx], mvy[sub_idx])
+
+    # Chroma reconstruction
+    cb, cr = _reconstruct_chroma_16x16(
+        ref_buffer, ref_idx[0], mvx[0], mvy[0], residual_cb, residual_cr, mb_x, mb_y
+    )
+
+    logger.debug(f"P_8x8 MB({mb_x},{mb_y}): MVs={list(zip(mvx, mvy))}")
+
+    return luma, cb, cr
+
+
+def _reconstruct_chroma_16x16(
+    ref_buffer: ReferenceFrameBuffer,
+    ref_idx: int,
+    mvx: int,
+    mvy: int,
+    residual_cb: Optional[np.ndarray],
+    residual_cr: Optional[np.ndarray],
+    mb_x: int,
+    mb_y: int,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Reconstruct chroma components for a P-macroblock.
+
+    Args:
+        ref_buffer: Reference frame buffer
+        ref_idx: Reference frame index
+        mvx, mvy: Motion vector (uses first partition's MV for simplicity)
+        residual_cb, residual_cr: 8x8 chroma residuals or None
+        mb_x, mb_y: Macroblock position
+
+    Returns:
+        Tuple of (cb, cr) reconstructed blocks
+    """
+    ref_frame = ref_buffer.get_frame(ref_idx)
+
+    # Chroma MV is half of luma MV
+    chroma_mvx = mvx >> 1
+    chroma_mvy = mvy >> 1
+    int_cmvx = chroma_mvx >> 2
+    int_cmvy = chroma_mvy >> 2
+    frac_cx = chroma_mvx & 3
+    frac_cy = chroma_mvy & 3
+
+    ref_cx = mb_x * 8 + int_cmvx
+    ref_cy = mb_y * 8 + int_cmvy
+
+    pred_cb = apply_chroma_prediction(
+        ref_frame.cb, ref_cx, ref_cy, frac_cx, frac_cy, 8, 8
+    )
+    pred_cr = apply_chroma_prediction(
+        ref_frame.cr, ref_cx, ref_cy, frac_cx, frac_cy, 8, 8
+    )
+
+    if residual_cb is not None:
+        cb = np.clip(
+            pred_cb.astype(np.int32) + residual_cb, 0, 255
+        ).astype(np.uint8)
+    else:
+        cb = pred_cb
+
+    if residual_cr is not None:
+        cr = np.clip(
+            pred_cr.astype(np.int32) + residual_cr, 0, 255
+        ).astype(np.uint8)
+    else:
+        cr = pred_cr
+
+    return cb, cr

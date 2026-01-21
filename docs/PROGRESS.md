@@ -3,7 +3,7 @@
 ## Current Status
 
 **Working:** I-frame and P-frame decoder for Baseline profile
-**Tests:** 566 passing
+**Tests:** 602 passing
 
 ## What Works
 
@@ -22,10 +22,11 @@
 | YCbCr → RGB | ✅ | BT.601 and BT.709 |
 | Multi-MB frames | ✅ | Neighbor pixel handling |
 | Reference frame buffer | ✅ | FIFO with configurable size |
-| Motion compensation | ✅ | Integer and fractional (quarter-pixel) |
+| Motion compensation | ✅ | Luma 6-tap + chroma bilinear interpolation |
 | MV prediction | ✅ | Spatial median prediction |
 | P_Skip macroblocks | ✅ | Zero-residual inter prediction |
 | P_L0_16x16 macroblocks | ✅ | Single partition inter |
+| P_16x8, P_8x16, P_8x8 | ✅ | Multiple partition modes |
 
 ## What Does NOT Work
 
@@ -33,7 +34,7 @@
 |---------|--------|-------|
 | I_8x8 macroblocks | ❌ | High profile only |
 | I_PCM macroblocks | ❌ | Raw sample blocks not implemented |
-| P_16x8, P_8x16, P_8x8 | ⚠️ | Partial - falls back to skip |
+| P_16x8, P_8x16, P_8x8 | ✅ | Luma reconstruction working |
 | B-frames | ❌ | Bi-directional prediction not implemented |
 | CABAC entropy | ❌ | Main/High profile only |
 | Deblocking filter | ❌ | Post-processing not implemented |
@@ -100,9 +101,9 @@ Tested against JM reference decoder:
 - [x] P_L0_16x16 macroblock reconstruction
 - [x] Decoder integration
 
-### ❌ Phase 4: Polish
-- [ ] P_16x8, P_8x16, P_8x8 partitions
-- [ ] Residual decoding for P-macroblocks
+### ⚠️ Phase 4: Polish
+- [x] P_16x8, P_8x16, P_8x8 partitions
+- [x] Residual decoding for P-macroblocks
 - [ ] Deblocking filter
 - [ ] Multiple slice support
 - [ ] Streaming decoder API
@@ -112,8 +113,8 @@ Tested against JM reference decoder:
 
 ```
 bitstream/     106 tests
+inter/         131 tests
 reconstruct/   102 tests
-inter/          95 tests
 intra/          62 tests
 parameters/     45 tests
 entropy/        35 tests
@@ -123,5 +124,5 @@ transform/      26 tests
 dequant/        25 tests
 color/          15 tests
 ─────────────────────────
-Total:         566 tests
+Total:         602 tests
 ```

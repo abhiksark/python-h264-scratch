@@ -396,3 +396,71 @@ def get_luma_block_fractional(
         block = avg.astype(np.uint8)
 
     return block
+
+
+def get_chroma_block_fractional(
+    ref_frame: np.ndarray,
+    x: int,
+    y: int,
+    dx: int,
+    dy: int,
+    width: int,
+    height: int
+) -> np.ndarray:
+    """Extract chroma block at fractional (eighth-pixel) position.
+
+    H.264 chroma motion compensation uses bilinear interpolation at
+    1/8-pixel precision. The fractional position is specified by dx and dy
+    in the range 0-7.
+
+    Formula (per H.264 spec section 8.4.2.2.2):
+        ((8-dx)*(8-dy)*A + dx*(8-dy)*B + (8-dx)*dy*C + dx*dy*D + 32) >> 6
+
+    Where A, B, C, D are the four surrounding integer samples:
+        A = (x, y)      B = (x+1, y)
+        C = (x, y+1)    D = (x+1, y+1)
+
+    Args:
+        ref_frame: Reference chroma frame (height x width), uint8
+        x: Integer part of horizontal position
+        y: Integer part of vertical position
+        dx: Fractional horizontal offset (0-7, in eighth-pixels)
+        dy: Fractional vertical offset (0-7, in eighth-pixels)
+        width: Output block width
+        height: Output block height
+
+    Returns:
+        Interpolated block of size (height, width), uint8
+
+    H.264 Spec: Section 8.4.2.2.2 - Chroma sample interpolation
+    """
+    # Integer position - direct copy
+    if dx == 0 and dy == 0:
+        return get_block_integer(ref_frame, x, y, width, height)
+
+    block = np.zeros((height, width), dtype=np.uint8)
+
+    # Precompute weights
+    wx0 = 8 - dx  # Weight for left column
+    wx1 = dx      # Weight for right column
+    wy0 = 8 - dy  # Weight for top row
+    wy1 = dy      # Weight for bottom row
+
+    for by in range(height):
+        for bx in range(width):
+            px = x + bx
+            py = y + by
+
+            # Get four surrounding integer samples
+            a = _get_sample(ref_frame, px, py)          # Top-left
+            b = _get_sample(ref_frame, px + 1, py)      # Top-right
+            c = _get_sample(ref_frame, px, py + 1)      # Bottom-left
+            d = _get_sample(ref_frame, px + 1, py + 1)  # Bottom-right
+
+            # Bilinear interpolation
+            result = (wx0 * wy0 * a + wx1 * wy0 * b +
+                      wx0 * wy1 * c + wx1 * wy1 * d + 32) >> 6
+
+            block[by, bx] = result
+
+    return block
