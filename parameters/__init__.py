@@ -27,6 +27,22 @@ from .pps import (
     parse_pps,
 )
 
+from .scaling import (
+    DEFAULT_4x4_INTRA,
+    DEFAULT_4x4_INTER,
+    DEFAULT_8x8_INTRA,
+    DEFAULT_8x8_INTER,
+    FLAT_4x4,
+    FLAT_8x8,
+    get_scaling_list_4x4,
+    get_scaling_list_8x8,
+    get_effective_scaling_list_4x4,
+    get_effective_scaling_list_8x8,
+    get_scaling_list_with_default,
+    get_chroma_scaling_list_4x4,
+    parse_scaling_list,
+)
+
 __all__ = [
     # SPS
     "SPS",
@@ -42,4 +58,17 @@ __all__ = [
     # PPS
     "PPS",
     "parse_pps",
+    # Scaling lists
+    "DEFAULT_4x4_INTRA",
+    "DEFAULT_4x4_INTER",
+    "DEFAULT_8x8_INTRA",
+    "DEFAULT_8x8_INTER",
+    "FLAT_4x4",
+    "FLAT_8x8",
+    "get_scaling_list_4x4",
+    "get_scaling_list_8x8",
+    "get_effective_scaling_list_4x4",
+    "get_effective_scaling_list_8x8",
+    "get_chroma_scaling_list_4x4",
+    "parse_scaling_list",
 ]
