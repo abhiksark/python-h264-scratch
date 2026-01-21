@@ -28,7 +28,7 @@ class TestSliceTracking:
         from parameters import SPS
 
         state = DecoderState()
-        # Create minimal SPS
+        # Create minimal SPS (2x2 MBs = 32x32 pixels)
         sps = SPS(
             profile_idc=66,
             level_idc=30,
@@ -40,8 +40,9 @@ class TestSliceTracking:
             pic_order_cnt_type=0,
             log2_max_pic_order_cnt_lsb_minus4=0,
             max_num_ref_frames=1,
-            pic_width_in_mbs=2,
-            frame_height_in_mbs=2,
+            pic_width_in_mbs_minus1=1,  # 2 MBs wide
+            pic_height_in_map_units_minus1=1,  # 2 MBs tall
+            frame_mbs_only_flag=True,
         )
 
         state.allocate_frame_buffers(sps)

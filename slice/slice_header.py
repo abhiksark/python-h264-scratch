@@ -153,7 +153,7 @@ class SliceHeader:
     ref_pic_list_modification_l1: Optional[RefPicListModification] = None
 
     # Prediction weights (for weighted prediction)
-    # Skipped for baseline - not needed
+    weighted_pred_table: Optional['WeightTable'] = None
 
     # Decoded reference picture marking
     dec_ref_pic_marking: Optional[DecRefPicMarking] = None

@@ -82,6 +82,10 @@ class PPS:
     pic_scaling_matrix_present_flag: bool = False
     pic_scaling_list_present_flag: List[bool] = field(default_factory=list)
 
+    # Scaling lists (High profile)
+    scaling_lists_4x4: List[List[int]] = field(default_factory=list)
+    scaling_lists_8x8: List[List[int]] = field(default_factory=list)
+
     @property
     def entropy_coding_mode(self) -> str:
         """Human-readable entropy coding mode."""
@@ -237,7 +241,17 @@ def parse_pps(rbsp: bytes, is_high_profile: bool = False) -> PPS:
                     pps.pic_scaling_list_present_flag.append(present)
                     if present:
                         size = 16 if i < 6 else 64
-                        _parse_scaling_list(reader, size)
+                        scaling_list = _parse_scaling_list(reader, size)
+                        if i < 6:
+                            pps.scaling_lists_4x4.append(scaling_list)
+                        else:
+                            pps.scaling_lists_8x8.append(scaling_list)
+                    else:
+                        # Use default (flat) scaling list
+                        if i < 6:
+                            pps.scaling_lists_4x4.append([16] * 16)
+                        else:
+                            pps.scaling_lists_8x8.append([16] * 64)
 
             pps.second_chroma_qp_index_offset = reader.read_se()
         except Exception:

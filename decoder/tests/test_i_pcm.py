@@ -20,7 +20,7 @@ class TestIPCMDetection:
 
     def test_i_pcm_mb_type_value(self):
         """I_PCM has mb_type = 25 in I-slices."""
-        from intra.i_macroblock import IMBType, parse_i_mb_type
+        from intra.i_pcm import IMBType, parse_i_mb_type
 
         mb_type = parse_i_mb_type(25)
 
@@ -49,7 +49,7 @@ class TestIPCMParsing:
         writer.write_bits(0b101, 3)  # 3 bits
         writer.write_bits(0, 5)  # Padding to byte
         writer.write_bits(128, 8)  # First PCM byte
-        data = writer.get_bytes()
+        data = writer.to_bytes()
 
         reader = BitReader(data)
         reader.read_bits(3)  # Now at bit position 3

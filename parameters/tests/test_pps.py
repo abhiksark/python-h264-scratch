@@ -313,3 +313,23 @@ class TestRealWorldPPS:
         assert pps.num_ref_idx_l1_default_active == 2
         assert pps.weighted_bipred_idc == 1
         assert pps.chroma_qp_index_offset == -2
+
+
+class TestPPSScalingListStorage:
+    """Tests for scaling list storage in PPS (High profile)."""
+
+    def test_pps_has_scaling_lists_4x4_field(self):
+        """PPS should have scaling_lists_4x4 field."""
+        pps = PPS()
+        assert hasattr(pps, 'scaling_lists_4x4')
+
+    def test_pps_has_scaling_lists_8x8_field(self):
+        """PPS should have scaling_lists_8x8 field."""
+        pps = PPS()
+        assert hasattr(pps, 'scaling_lists_8x8')
+
+    def test_pps_scaling_lists_default_empty(self):
+        """PPS scaling lists should default to empty lists."""
+        pps = PPS()
+        assert pps.scaling_lists_4x4 == []
+        assert pps.scaling_lists_8x8 == []

@@ -89,13 +89,20 @@ class TestChromaEdgeFiltering:
         from deblock.deblock import get_chroma_bs_from_luma
 
         # bS is determined by luma block properties
-        # Chroma 4x4 block corresponds to 8x8 luma region
-        luma_bs = np.array([[4, 3], [2, 1]])  # 2x2 luma blocks
+        # Luma has 4x4 bS values (one per 4x4 block in 16x16 MB)
+        # Chroma 4x4 block corresponds to 2x2 group of luma 4x4 blocks
+        luma_bs = np.array([
+            [4, 3, 2, 1],
+            [3, 2, 1, 0],
+            [2, 1, 0, 1],
+            [1, 0, 1, 2],
+        ])
 
         chroma_bs = get_chroma_bs_from_luma(luma_bs)
 
-        # Chroma takes max bS from corresponding luma blocks
-        assert chroma_bs[0, 0] == 4  # max of top-left 2x2
+        # Chroma takes max bS from corresponding 2x2 luma blocks
+        assert chroma_bs[0, 0] == 4  # max of top-left 2x2: max(4,3,3,2) = 4
+        assert chroma_bs[0, 1] == 2  # max of top-right 2x2: max(2,1,1,0) = 2
 
 
 class TestChromaMBDeblocking:
@@ -145,24 +152,30 @@ class TestChromaFrameDeblocking:
         """deblock_frame should filter both Cb and Cr planes."""
         from deblock.deblock import deblock_frame
 
-        # Create test frame
+        # Create test frame (2x2 MBs = 32x32 luma, 16x16 chroma)
         luma = np.full((32, 32), 128, dtype=np.uint8)
         cb = np.zeros((16, 16), dtype=np.uint8)
         cr = np.zeros((16, 16), dtype=np.uint8)
 
-        # Add chroma blocking artifacts
-        cb[0:8, 0:8] = 120
-        cb[0:8, 8:16] = 130
-        cb[8:16, :] = 125
+        # Add chroma blocking artifacts at internal edges (x=4, y=4 within each 8x8)
+        # For 4:2:0, each 8x8 chroma block is one MB's chroma
+        # Edge at x=4 within first 8x8 block
+        cb[0:8, 0:4] = 120
+        cb[0:8, 4:8] = 130
+        # Edge at y=4 within first 8x8 block
+        cb[0:4, 8:16] = 125
+        cb[4:8, 8:16] = 130
+        cb[8:16, :] = 128
 
-        cr[:, 0:8] = 125
-        cr[:, 8:16] = 130
+        cr[0:4, :] = 125
+        cr[4:8, :] = 130
+        cr[8:16, :] = 128
 
         luma_out, cb_out, cr_out = deblock_frame(
             luma=luma, cb=cb, cr=cr, mb_info=None, qp=26
         )
 
-        # Chroma planes should be modified
+        # Chroma planes should be modified at internal edges
         assert not np.array_equal(cb_out, cb), \
             "Cb plane should be filtered"
         assert not np.array_equal(cr_out, cr), \

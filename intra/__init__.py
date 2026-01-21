@@ -1,7 +1,7 @@
 # h264/intra/__init__.py
 """Intra prediction module for H.264 I-frames.
 
-Handles 16x16 and 4x4 luma prediction, and 8x8 chroma prediction.
+Handles 16x16, 8x8 (High profile), and 4x4 luma prediction.
 """
 
 from .intra_16x16 import (
@@ -30,6 +30,20 @@ from .intra_4x4 import (
     intra_4x4_horizontal_up,
 )
 
+from .intra_8x8 import (
+    Intra8x8Mode,
+    predict_intra_8x8,
+    intra_8x8_vertical,
+    intra_8x8_horizontal,
+    intra_8x8_dc,
+    intra_8x8_diagonal_down_left,
+    intra_8x8_diagonal_down_right,
+    intra_8x8_vertical_right,
+    intra_8x8_horizontal_down,
+    intra_8x8_vertical_left,
+    intra_8x8_horizontal_up,
+)
+
 __all__ = [
     # 16x16 prediction
     "Intra16x16Mode",
@@ -53,4 +67,16 @@ __all__ = [
     "intra_4x4_horizontal_down",
     "intra_4x4_vertical_left",
     "intra_4x4_horizontal_up",
+    # 8x8 prediction (High profile)
+    "Intra8x8Mode",
+    "predict_intra_8x8",
+    "intra_8x8_vertical",
+    "intra_8x8_horizontal",
+    "intra_8x8_dc",
+    "intra_8x8_diagonal_down_left",
+    "intra_8x8_diagonal_down_right",
+    "intra_8x8_vertical_right",
+    "intra_8x8_horizontal_down",
+    "intra_8x8_vertical_left",
+    "intra_8x8_horizontal_up",
 ]

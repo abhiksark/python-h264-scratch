@@ -431,3 +431,90 @@ class TestVLCTableConsistency:
         """run_before tables cover zerosLeft 1-7."""
         for zl in range(1, 8):
             assert zl in RUN_BEFORE, f"Missing zerosLeft={zl}"
+
+
+class TestZigzag8x8:
+    """Tests for 8x8 zigzag scan table."""
+
+    def test_zigzag_8x8_exists(self):
+        """ZIGZAG_8x8 table should exist."""
+        from entropy.tables import ZIGZAG_8x8
+        assert ZIGZAG_8x8 is not None
+
+    def test_zigzag_8x8_length(self):
+        """ZIGZAG_8x8 should have 64 elements."""
+        from entropy.tables import ZIGZAG_8x8
+        assert len(ZIGZAG_8x8) == 64
+
+    def test_zigzag_8x8_coverage(self):
+        """All 64 positions covered in 8x8 zigzag scan."""
+        from entropy.tables import ZIGZAG_8x8
+        assert set(ZIGZAG_8x8) == set(range(64))
+
+    def test_zigzag_8x8_starts_at_dc(self):
+        """First position is DC (0,0) = position 0."""
+        from entropy.tables import ZIGZAG_8x8
+        assert ZIGZAG_8x8[0] == 0
+
+    def test_zigzag_8x8_ends_at_last(self):
+        """Last position is (7,7) = position 63."""
+        from entropy.tables import ZIGZAG_8x8
+        assert ZIGZAG_8x8[-1] == 63
+
+    def test_zigzag_8x8_diagonal_pattern(self):
+        """Verify diagonal scan pattern at start."""
+        from entropy.tables import ZIGZAG_8x8
+        # First diagonal: (0,0)=0
+        # Second diagonal: (0,1)=1, (1,0)=8
+        # Third diagonal: (2,0)=16, (1,1)=9, (0,2)=2
+        expected_start = [0, 1, 8, 16, 9, 2, 3, 10]
+        assert list(ZIGZAG_8x8[:8]) == expected_start
+
+    def test_zigzag_8x8_inv_exists(self):
+        """ZIGZAG_8x8_INV inverse table should exist."""
+        from entropy.tables import ZIGZAG_8x8_INV
+        assert ZIGZAG_8x8_INV is not None
+
+    def test_zigzag_8x8_inv_roundtrip(self):
+        """Inverse zigzag should correctly invert the scan."""
+        from entropy.tables import ZIGZAG_8x8, ZIGZAG_8x8_INV
+        # zigzag[i] = raster_pos means inv[raster_pos] = i
+        for scan_idx, raster_pos in enumerate(ZIGZAG_8x8):
+            assert ZIGZAG_8x8_INV[raster_pos] == scan_idx
+
+
+class TestDecodeResidual8x8:
+    """Tests for 8x8 residual decoding."""
+
+    def test_decode_residual_8x8_exists(self):
+        """decode_residual_8x8 function should exist."""
+        from entropy.cavlc import decode_residual_8x8
+        assert callable(decode_residual_8x8)
+
+    def test_decode_empty_8x8(self):
+        """Decode empty 8x8 block."""
+        from entropy.cavlc import decode_residual_8x8
+
+        writer = BitWriter()
+        writer.write_bits(0b1, 1)  # TC=0 for nC=0
+        writer.write_bits(0, 7)
+        reader = BitReader(writer.to_bytes())
+
+        coeffs = decode_residual_8x8(reader, nC=0)
+
+        assert coeffs.shape == (8, 8)
+        assert np.all(coeffs == 0)
+
+    def test_decode_8x8_returns_correct_shape(self):
+        """8x8 residual returns 8x8 array."""
+        from entropy.cavlc import decode_residual_8x8
+
+        writer = BitWriter()
+        writer.write_bits(0b1, 1)  # TC=0
+        writer.write_bits(0, 7)
+        reader = BitReader(writer.to_bytes())
+
+        coeffs = decode_residual_8x8(reader, nC=0)
+
+        assert coeffs.shape == (8, 8)
+        assert coeffs.dtype == np.int32

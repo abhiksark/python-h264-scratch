@@ -32,7 +32,7 @@ class TestWeightedPredictionParsing:
         writer.write_se(0)   # luma_offset_l0[0]
         writer.write_bits(0, 1)  # chroma_weight_l0_flag[0]
 
-        reader = BitReader(writer.get_bytes())
+        reader = BitReader(writer.to_bytes())
 
         table = parse_pred_weight_table(reader, num_ref_idx_l0=1)
 

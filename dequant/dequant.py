@@ -56,6 +56,32 @@ POSITION_TYPE = np.array([
 ], dtype=np.int32)
 
 
+# 8x8 LevelScale lookup table (H.264 Table 8-14)
+# Indexed by [qp % 6][position_type] where position_type is 0-5 for 8x8
+LEVEL_SCALE_8x8 = np.array([
+    [20, 18, 32, 19, 25, 24],  # qp % 6 == 0
+    [22, 19, 35, 21, 28, 26],  # qp % 6 == 1
+    [26, 23, 42, 24, 33, 31],  # qp % 6 == 2
+    [28, 25, 45, 26, 35, 33],  # qp % 6 == 3
+    [32, 28, 51, 30, 40, 38],  # qp % 6 == 4
+    [36, 32, 58, 34, 46, 43],  # qp % 6 == 5
+], dtype=np.int32)
+
+
+# Position type map for 8x8 block (H.264 Table 8-15)
+# 6 position types for 8x8 blocks
+POSITION_TYPE_8x8 = np.array([
+    [0, 3, 4, 3, 0, 3, 4, 3],
+    [3, 1, 5, 1, 3, 1, 5, 1],
+    [4, 5, 2, 5, 4, 5, 2, 5],
+    [3, 1, 5, 1, 3, 1, 5, 1],
+    [0, 3, 4, 3, 0, 3, 4, 3],
+    [3, 1, 5, 1, 3, 1, 5, 1],
+    [4, 5, 2, 5, 4, 5, 2, 5],
+    [3, 1, 5, 1, 3, 1, 5, 1],
+], dtype=np.int32)
+
+
 def get_scale_matrix(qp: int) -> np.ndarray:
     """Get the 4x4 scaling matrix for a given QP.
 
@@ -233,6 +259,78 @@ def dequant_dc_2x2(
     else:
         # Use C-style truncation toward zero
         dequant = _rshift_toward_zero(dc_coeffs * scale + 1, 1)
+
+    return dequant.astype(np.int32)
+
+
+def get_scale_matrix_8x8(qp: int) -> np.ndarray:
+    """Get the 8x8 scaling matrix for a given QP.
+
+    Args:
+        qp: Quantization parameter (0-51)
+
+    Returns:
+        8x8 scaling matrix (int32)
+    """
+    qp_mod_6 = qp % 6
+    scales = LEVEL_SCALE_8x8[qp_mod_6]
+
+    # Build scale matrix based on position types
+    scale_matrix = np.zeros((8, 8), dtype=np.int32)
+    for i in range(8):
+        for j in range(8):
+            pos_type = POSITION_TYPE_8x8[i, j]
+            scale_matrix[i, j] = scales[pos_type]
+
+    return scale_matrix
+
+
+def dequant_8x8(
+    coeffs: np.ndarray,
+    qp: int,
+    scaling_list: list = None,
+) -> np.ndarray:
+    """Dequantize an 8x8 coefficient block (High profile).
+
+    Applies the inverse quantization scaling to transform coefficients.
+
+    Args:
+        coeffs: 8x8 quantized coefficients (int32)
+        qp: Quantization parameter (0-51)
+        scaling_list: Optional 64-element scaling list from SPS/PPS
+
+    Returns:
+        8x8 dequantized coefficients (int32)
+
+    H.264 Spec: Section 8.5.11
+    Formula: d[i,j] = c[i,j] * LevelScale8x8[qp%6][pos] * ScalingList[k] << (qp // 6)
+    where k = zigzag index of position (i, j)
+    """
+    if coeffs.shape != (8, 8):
+        raise ValueError(f"Expected 8x8 block, got {coeffs.shape}")
+
+    qp = max(0, min(51, qp))  # Clamp QP to valid range
+
+    qp_div_6 = qp // 6
+    qp_mod_6 = qp % 6
+
+    logger.debug(f"Dequantizing 8x8 with QP={qp} (div6={qp_div_6}, mod6={qp_mod_6})")
+
+    # Get scale matrix
+    scale_matrix = get_scale_matrix_8x8(qp)
+
+    # Apply scaling list if provided
+    if scaling_list is not None:
+        if len(scaling_list) != 64:
+            raise ValueError(f"Scaling list must have 64 elements, got {len(scaling_list)}")
+        # Reshape scaling list to 8x8 (row-major)
+        scaling_matrix = np.array(scaling_list, dtype=np.int32).reshape(8, 8)
+        scale_matrix = scale_matrix * scaling_matrix // 16
+
+    # Apply dequantization with left shift
+    dequant = (coeffs * scale_matrix) << qp_div_6
+
+    logger.debug(f"Dequantized 8x8 output: max={np.max(np.abs(dequant))}")
 
     return dequant.astype(np.int32)
 

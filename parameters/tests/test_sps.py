@@ -433,3 +433,196 @@ class TestRealWorldSPS:
         assert sps.cropped_height == 1080
         assert sps.profile_name == "Main"
         assert sps.level == "4.0"
+
+
+class TestScalingListStorage:
+    """Tests for scaling list storage in SPS (High profile)."""
+
+    def test_sps_has_scaling_lists_4x4_field(self):
+        """SPS should have scaling_lists_4x4 field."""
+        sps = SPS()
+        assert hasattr(sps, 'scaling_lists_4x4')
+
+    def test_sps_has_scaling_lists_8x8_field(self):
+        """SPS should have scaling_lists_8x8 field."""
+        sps = SPS()
+        assert hasattr(sps, 'scaling_lists_8x8')
+
+    def test_sps_scaling_lists_4x4_default_empty(self):
+        """SPS scaling_lists_4x4 should default to empty list."""
+        sps = SPS()
+        assert sps.scaling_lists_4x4 == []
+
+    def test_sps_scaling_lists_8x8_default_empty(self):
+        """SPS scaling_lists_8x8 should default to empty list."""
+        sps = SPS()
+        assert sps.scaling_lists_8x8 == []
+
+    def test_parse_high_profile_without_scaling_matrix(self):
+        """Parse High profile SPS without scaling matrix present."""
+        writer = BitWriter()
+
+        # High profile
+        writer.write_bits(100, 8)  # profile_idc (High)
+        writer.write_bits(0, 6)  # constraint flags
+        writer.write_bits(0, 2)  # reserved
+        writer.write_bits(40, 8)  # level_idc
+
+        writer.write_ue(0)  # sps_id
+
+        # High profile extensions
+        writer.write_ue(1)  # chroma_format_idc (4:2:0)
+        writer.write_ue(0)  # bit_depth_luma_minus8
+        writer.write_ue(0)  # bit_depth_chroma_minus8
+        writer.write_flag(False)  # qpprime_y_zero_transform_bypass_flag
+        writer.write_flag(False)  # seq_scaling_matrix_present_flag
+
+        # Standard SPS fields
+        writer.write_ue(0)  # log2_max_frame_num_minus4
+        writer.write_ue(2)  # pic_order_cnt_type
+        writer.write_ue(1)  # max_num_ref_frames
+        writer.write_flag(False)  # gaps
+
+        writer.write_ue(7)  # width - 1 (8 MBs)
+        writer.write_ue(5)  # height - 1 (6 MBs)
+
+        writer.write_flag(True)  # frame_mbs_only
+        writer.write_flag(True)  # direct_8x8_inference
+        writer.write_flag(False)  # no cropping
+        writer.write_flag(False)  # no vui
+
+        rbsp = writer.to_bytes()
+        sps = parse_sps(rbsp)
+
+        assert sps.profile_idc == 100
+        assert sps.seq_scaling_matrix_present_flag is False
+        assert sps.scaling_lists_4x4 == []
+        assert sps.scaling_lists_8x8 == []
+
+    def test_parse_high_profile_with_scaling_matrix_stores_lists(self):
+        """Parse High profile SPS with scaling matrix should store lists."""
+        writer = BitWriter()
+
+        # High profile
+        writer.write_bits(100, 8)  # profile_idc (High)
+        writer.write_bits(0, 6)
+        writer.write_bits(0, 2)
+        writer.write_bits(40, 8)
+
+        writer.write_ue(0)  # sps_id
+
+        # High profile extensions
+        writer.write_ue(1)  # chroma_format_idc
+        writer.write_ue(0)  # bit_depth_luma
+        writer.write_ue(0)  # bit_depth_chroma
+        writer.write_flag(False)  # qpprime bypass
+        writer.write_flag(True)  # seq_scaling_matrix_present_flag
+
+        # 8 scaling lists for 4:2:0 (6 for 4x4, 2 for 8x8)
+        for i in range(8):
+            writer.write_flag(True)  # list present
+            size = 16 if i < 6 else 64
+            # Write flat scaling list (all values = 16)
+            for _ in range(size):
+                writer.write_se(0)  # delta_scale = 0 means use last (default 8)
+
+        # Standard SPS fields
+        writer.write_ue(0)  # log2_max_frame_num
+        writer.write_ue(2)  # poc type
+        writer.write_ue(1)  # max ref frames
+        writer.write_flag(False)
+
+        writer.write_ue(7)
+        writer.write_ue(5)
+
+        writer.write_flag(True)
+        writer.write_flag(True)
+        writer.write_flag(False)
+        writer.write_flag(False)
+
+        rbsp = writer.to_bytes()
+        sps = parse_sps(rbsp)
+
+        assert sps.seq_scaling_matrix_present_flag is True
+        # Should have 6 4x4 lists and 2 8x8 lists
+        assert len(sps.scaling_lists_4x4) == 6
+        assert len(sps.scaling_lists_8x8) == 2
+
+    def test_scaling_list_4x4_has_16_elements(self):
+        """Each 4x4 scaling list should have 16 elements."""
+        writer = BitWriter()
+
+        writer.write_bits(100, 8)
+        writer.write_bits(0, 6)
+        writer.write_bits(0, 2)
+        writer.write_bits(40, 8)
+
+        writer.write_ue(0)
+        writer.write_ue(1)
+        writer.write_ue(0)
+        writer.write_ue(0)
+        writer.write_flag(False)
+        writer.write_flag(True)  # scaling matrix present
+
+        # Write 8 scaling lists
+        for i in range(8):
+            writer.write_flag(True)
+            size = 16 if i < 6 else 64
+            for _ in range(size):
+                writer.write_se(0)
+
+        writer.write_ue(0)
+        writer.write_ue(2)
+        writer.write_ue(1)
+        writer.write_flag(False)
+        writer.write_ue(7)
+        writer.write_ue(5)
+        writer.write_flag(True)
+        writer.write_flag(True)
+        writer.write_flag(False)
+        writer.write_flag(False)
+
+        rbsp = writer.to_bytes()
+        sps = parse_sps(rbsp)
+
+        for sl in sps.scaling_lists_4x4:
+            assert len(sl) == 16
+
+    def test_scaling_list_8x8_has_64_elements(self):
+        """Each 8x8 scaling list should have 64 elements."""
+        writer = BitWriter()
+
+        writer.write_bits(100, 8)
+        writer.write_bits(0, 6)
+        writer.write_bits(0, 2)
+        writer.write_bits(40, 8)
+
+        writer.write_ue(0)
+        writer.write_ue(1)
+        writer.write_ue(0)
+        writer.write_ue(0)
+        writer.write_flag(False)
+        writer.write_flag(True)
+
+        for i in range(8):
+            writer.write_flag(True)
+            size = 16 if i < 6 else 64
+            for _ in range(size):
+                writer.write_se(0)
+
+        writer.write_ue(0)
+        writer.write_ue(2)
+        writer.write_ue(1)
+        writer.write_flag(False)
+        writer.write_ue(7)
+        writer.write_ue(5)
+        writer.write_flag(True)
+        writer.write_flag(True)
+        writer.write_flag(False)
+        writer.write_flag(False)
+
+        rbsp = writer.to_bytes()
+        sps = parse_sps(rbsp)
+
+        for sl in sps.scaling_lists_8x8:
+            assert len(sl) == 64

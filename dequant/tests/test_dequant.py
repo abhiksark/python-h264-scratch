@@ -237,3 +237,110 @@ class TestIntegration:
         assert result[0, 0] != 0
         assert result[0, 1] != 0
         assert result[1, 0] != 0
+
+
+class TestDequant8x8:
+    """Tests for 8x8 dequantization (High profile)."""
+
+    def test_dequant_8x8_exists(self):
+        """dequant_8x8 function should exist."""
+        from dequant import dequant_8x8
+        assert callable(dequant_8x8)
+
+    def test_dequant_8x8_accepts_8x8_input(self):
+        """dequant_8x8 should accept 8x8 input."""
+        from dequant import dequant_8x8
+        coeffs = np.zeros((8, 8), dtype=np.int32)
+        result = dequant_8x8(coeffs, qp=26)
+        assert result.shape == (8, 8)
+
+    def test_dequant_8x8_returns_int32(self):
+        """dequant_8x8 should return int32 array."""
+        from dequant import dequant_8x8
+        coeffs = np.ones((8, 8), dtype=np.int32)
+        result = dequant_8x8(coeffs, qp=26)
+        assert result.dtype == np.int32
+
+    def test_dequant_8x8_rejects_wrong_shape(self):
+        """dequant_8x8 should reject non-8x8 input."""
+        from dequant import dequant_8x8
+        coeffs = np.zeros((4, 4), dtype=np.int32)
+        with pytest.raises(ValueError):
+            dequant_8x8(coeffs, qp=26)
+
+    def test_dequant_8x8_zero_coeffs_zero_output(self):
+        """Zero coefficients should produce zero output."""
+        from dequant import dequant_8x8
+        coeffs = np.zeros((8, 8), dtype=np.int32)
+        result = dequant_8x8(coeffs, qp=26)
+        np.testing.assert_array_equal(result, np.zeros((8, 8)))
+
+    def test_dequant_8x8_nonzero_coeffs_nonzero_output(self):
+        """Non-zero coefficients should produce non-zero output."""
+        from dequant import dequant_8x8
+        coeffs = np.ones((8, 8), dtype=np.int32)
+        result = dequant_8x8(coeffs, qp=26)
+        assert np.all(result != 0)
+
+    def test_dequant_8x8_scales_with_qp(self):
+        """Higher QP should produce larger dequantized values."""
+        from dequant import dequant_8x8
+        coeffs = np.ones((8, 8), dtype=np.int32)
+
+        result_low_qp = dequant_8x8(coeffs, qp=12)
+        result_high_qp = dequant_8x8(coeffs, qp=24)
+
+        # Higher QP means larger scaling
+        assert np.sum(np.abs(result_high_qp)) > np.sum(np.abs(result_low_qp))
+
+    def test_dequant_8x8_with_scaling_list(self):
+        """dequant_8x8 should accept optional scaling list."""
+        from dequant import dequant_8x8
+        coeffs = np.ones((8, 8), dtype=np.int32)
+        scaling_list = [16] * 64  # Flat scaling list
+        result = dequant_8x8(coeffs, qp=26, scaling_list=scaling_list)
+        assert result.shape == (8, 8)
+
+    def test_dequant_8x8_custom_scaling_affects_output(self):
+        """Custom scaling list should affect dequantization output."""
+        from dequant import dequant_8x8
+        coeffs = np.ones((8, 8), dtype=np.int32)
+
+        # Default (no scaling list)
+        result_default = dequant_8x8(coeffs, qp=26)
+
+        # Custom scaling list (double all values)
+        scaling_list = [32] * 64
+        result_scaled = dequant_8x8(coeffs, qp=26, scaling_list=scaling_list)
+
+        # Scaled result should be larger
+        assert np.sum(np.abs(result_scaled)) > np.sum(np.abs(result_default))
+
+    def test_dequant_8x8_qp_0(self):
+        """dequant_8x8 should work with QP=0."""
+        from dequant import dequant_8x8
+        coeffs = np.array([[10] * 8] * 8, dtype=np.int32)
+        result = dequant_8x8(coeffs, qp=0)
+        assert result.shape == (8, 8)
+        assert np.all(result != 0)
+
+    def test_dequant_8x8_qp_51(self):
+        """dequant_8x8 should work with QP=51 (max)."""
+        from dequant import dequant_8x8
+        coeffs = np.array([[1] * 8] * 8, dtype=np.int32)
+        result = dequant_8x8(coeffs, qp=51)
+        assert result.shape == (8, 8)
+
+
+class TestLevelScale8x8:
+    """Tests for 8x8 level scale table."""
+
+    def test_level_scale_8x8_exists(self):
+        """LEVEL_SCALE_8x8 table should exist."""
+        from dequant import LEVEL_SCALE_8x8
+        assert LEVEL_SCALE_8x8 is not None
+
+    def test_level_scale_8x8_shape(self):
+        """LEVEL_SCALE_8x8 should be 6x6 (qp%6 x position_type)."""
+        from dequant import LEVEL_SCALE_8x8
+        assert LEVEL_SCALE_8x8.shape == (6, 6)

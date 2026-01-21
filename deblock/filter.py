@@ -154,3 +154,93 @@ def filter_chroma_edge(
     q0_new = np.clip(q0 - delta, 0, 255)
 
     return int(p0_new), int(q0_new)
+
+
+def filter_chroma_vertical_edge(
+    chroma: np.ndarray,
+    edge_x: int,
+    bs: int,
+    alpha: int,
+    beta: int,
+    tc: int,
+) -> np.ndarray:
+    """Filter vertical edge in chroma plane.
+
+    Args:
+        chroma: 8x8 chroma block
+        edge_x: X position of edge (column index)
+        bs: Boundary strength
+        alpha: Alpha threshold
+        beta: Beta threshold
+        tc: Clipping threshold
+
+    Returns:
+        Filtered chroma block
+    """
+    result = chroma.copy()
+
+    if bs == 0 or edge_x < 1 or edge_x >= chroma.shape[1]:
+        return result
+
+    for y in range(chroma.shape[0]):
+        p0 = int(chroma[y, edge_x - 1])
+        p1 = int(chroma[y, edge_x - 2]) if edge_x >= 2 else p0
+        q0 = int(chroma[y, edge_x])
+        q1 = int(chroma[y, edge_x + 1]) if edge_x + 1 < chroma.shape[1] else q0
+
+        if not should_filter_edge(bs, alpha, beta, p0, p1, q0, q1):
+            continue
+
+        p = np.array([p1, p0], dtype=np.int32)
+        q = np.array([q0, q1], dtype=np.int32)
+        p0_new, q0_new = filter_chroma_edge(p, q, bs, tc)
+
+        result[y, edge_x - 1] = p0_new
+        result[y, edge_x] = q0_new
+
+    return result
+
+
+def filter_chroma_horizontal_edge(
+    chroma: np.ndarray,
+    edge_y: int,
+    bs: int,
+    alpha: int,
+    beta: int,
+    tc: int,
+) -> np.ndarray:
+    """Filter horizontal edge in chroma plane.
+
+    Args:
+        chroma: 8x8 chroma block
+        edge_y: Y position of edge (row index)
+        bs: Boundary strength
+        alpha: Alpha threshold
+        beta: Beta threshold
+        tc: Clipping threshold
+
+    Returns:
+        Filtered chroma block
+    """
+    result = chroma.copy()
+
+    if bs == 0 or edge_y < 1 or edge_y >= chroma.shape[0]:
+        return result
+
+    for x in range(chroma.shape[1]):
+        p0 = int(chroma[edge_y - 1, x])
+        p1 = int(chroma[edge_y - 2, x]) if edge_y >= 2 else p0
+        q0 = int(chroma[edge_y, x])
+        q1 = int(chroma[edge_y + 1, x]) if edge_y + 1 < chroma.shape[0] else q0
+
+        if not should_filter_edge(bs, alpha, beta, p0, p1, q0, q1):
+            continue
+
+        p = np.array([p1, p0], dtype=np.int32)
+        q = np.array([q0, q1], dtype=np.int32)
+        p0_new, q0_new = filter_chroma_edge(p, q, bs, tc)
+
+        result[edge_y - 1, x] = p0_new
+        result[edge_y, x] = q0_new
+
+    return result

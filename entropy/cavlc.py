@@ -36,6 +36,7 @@ from .tables import (
     RUN_BEFORE_DECODE,
     ZIGZAG_4x4,
     ZIGZAG_2x2,
+    ZIGZAG_8x8,
 )
 
 logger = logging.getLogger(__name__)
@@ -551,3 +552,34 @@ def calculate_nC(
         return nB
     else:
         return 0
+
+
+def decode_residual_8x8(
+    reader: BitReader,
+    nC: int
+) -> np.ndarray:
+    """Decode 8x8 residual block and return in raster order.
+
+    For High profile 8x8 transforms with CAVLC entropy coding.
+    Uses the 8x8 diagonal zigzag scan pattern.
+
+    Args:
+        reader: Bit reader
+        nC: Context value for coeff_token table selection
+
+    Returns:
+        8x8 coefficient array in raster order (int32)
+
+    H.264 Spec: Section 9.2, 7.4.5.3.3
+    Note: 8x8 CAVLC uses same coeff_token tables as 4x4.
+    For full implementation, total_zeros tables 9-9a to 9-9g are needed.
+    """
+    block = decode_residual_block(reader, nC, max_coeffs=64)
+
+    # Convert from scan order to raster order using 8x8 zigzag
+    coeffs_8x8 = np.zeros((8, 8), dtype=np.int32)
+    for i, pos in enumerate(ZIGZAG_8x8):
+        row, col = pos // 8, pos % 8
+        coeffs_8x8[row, col] = block.coefficients[i]
+
+    return coeffs_8x8

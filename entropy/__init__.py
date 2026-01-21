@@ -17,6 +17,7 @@ from .cavlc import (
     decode_run_before,
     decode_residual_block,
     decode_residual_4x4,
+    decode_residual_8x8,
     decode_chroma_dc,
     decode_luma_dc_16x16,
     calculate_nC,
@@ -26,6 +27,8 @@ from .tables import (
     ZIGZAG_4x4,
     ZIGZAG_2x2,
     ZIGZAG_4x4_INV,
+    ZIGZAG_8x8,
+    ZIGZAG_8x8_INV,
 )
 
 __all__ = [
@@ -38,6 +41,7 @@ __all__ = [
     "decode_run_before",
     "decode_residual_block",
     "decode_residual_4x4",
+    "decode_residual_8x8",
     "decode_chroma_dc",
     "decode_luma_dc_16x16",
     "calculate_nC",
@@ -45,4 +49,6 @@ __all__ = [
     "ZIGZAG_4x4",
     "ZIGZAG_2x2",
     "ZIGZAG_4x4_INV",
+    "ZIGZAG_8x8",
+    "ZIGZAG_8x8_INV",
 ]

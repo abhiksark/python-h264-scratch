@@ -155,6 +155,10 @@ class SPS:
     vui_parameters_present_flag: bool = False
     vui_parameters: Optional[VUIParameters] = None
 
+    # Scaling lists (High profile)
+    scaling_lists_4x4: List[List[int]] = field(default_factory=list)
+    scaling_lists_8x8: List[List[int]] = field(default_factory=list)
+
     # Derived values
     @property
     def profile_name(self) -> str:
@@ -427,13 +431,23 @@ def parse_sps(rbsp: bytes) -> SPS:
         sps.seq_scaling_matrix_present_flag = reader.read_flag()
 
         if sps.seq_scaling_matrix_present_flag:
-            # Parse scaling lists
+            # Parse and store scaling lists
             n_scaling_lists = 12 if sps.chroma_format_idc == 3 else 8
             for i in range(n_scaling_lists):
                 seq_scaling_list_present_flag = reader.read_flag()
                 if seq_scaling_list_present_flag:
                     size = 16 if i < 6 else 64
-                    _parse_scaling_list(reader, size)
+                    scaling_list = _parse_scaling_list(reader, size)
+                    if i < 6:
+                        sps.scaling_lists_4x4.append(scaling_list)
+                    else:
+                        sps.scaling_lists_8x8.append(scaling_list)
+                else:
+                    # Use default (flat) scaling list
+                    if i < 6:
+                        sps.scaling_lists_4x4.append([16] * 16)
+                    else:
+                        sps.scaling_lists_8x8.append([16] * 64)
 
     # Frame numbering
     sps.log2_max_frame_num_minus4 = reader.read_ue()

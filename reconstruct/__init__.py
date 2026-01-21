@@ -16,8 +16,14 @@ from .macroblock import (
     decode_i16x16_mb_type,
     decode_cbp_intra,
     decode_macroblock,
+    decode_intra8x8_pred_modes,
+    decode_and_reconstruct_i8x8_luma,
     reconstruct_i16x16_luma,
+    reconstruct_i8x8_luma,
+    reconstruct_i8x8_block,
     reconstruct_chroma,
+    BLOCK_SCAN_ORDER,
+    BLOCK_SCAN_ORDER_8x8,
 )
 
 __all__ = [
@@ -27,6 +33,12 @@ __all__ = [
     "decode_i16x16_mb_type",
     "decode_cbp_intra",
     "decode_macroblock",
+    "decode_intra8x8_pred_modes",
+    "decode_and_reconstruct_i8x8_luma",
     "reconstruct_i16x16_luma",
+    "reconstruct_i8x8_luma",
+    "reconstruct_i8x8_block",
     "reconstruct_chroma",
+    "BLOCK_SCAN_ORDER",
+    "BLOCK_SCAN_ORDER_8x8",
 ]

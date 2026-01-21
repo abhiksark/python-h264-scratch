@@ -52,6 +52,14 @@ from inter.p_reconstruct import (
     reconstruct_p_8x16,
     reconstruct_p_8x8,
 )
+from inter.b_macroblock import parse_b_mb_type, get_b_skip_info
+from inter.b_reconstruct import (
+    reconstruct_b_skip,
+    reconstruct_b_l0_16x16,
+    reconstruct_b_l1_16x16,
+    reconstruct_b_bi_16x16,
+    reconstruct_b_direct_16x16,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -128,6 +136,21 @@ class DecoderState:
     mb_types: Optional[np.ndarray] = None  # MB type per MB
     mb_coeffs: Optional[np.ndarray] = None  # Has non-zero coeffs per 4x4 block
 
+    # Slice tracking for multiple slice support
+    mb_slice_ids: Optional[np.ndarray] = None  # Which slice each MB belongs to
+    current_slice_id: int = 0  # Current slice being decoded
+
+    # B-frame reference lists
+    l0_list: list = field(default_factory=list)  # L0 reference list (past frames)
+    l1_list: list = field(default_factory=list)  # L1 reference list (future frames)
+
+    # POC tracking
+    prev_poc_msb: int = 0
+    prev_poc_lsb: int = 0
+
+    # CABAC context models (None = not initialized)
+    cabac_contexts: Optional[list] = None
+
     def get_sps(self, sps_id: int) -> SPS:
         """Get SPS by ID."""
         if sps_id not in self.sps_dict:
@@ -162,6 +185,10 @@ class DecoderState:
         self.mb_types = np.zeros(mb_count, dtype=np.int32)
         # 16 luma + 8 chroma 4x4 blocks per MB
         self.mb_coeffs = np.zeros((mb_count, 24), dtype=bool)
+
+        # Slice tracking
+        self.mb_slice_ids = np.zeros(mb_count, dtype=np.int32)
+        self.current_slice_id = 0
 
         logger.debug(
             f"Allocated frame buffers: {width}x{height} "
@@ -974,6 +1001,77 @@ class H264Decoder:
         # 2 = disable at slice boundaries
         return disable_idc != 1
 
+    def _decode_i_pcm_macroblock(
+        self,
+        reader: 'BitReader',
+        mb_x: int,
+        mb_y: int,
+    ) -> None:
+        """Decode I_PCM macroblock.
+
+        I_PCM contains raw, uncompressed samples.
+
+        Args:
+            reader: BitReader positioned after mb_type
+            mb_x, mb_y: Macroblock position
+        """
+        from intra.i_pcm import (
+            align_to_byte,
+            parse_i_pcm_luma,
+            parse_i_pcm_chroma,
+            get_i_pcm_nz_counts,
+        )
+
+        # Align to byte boundary
+        align_to_byte(reader)
+
+        # Parse raw samples
+        bit_depth = 8  # Baseline profile uses 8-bit
+        luma = parse_i_pcm_luma(reader, bit_depth)
+        cb, cr = parse_i_pcm_chroma(reader, bit_depth)
+
+        # Write to frame buffers
+        ly, lx = mb_y * 16, mb_x * 16
+        cy, cx = mb_y * 8, mb_x * 8
+
+        self.state.frame_luma[ly:ly + 16, lx:lx + 16] = luma.astype(np.uint8)
+        self.state.frame_cb[cy:cy + 8, cx:cx + 8] = cb.astype(np.uint8)
+        self.state.frame_cr[cy:cy + 8, cx:cx + 8] = cr.astype(np.uint8)
+
+        # Set nz_counts (all 16 for I_PCM)
+        mb_idx = mb_y * self.state.current_sps.pic_width_in_mbs + mb_x
+        self.state.nz_counts[mb_idx] = get_i_pcm_nz_counts()
+
+        logger.debug(f"I_PCM MB ({mb_x}, {mb_y})")
+
+    def _use_weighted_prediction(
+        self,
+        slice_header: 'SliceHeader',
+    ) -> bool:
+        """Check if weighted prediction should be used for this slice.
+
+        Args:
+            slice_header: Parsed slice header
+
+        Returns:
+            True if weighted prediction is enabled
+        """
+        if self.state.current_pps is None:
+            return False
+
+        pps = self.state.current_pps
+
+        # P-slices: check weighted_pred_flag
+        if slice_header.is_p_slice:
+            return getattr(pps, 'weighted_pred_flag', False)
+
+        # B-slices: check weighted_bipred_idc
+        if slice_header.is_b_slice:
+            weighted_bipred_idc = getattr(pps, 'weighted_bipred_idc', 0)
+            return weighted_bipred_idc > 0
+
+        return False
+
     def _is_slice_boundary(
         self,
         mb_x: int,
@@ -990,9 +1088,829 @@ class H264Decoder:
         Returns:
             True if the edge between these MBs is a slice boundary
         """
-        # For single-slice frames, no boundaries
-        # Full implementation would track which slice each MB belongs to
-        return False
+        if self.state.mb_slice_ids is None:
+            return False
+
+        sps = self.state.current_sps
+        if sps is None:
+            return False
+
+        mb_width = sps.pic_width_in_mbs
+        current_idx = mb_y * mb_width + mb_x
+        neighbor_idx = neighbor_mb_y * mb_width + neighbor_mb_x
+
+        return self.state.mb_slice_ids[current_idx] != self.state.mb_slice_ids[neighbor_idx]
+
+    def _continue_slice(
+        self,
+        reader: 'BitReader',
+        slice_header: 'SliceHeader',
+        sps: 'SPS',
+        pps: 'PPS',
+        slice_qp: int,
+    ) -> None:
+        """Continue decoding a slice from first_mb_in_slice.
+
+        Used when decoding multiple slices in a single frame.
+
+        Args:
+            reader: BitReader positioned at slice data
+            slice_header: Parsed slice header
+            sps: Active SPS
+            pps: Active PPS
+            slice_qp: Slice-level QP
+        """
+        # Increment slice ID for this new slice
+        self.state.current_slice_id += 1
+
+        # Decode from first_mb_in_slice
+        if slice_header.is_i_slice:
+            self._decode_slice_data(reader, slice_header, sps, pps, slice_qp)
+        elif slice_header.is_p_slice:
+            self._decode_p_slice_data(reader, slice_header, sps, pps, slice_qp)
+
+    def _get_slice_qp(self, slice_header: 'SliceHeader') -> int:
+        """Get the QP for a slice.
+
+        Args:
+            slice_header: Parsed slice header
+
+        Returns:
+            Slice QP value
+        """
+        pps = self.state.current_pps
+        if pps is None:
+            return 26 + slice_header.slice_qp_delta
+
+        return 26 + pps.pic_init_qp_minus26 + slice_header.slice_qp_delta
+
+    def _get_slice_group(self, mb_x: int, mb_y: int) -> int:
+        """Get the slice group for a macroblock.
+
+        Args:
+            mb_x, mb_y: Macroblock position
+
+        Returns:
+            Slice group ID
+        """
+        pps = self.state.current_pps
+        if pps is None or getattr(pps, 'num_slice_groups_minus1', 0) == 0:
+            return 0
+
+        sps = self.state.current_sps
+        if sps is None:
+            return 0
+
+        map_type = getattr(pps, 'slice_group_map_type', 0)
+
+        if map_type == 0:
+            return self._calc_interleaved_map(mb_x, mb_y)
+        elif map_type == 1:
+            return self._calc_dispersed_map(mb_x, mb_y)
+        else:
+            # Types 2-6 not implemented
+            return 0
+
+    def _calc_interleaved_map(self, mb_x: int, mb_y: int) -> int:
+        """Calculate slice group for interleaved pattern (type 0).
+
+        In interleaved mode, MBs are assigned to groups in runs.
+
+        Args:
+            mb_x, mb_y: Macroblock position
+
+        Returns:
+            Slice group ID
+        """
+        pps = self.state.current_pps
+        sps = self.state.current_sps
+
+        if pps is None or sps is None:
+            return 0
+
+        num_groups = getattr(pps, 'num_slice_groups_minus1', 0) + 1
+        run_length = getattr(pps, 'run_length_minus1', [0])
+
+        if num_groups == 1:
+            return 0
+
+        mb_width = sps.pic_width_in_mbs
+        mb_idx = mb_y * mb_width + mb_x
+
+        # Simple interleaving based on run_length
+        group = 0
+        remaining = mb_idx
+
+        while remaining >= 0 and group < num_groups:
+            run = run_length[group] + 1 if group < len(run_length) else 1
+            if remaining < run:
+                return group
+            remaining -= run
+            group = (group + 1) % num_groups
+
+        return 0
+
+    def _calc_dispersed_map(self, mb_x: int, mb_y: int) -> int:
+        """Calculate slice group for dispersed pattern (type 1).
+
+        In dispersed mode, MBs are assigned in a checkered pattern.
+
+        Args:
+            mb_x, mb_y: Macroblock position
+
+        Returns:
+            Slice group ID
+        """
+        pps = self.state.current_pps
+        sps = self.state.current_sps
+
+        if pps is None or sps is None:
+            return 0
+
+        num_groups = getattr(pps, 'num_slice_groups_minus1', 0) + 1
+
+        if num_groups == 1:
+            return 0
+
+        mb_width = sps.pic_width_in_mbs
+        mb_idx = mb_y * mb_width + mb_x
+
+        # Dispersed: cycle through groups based on MB position
+        return (mb_idx + mb_y * (num_groups // 2)) % num_groups
+
+    # -------------------------------------------------------------------------
+    # B-frame support methods
+    # -------------------------------------------------------------------------
+
+    def _decode_b_slice_data(
+        self,
+        reader: 'BitReader',
+        slice_header: 'SliceHeader',
+        sps: 'SPS',
+        pps: 'PPS',
+        slice_qp: int,
+    ) -> None:
+        """Decode B-slice data (macroblocks with bi-directional prediction).
+
+        B-slices can contain:
+        - B_Skip macroblocks (mb_skip_run)
+        - B_Direct_16x16, B_L0_16x16, B_L1_16x16, B_Bi_16x16
+        - Partition modes (16x8, 8x16, 8x8)
+        - I-macroblocks (intra in B-slice)
+
+        Args:
+            reader: BitReader positioned at slice data
+            slice_header: Parsed slice header
+            sps: Active SPS
+            pps: Active PPS
+            slice_qp: Slice-level QP
+        """
+        mb_width = sps.pic_width_in_mbs
+        mb_height = sps.frame_height_in_mbs
+        total_mbs = mb_width * mb_height
+
+        logger.debug(f"Decoding B-slice: {total_mbs} macroblocks")
+
+        current_qp = slice_qp
+        mb_idx = slice_header.first_mb_in_slice
+
+        # Get direct mode flag
+        use_spatial = getattr(slice_header, 'direct_spatial_mv_pred_flag', True)
+        current_poc = getattr(slice_header, 'pic_order_cnt_lsb', 0)
+
+        while mb_idx < total_mbs:
+            mb_x = mb_idx % mb_width
+            mb_y = mb_idx // mb_width
+
+            # Read mb_skip_run for B-slices
+            mb_skip_run = reader.read_ue()
+            logger.debug(f"mb_skip_run={mb_skip_run} at MB {mb_idx}")
+
+            # Process B_Skip macroblocks
+            for _ in range(mb_skip_run):
+                if mb_idx >= total_mbs:
+                    break
+
+                mb_x = mb_idx % mb_width
+                mb_y = mb_idx // mb_width
+
+                self._process_b_skip_run(
+                    mb_x, mb_y, use_spatial, current_poc
+                )
+                mb_idx += 1
+
+            # After skip run, decode regular macroblock
+            if mb_idx >= total_mbs:
+                break
+
+            mb_x = mb_idx % mb_width
+            mb_y = mb_idx // mb_width
+
+            # Read mb_type
+            mb_type_code = reader.read_ue()
+            mb_info = parse_b_mb_type(mb_type_code)
+
+            logger.debug(f"MB ({mb_x}, {mb_y}): type={mb_info.name}")
+
+            if mb_info.is_intra:
+                # I-macroblock in B-slice
+                mb_data = decode_macroblock(
+                    reader=reader,
+                    sps=sps,
+                    pps=pps,
+                    slice_qp=current_qp,
+                    mb_x=mb_x,
+                    mb_y=mb_y,
+                    frame_luma=self.state.frame_luma,
+                    frame_cb=self.state.frame_cb,
+                    frame_cr=self.state.frame_cr,
+                    is_i_slice=False,
+                )
+            else:
+                # B-macroblock
+                self._decode_b_macroblock(
+                    reader, mb_info, mb_x, mb_y, current_qp,
+                    sps, pps, use_spatial, current_poc
+                )
+
+            mb_idx += 1
+
+    def _build_b_slice_ref_lists(
+        self,
+        slice_header: 'SliceHeader',
+    ) -> None:
+        """Build L0 and L1 reference lists for B-slice.
+
+        L0 contains past frames, L1 contains future frames,
+        both ordered by POC distance.
+
+        Args:
+            slice_header: Parsed slice header
+        """
+        if self.state.ref_buffer is None:
+            self.state.l0_list = []
+            self.state.l1_list = []
+            return
+
+        current_poc = getattr(slice_header, 'pic_order_cnt_lsb', 0)
+        self.state.ref_buffer.build_ref_lists(current_poc)
+        self.state.l0_list = self.state.ref_buffer.get_l0_list()
+        self.state.l1_list = self.state.ref_buffer.get_l1_list()
+
+        logger.debug(
+            f"Built ref lists: L0={len(self.state.l0_list)}, "
+            f"L1={len(self.state.l1_list)}"
+        )
+
+    def _decode_b_macroblock(
+        self,
+        reader: 'BitReader',
+        mb_info,
+        mb_x: int,
+        mb_y: int,
+        qp: int,
+        sps: 'SPS',
+        pps: 'PPS',
+        use_spatial: bool,
+        current_poc: int,
+    ) -> None:
+        """Decode a single B-macroblock.
+
+        Args:
+            reader: BitReader
+            mb_info: Parsed BMacroblockInfo
+            mb_x, mb_y: Macroblock position
+            qp: Current QP
+            sps, pps: Parameter sets
+            use_spatial: True for spatial direct mode
+            current_poc: Picture order count
+        """
+        ly, lx = mb_y * 16, mb_x * 16
+        cy, cx = mb_y * 8, mb_x * 8
+
+        if mb_info.is_direct:
+            # B_Direct_16x16
+            luma, cb, cr = reconstruct_b_direct_16x16(
+                ref_buffer=self.state.ref_buffer,
+                mv_cache=self.state.mv_cache,
+                residual_luma=None,
+                residual_cb=None,
+                residual_cr=None,
+                mb_x=mb_x,
+                mb_y=mb_y,
+                use_spatial=use_spatial,
+                current_poc=current_poc,
+            )
+        elif mb_info.pred_mode == "L0":
+            # B_L0_16x16
+            ref_idx = 0
+            if len(self.state.l0_list) > 1:
+                ref_idx = reader.read_te(len(self.state.l0_list) - 1)
+
+            mvd_x = reader.read_se()
+            mvd_y = reader.read_se()
+
+            mvp_x, mvp_y = predict_mv_16x16(self.state.mv_cache, mb_x, mb_y)
+            mvx = mvp_x + mvd_x
+            mvy = mvp_y + mvd_y
+
+            self.state.mv_cache.set_mv_16x16(mb_x, mb_y, mvx, mvy)
+
+            luma, cb, cr = reconstruct_b_l0_16x16(
+                ref_buffer=self.state.ref_buffer,
+                ref_idx=ref_idx,
+                mvx=mvx,
+                mvy=mvy,
+                residual_luma=None,
+                residual_cb=None,
+                residual_cr=None,
+                mb_x=mb_x,
+                mb_y=mb_y,
+            )
+        elif mb_info.pred_mode == "L1":
+            # B_L1_16x16
+            ref_idx = 0
+            if len(self.state.l1_list) > 1:
+                ref_idx = reader.read_te(len(self.state.l1_list) - 1)
+
+            mvd_x = reader.read_se()
+            mvd_y = reader.read_se()
+
+            # Use L1 MV prediction (simplified: same as L0 for now)
+            mvp_x, mvp_y = predict_mv_16x16(self.state.mv_cache, mb_x, mb_y)
+            mvx = mvp_x + mvd_x
+            mvy = mvp_y + mvd_y
+
+            luma, cb, cr = reconstruct_b_l1_16x16(
+                ref_buffer=self.state.ref_buffer,
+                ref_idx=ref_idx,
+                mvx=mvx,
+                mvy=mvy,
+                residual_luma=None,
+                residual_cb=None,
+                residual_cr=None,
+                mb_x=mb_x,
+                mb_y=mb_y,
+            )
+        elif mb_info.pred_mode == "Bi":
+            # B_Bi_16x16
+            ref_idx_l0 = 0
+            ref_idx_l1 = 0
+            if len(self.state.l0_list) > 1:
+                ref_idx_l0 = reader.read_te(len(self.state.l0_list) - 1)
+            if len(self.state.l1_list) > 1:
+                ref_idx_l1 = reader.read_te(len(self.state.l1_list) - 1)
+
+            # L0 MVD
+            mvd_x_l0 = reader.read_se()
+            mvd_y_l0 = reader.read_se()
+            # L1 MVD
+            mvd_x_l1 = reader.read_se()
+            mvd_y_l1 = reader.read_se()
+
+            mvp_x, mvp_y = predict_mv_16x16(self.state.mv_cache, mb_x, mb_y)
+            mvx_l0 = mvp_x + mvd_x_l0
+            mvy_l0 = mvp_y + mvd_y_l0
+            mvx_l1 = mvp_x + mvd_x_l1
+            mvy_l1 = mvp_y + mvd_y_l1
+
+            luma, cb, cr = reconstruct_b_bi_16x16(
+                ref_buffer=self.state.ref_buffer,
+                ref_idx_l0=ref_idx_l0,
+                mvx_l0=mvx_l0,
+                mvy_l0=mvy_l0,
+                ref_idx_l1=ref_idx_l1,
+                mvx_l1=mvx_l1,
+                mvy_l1=mvy_l1,
+                residual_luma=None,
+                residual_cb=None,
+                residual_cr=None,
+                mb_x=mb_x,
+                mb_y=mb_y,
+            )
+        else:
+            # Fallback to direct mode
+            logger.warning(f"Unsupported B-MB pred_mode: {mb_info.pred_mode}")
+            luma, cb, cr = reconstruct_b_skip(
+                ref_buffer=self.state.ref_buffer,
+                mv_cache=self.state.mv_cache,
+                mb_x=mb_x,
+                mb_y=mb_y,
+                use_spatial=use_spatial,
+                current_poc=current_poc,
+            )
+
+        self.state.frame_luma[ly:ly + 16, lx:lx + 16] = luma
+        self.state.frame_cb[cy:cy + 8, cx:cx + 8] = cb
+        self.state.frame_cr[cy:cy + 8, cx:cx + 8] = cr
+
+    def _process_b_skip_run(
+        self,
+        mb_x: int,
+        mb_y: int,
+        use_spatial: bool,
+        current_poc: int,
+    ) -> None:
+        """Process a B_Skip macroblock.
+
+        B_Skip uses direct mode MV derivation with no residual.
+
+        Args:
+            mb_x, mb_y: Macroblock position
+            use_spatial: True for spatial direct mode
+            current_poc: Picture order count
+        """
+        luma, cb, cr = reconstruct_b_skip(
+            ref_buffer=self.state.ref_buffer,
+            mv_cache=self.state.mv_cache,
+            mb_x=mb_x,
+            mb_y=mb_y,
+            use_spatial=use_spatial,
+            current_poc=current_poc,
+        )
+
+        ly, lx = mb_y * 16, mb_x * 16
+        cy, cx = mb_y * 8, mb_x * 8
+        self.state.frame_luma[ly:ly + 16, lx:lx + 16] = luma
+        self.state.frame_cb[cy:cy + 8, cx:cx + 8] = cb
+        self.state.frame_cr[cy:cy + 8, cx:cx + 8] = cr
+
+        logger.debug(f"B_Skip MB ({mb_x}, {mb_y})")
+
+    def _calculate_poc(
+        self,
+        slice_header: 'SliceHeader',
+        sps: 'SPS',
+    ) -> int:
+        """Calculate Picture Order Count for current picture.
+
+        Args:
+            slice_header: Parsed slice header
+            sps: Active SPS
+
+        Returns:
+            Calculated POC value
+        """
+        poc_type = getattr(sps, 'pic_order_cnt_type', 0)
+
+        if poc_type == 0:
+            return self._calc_poc_type_0(slice_header, sps)
+        elif poc_type == 2:
+            return self._calc_poc_type_2(slice_header, sps)
+        else:
+            # Type 1 not implemented
+            return slice_header.frame_num * 2
+
+    def _calc_poc_type_0(
+        self,
+        slice_header: 'SliceHeader',
+        sps: 'SPS',
+    ) -> int:
+        """Calculate POC using type 0 (pic_order_cnt_lsb).
+
+        POC type 0 uses explicit LSB in slice header with MSB derivation.
+
+        Args:
+            slice_header: Parsed slice header
+            sps: Active SPS
+
+        Returns:
+            Calculated POC value
+        """
+        max_poc_lsb = 1 << (getattr(sps, 'log2_max_pic_order_cnt_lsb_minus4', 0) + 4)
+        poc_lsb = getattr(slice_header, 'pic_order_cnt_lsb', 0)
+
+        # Derive POC MSB
+        if poc_lsb < self.state.prev_poc_lsb and \
+           (self.state.prev_poc_lsb - poc_lsb) >= (max_poc_lsb // 2):
+            poc_msb = self.state.prev_poc_msb + max_poc_lsb
+        elif poc_lsb > self.state.prev_poc_lsb and \
+             (poc_lsb - self.state.prev_poc_lsb) > (max_poc_lsb // 2):
+            poc_msb = self.state.prev_poc_msb - max_poc_lsb
+        else:
+            poc_msb = self.state.prev_poc_msb
+
+        poc = poc_msb + poc_lsb
+
+        # Update state for next picture
+        self.state.prev_poc_msb = poc_msb
+        self.state.prev_poc_lsb = poc_lsb
+
+        return poc
+
+    def _calc_poc_type_2(
+        self,
+        slice_header: 'SliceHeader',
+        sps: 'SPS',
+    ) -> int:
+        """Calculate POC using type 2 (derived from frame_num).
+
+        POC type 2 derives POC directly from frame_num.
+
+        Args:
+            slice_header: Parsed slice header
+            sps: Active SPS
+
+        Returns:
+            Calculated POC value
+        """
+        # For non-reference pictures, POC = 2*frame_num - 1
+        # For reference pictures, POC = 2*frame_num
+        frame_num = slice_header.frame_num
+        return frame_num * 2
+
+    def _handle_frame_reordering(
+        self,
+        frame: 'DecodedFrame',
+    ) -> Optional['DecodedFrame']:
+        """Handle frame reordering for B-frames.
+
+        B-frames may be decoded out of display order.
+        This method manages the DPB to output frames in POC order.
+
+        Args:
+            frame: Decoded frame
+
+        Returns:
+            Frame to output (may be different from input due to reordering)
+        """
+        # For now, simple pass-through
+        # Full implementation would use DPB and output in POC order
+        return frame
+
+    def _use_weighted_bipred(
+        self,
+        slice_header: 'SliceHeader',
+    ) -> bool:
+        """Check if weighted bi-prediction should be used.
+
+        Args:
+            slice_header: Parsed slice header
+
+        Returns:
+            True if weighted bi-prediction is enabled
+        """
+        if self.state.current_pps is None:
+            return False
+
+        pps = self.state.current_pps
+        weighted_bipred_idc = getattr(pps, 'weighted_bipred_idc', 0)
+
+        # 0 = default (no weighted)
+        # 1 = explicit weighted
+        # 2 = implicit weighted
+        return weighted_bipred_idc > 0
+
+    def _store_mvs_in_ref(
+        self,
+        ref_frame: 'ReferenceFrame',
+    ) -> None:
+        """Store MVs in reference frame for temporal direct mode.
+
+        Args:
+            ref_frame: Reference frame to store MVs in
+        """
+        if self.state.mv_cache is None:
+            return
+
+        sps = self.state.current_sps
+        if sps is None:
+            return
+
+        for mb_y in range(sps.frame_height_in_mbs):
+            for mb_x in range(sps.pic_width_in_mbs):
+                mv = self.state.mv_cache.get_mv(mb_x, mb_y, 0, 0)
+                if mv != (0, 0):
+                    ref_frame.store_mv(mb_x, mb_y, mv[0], mv[1])
+
+    def _combine_partitions(
+        self,
+        partition_a: bytes,
+        partition_b: bytes,
+        partition_c: bytes,
+    ) -> bytes:
+        """Combine data partitions A, B, C into complete slice.
+
+        Data partitioning splits slice data:
+        - Partition A: Slice header, MB type, motion data
+        - Partition B: Intra residual data
+        - Partition C: Inter residual data
+
+        Args:
+            partition_a: Partition A NAL data
+            partition_b: Partition B NAL data
+            partition_c: Partition C NAL data
+
+        Returns:
+            Combined slice data
+        """
+        # Simple concatenation for basic support
+        # Full implementation would properly interleave based on MB syntax
+        return partition_a + partition_b + partition_c
+
+    # -------------------------------------------------------------------------
+    # CABAC entropy decoding support
+    # -------------------------------------------------------------------------
+
+    def _get_entropy_mode(self, entropy_flag: bool) -> str:
+        """Get entropy coding mode based on PPS flag.
+
+        Args:
+            entropy_flag: entropy_coding_mode_flag from PPS
+
+        Returns:
+            'cavlc' or 'cabac'
+        """
+        return 'cabac' if entropy_flag else 'cavlc'
+
+    def _init_cabac_contexts(
+        self,
+        slice_type: int,
+        slice_qp: int,
+    ) -> None:
+        """Initialize CABAC context models for a slice.
+
+        Args:
+            slice_type: Slice type (0=P, 1=B, 2=I)
+            slice_qp: Slice QP value
+        """
+        from entropy.cabac_context import init_context_models
+
+        self.state.cabac_contexts = init_context_models(slice_type, slice_qp)
+        logger.debug(f"Initialized CABAC contexts for slice_type={slice_type}, QP={slice_qp}")
+
+    def _create_cabac_decoder(
+        self,
+        reader: 'BitReader',
+    ) -> 'CABACDecoder':
+        """Create CABAC arithmetic decoder.
+
+        Args:
+            reader: BitReader positioned at CABAC data
+
+        Returns:
+            CABACDecoder instance
+        """
+        from entropy.cabac_arith import CABACDecoder
+
+        return CABACDecoder(reader)
+
+    def _decode_mb_skip_flag_cabac(
+        self,
+        cabac_decoder: 'CABACDecoder',
+        slice_type: int,
+        mb_x: int,
+        mb_y: int,
+    ) -> int:
+        """Decode mb_skip_flag using CABAC.
+
+        Args:
+            cabac_decoder: CABAC decoder
+            slice_type: Slice type
+            mb_x, mb_y: Macroblock position
+
+        Returns:
+            mb_skip_flag value (0 or 1)
+        """
+        from entropy.cabac_syntax import decode_mb_skip_flag
+
+        # Get neighbor skip status
+        mb_width = self.state.current_sps.pic_width_in_mbs
+        left_skip = False
+        top_skip = False
+
+        if mb_x > 0:
+            left_idx = mb_y * mb_width + (mb_x - 1)
+            left_skip = self.state.mb_types[left_idx] == -1  # -1 = skip
+        if mb_y > 0:
+            top_idx = (mb_y - 1) * mb_width + mb_x
+            top_skip = self.state.mb_types[top_idx] == -1
+
+        return decode_mb_skip_flag(
+            cabac_decoder, self.state.cabac_contexts,
+            slice_type, mb_x, mb_y, left_skip, top_skip
+        )
+
+    def _decode_residual_cabac(
+        self,
+        cabac_decoder: 'CABACDecoder',
+        max_coeff: int,
+        block_cat: int,
+    ) -> 'np.ndarray':
+        """Decode residual block using CABAC.
+
+        Args:
+            cabac_decoder: CABAC decoder
+            max_coeff: Maximum coefficients (4, 15, or 16)
+            block_cat: Block category (0-4)
+
+        Returns:
+            Array of coefficients
+        """
+        from entropy.cabac_residual import decode_residual_block_cabac
+
+        return decode_residual_block_cabac(
+            cabac_decoder, self.state.cabac_contexts, max_coeff, block_cat
+        )
+
+    def _decode_macroblock_cabac(
+        self,
+        cabac_decoder: 'CABACDecoder',
+        slice_type: int,
+        mb_x: int,
+        mb_y: int,
+        qp: int,
+    ) -> None:
+        """Decode a macroblock using CABAC.
+
+        Args:
+            cabac_decoder: CABAC decoder
+            slice_type: Slice type
+            mb_x, mb_y: Macroblock position
+            qp: Current QP
+        """
+        from entropy.cabac_syntax import (
+            decode_mb_type_i,
+            decode_mb_type_p,
+            decode_mb_type_b,
+        )
+
+        # Decode mb_type based on slice type
+        if slice_type == 2 or slice_type == 7:  # I-slice
+            mb_type = decode_mb_type_i(cabac_decoder, self.state.cabac_contexts)
+        elif slice_type == 0 or slice_type == 5:  # P-slice
+            mb_type = decode_mb_type_p(cabac_decoder, self.state.cabac_contexts)
+        else:  # B-slice
+            mb_type = decode_mb_type_b(cabac_decoder, self.state.cabac_contexts)
+
+        logger.debug(f"CABAC MB ({mb_x}, {mb_y}): type={mb_type}")
+
+        # Store mb_type for neighbor reference
+        mb_width = self.state.current_sps.pic_width_in_mbs
+        mb_idx = mb_y * mb_width + mb_x
+        self.state.mb_types[mb_idx] = mb_type
+
+        # TODO: Decode prediction modes, MVD, CBP, residual using CABAC
+        # For now, just placeholder
+
+    def _decode_slice_data_cabac(
+        self,
+        reader: 'BitReader',
+        slice_header: 'SliceHeader',
+        sps: 'SPS',
+        pps: 'PPS',
+        slice_qp: int,
+    ) -> None:
+        """Decode slice data using CABAC entropy coding.
+
+        Args:
+            reader: BitReader positioned at slice data
+            slice_header: Parsed slice header
+            sps: Active SPS
+            pps: Active PPS
+            slice_qp: Slice-level QP
+        """
+        mb_width = sps.pic_width_in_mbs
+        mb_height = sps.frame_height_in_mbs
+        total_mbs = mb_width * mb_height
+
+        # Initialize CABAC contexts
+        slice_type = slice_header.slice_type % 5
+        self._init_cabac_contexts(slice_type, slice_qp)
+
+        # Create CABAC decoder
+        cabac_decoder = self._create_cabac_decoder(reader)
+
+        logger.debug(f"Decoding CABAC slice: {total_mbs} macroblocks")
+
+        mb_idx = slice_header.first_mb_in_slice
+
+        while mb_idx < total_mbs:
+            mb_x = mb_idx % mb_width
+            mb_y = mb_idx // mb_width
+
+            # Check for mb_skip_flag (P/B slices only)
+            if slice_type in (0, 1):  # P or B slice
+                skip_flag = self._decode_mb_skip_flag_cabac(
+                    cabac_decoder, slice_type, mb_x, mb_y
+                )
+
+                if skip_flag == 1:
+                    # Skip this macroblock
+                    self.state.mb_types[mb_idx] = -1  # Mark as skipped
+                    mb_idx += 1
+                    continue
+
+            # Decode macroblock
+            self._decode_macroblock_cabac(
+                cabac_decoder, slice_type, mb_x, mb_y, slice_qp
+            )
+
+            # Check for end_of_slice
+            if cabac_decoder.decode_terminate() == 1:
+                break
+
+            mb_idx += 1
 
 
 def decode_h264_file(path: str) -> list:

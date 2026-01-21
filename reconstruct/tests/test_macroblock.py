@@ -504,3 +504,287 @@ class TestReconstructionPipeline:
 
         # Results should be different
         assert not np.array_equal(result_v, result_h)
+
+
+class TestI8x8BlockScanOrder:
+    """Tests for I_8x8 block scan order."""
+
+    def test_block_scan_order_8x8_exists(self):
+        """BLOCK_SCAN_ORDER_8x8 should exist."""
+        from reconstruct.macroblock import BLOCK_SCAN_ORDER_8x8
+        assert BLOCK_SCAN_ORDER_8x8 is not None
+
+    def test_block_scan_order_8x8_has_4_blocks(self):
+        """I_8x8 has 4 blocks."""
+        from reconstruct.macroblock import BLOCK_SCAN_ORDER_8x8
+        assert len(BLOCK_SCAN_ORDER_8x8) == 4
+
+    def test_block_scan_order_8x8_positions(self):
+        """I_8x8 blocks are at (0,0), (0,8), (8,0), (8,8)."""
+        from reconstruct.macroblock import BLOCK_SCAN_ORDER_8x8
+        expected = [(0, 0), (0, 8), (8, 0), (8, 8)]
+        assert list(BLOCK_SCAN_ORDER_8x8) == expected
+
+
+class TestReconstructI8x8Block:
+    """Tests for single I_8x8 block reconstruction."""
+
+    def test_reconstruct_i8x8_block_exists(self):
+        """reconstruct_i8x8_block function should exist."""
+        from reconstruct.macroblock import reconstruct_i8x8_block
+        assert callable(reconstruct_i8x8_block)
+
+    def test_reconstruct_i8x8_block_returns_8x8(self):
+        """reconstruct_i8x8_block should return 8x8 array."""
+        from reconstruct.macroblock import reconstruct_i8x8_block
+
+        residual = np.zeros((8, 8), dtype=np.int32)
+        top = np.full(8, 128, dtype=np.uint8)
+        left = np.full(8, 128, dtype=np.uint8)
+        top_right = np.full(8, 128, dtype=np.uint8)
+
+        result = reconstruct_i8x8_block(
+            mode=2,  # DC mode
+            residual=residual,
+            top=top,
+            left=left,
+            top_left=128,
+            top_right=top_right,
+            top_available=True,
+            left_available=True,
+            top_right_available=True,
+        )
+
+        assert result.shape == (8, 8)
+        assert result.dtype == np.uint8
+
+    def test_reconstruct_i8x8_dc_prediction(self):
+        """DC prediction with uniform neighbors."""
+        from reconstruct.macroblock import reconstruct_i8x8_block
+
+        residual = np.zeros((8, 8), dtype=np.int32)
+        top = np.full(8, 100, dtype=np.uint8)
+        left = np.full(8, 100, dtype=np.uint8)
+        top_right = np.full(8, 100, dtype=np.uint8)
+
+        result = reconstruct_i8x8_block(
+            mode=2,  # DC mode
+            residual=residual,
+            top=top,
+            left=left,
+            top_left=100,
+            top_right=top_right,
+            top_available=True,
+            left_available=True,
+            top_right_available=True,
+        )
+
+        # With uniform neighbors and zero residual, result should be 100
+        assert np.all(result == 100)
+
+    def test_reconstruct_i8x8_with_residual(self):
+        """Reconstruction with non-zero residual."""
+        from reconstruct.macroblock import reconstruct_i8x8_block
+
+        residual = np.full((8, 8), 10, dtype=np.int32)
+        top = np.full(8, 100, dtype=np.uint8)
+        left = np.full(8, 100, dtype=np.uint8)
+        top_right = np.full(8, 100, dtype=np.uint8)
+
+        result = reconstruct_i8x8_block(
+            mode=2,  # DC
+            residual=residual,
+            top=top,
+            left=left,
+            top_left=100,
+            top_right=top_right,
+            top_available=True,
+            left_available=True,
+            top_right_available=True,
+        )
+
+        # Prediction=100, residual=10, result should be 110
+        assert np.all(result == 110)
+
+
+class TestReconstructI8x8Luma:
+    """Tests for full I_8x8 luma macroblock reconstruction."""
+
+    def test_reconstruct_i8x8_luma_exists(self):
+        """reconstruct_i8x8_luma function should exist."""
+        from reconstruct.macroblock import reconstruct_i8x8_luma
+        assert callable(reconstruct_i8x8_luma)
+
+    def test_reconstruct_i8x8_luma_returns_16x16(self):
+        """I_8x8 reconstruction returns 16x16 block."""
+        from reconstruct.macroblock import reconstruct_i8x8_luma
+
+        modes = [2, 2, 2, 2]  # All DC mode
+        residuals = [np.zeros((8, 8), dtype=np.int32) for _ in range(4)]
+        neighbors_top = np.full(16, 128, dtype=np.uint8)
+        neighbors_left = np.full(16, 128, dtype=np.uint8)
+
+        result = reconstruct_i8x8_luma(
+            modes, residuals,
+            neighbors_top, neighbors_left, 128
+        )
+
+        assert result.shape == (16, 16)
+        assert result.dtype == np.uint8
+
+    def test_reconstruct_i8x8_luma_dc_uniform(self):
+        """I_8x8 with DC mode and uniform neighbors."""
+        from reconstruct.macroblock import reconstruct_i8x8_luma
+
+        modes = [2, 2, 2, 2]  # All DC mode
+        residuals = [np.zeros((8, 8), dtype=np.int32) for _ in range(4)]
+        neighbors_top = np.full(16, 128, dtype=np.uint8)
+        neighbors_left = np.full(16, 128, dtype=np.uint8)
+
+        result = reconstruct_i8x8_luma(
+            modes, residuals,
+            neighbors_top, neighbors_left, 128
+        )
+
+        # With uniform DC prediction, all pixels should be 128
+        assert np.all(result == 128)
+
+
+class TestDecodeIntra8x8PredModes:
+    """Tests for I_8x8 prediction mode decoding."""
+
+    def test_decode_intra8x8_pred_modes_exists(self):
+        """decode_intra8x8_pred_modes function should exist."""
+        from reconstruct.macroblock import decode_intra8x8_pred_modes
+        assert callable(decode_intra8x8_pred_modes)
+
+    def test_decode_intra8x8_pred_modes_returns_4_modes(self):
+        """decode_intra8x8_pred_modes returns 4 modes."""
+        from reconstruct.macroblock import decode_intra8x8_pred_modes
+
+        # Create bitstream with 4 predicted modes (all prev_flag=1)
+        writer = BitWriter()
+        for _ in range(4):
+            writer.write_bits(1, 1)  # prev_intra8x8_pred_mode_flag = 1
+        writer.write_bits(0, 4)  # Padding
+        reader = BitReader(writer.to_bytes())
+
+        modes = decode_intra8x8_pred_modes(reader)
+        assert len(modes) == 4
+
+    def test_decode_intra8x8_pred_modes_with_rem_mode(self):
+        """decode_intra8x8_pred_modes handles rem_intra8x8_pred_mode."""
+        from reconstruct.macroblock import decode_intra8x8_pred_modes
+
+        # Create bitstream: prev_flag=0, rem_mode=0 for first block
+        writer = BitWriter()
+        writer.write_bits(0, 1)  # prev_flag = 0
+        writer.write_bits(0, 3)  # rem_mode = 0
+        # Remaining 3 blocks use predicted mode
+        for _ in range(3):
+            writer.write_bits(1, 1)
+        writer.write_bits(0, 4)  # Padding
+        reader = BitReader(writer.to_bytes())
+
+        modes = decode_intra8x8_pred_modes(reader)
+        assert len(modes) == 4
+        # First mode should be 0 (rem_mode=0 < predicted_mode=2, so mode=0)
+        assert modes[0] == 0
+
+
+class TestDecodeAndReconstructI8x8Luma:
+    """Tests for full I_8x8 decode from bitstream."""
+
+    def test_decode_and_reconstruct_i8x8_luma_exists(self):
+        """decode_and_reconstruct_i8x8_luma function should exist."""
+        from reconstruct.macroblock import decode_and_reconstruct_i8x8_luma
+        assert callable(decode_and_reconstruct_i8x8_luma)
+
+    def test_decode_and_reconstruct_i8x8_luma_cbp_zero(self):
+        """I_8x8 with no coefficients returns prediction only."""
+        from reconstruct.macroblock import (
+            decode_and_reconstruct_i8x8_luma,
+            CodedBlockPattern,
+        )
+
+        # Create empty bitstream (no coefficients to decode)
+        writer = BitWriter()
+        writer.write_bits(0, 8)  # Padding
+        reader = BitReader(writer.to_bytes())
+
+        # All DC modes (mode 2)
+        modes = [2, 2, 2, 2]
+
+        # CBP with no luma coefficients
+        cbp = CodedBlockPattern(luma=0, chroma=0)
+
+        # Frame buffer with neighbors
+        frame_luma = np.full((32, 32), 128, dtype=np.uint8)
+        nz_counts = np.zeros(24, dtype=np.int32)
+
+        result = decode_and_reconstruct_i8x8_luma(
+            reader=reader,
+            modes=modes,
+            cbp=cbp,
+            qp=28,
+            frame_luma=frame_luma,
+            mb_x=1,
+            mb_y=1,
+            nz_counts=nz_counts,
+        )
+
+        # Should return 16x16 result
+        assert result.shape == (16, 16)
+        # DC mode with 128 neighbors should predict ~128
+        assert np.all(result == 128)
+
+    def test_decode_and_reconstruct_i8x8_no_neighbors(self):
+        """I_8x8 at top-left corner (no neighbors) uses DC fallback."""
+        from reconstruct.macroblock import (
+            decode_and_reconstruct_i8x8_luma,
+            CodedBlockPattern,
+        )
+
+        writer = BitWriter()
+        writer.write_bits(0, 8)
+        reader = BitReader(writer.to_bytes())
+
+        modes = [2, 2, 2, 2]  # DC mode
+        cbp = CodedBlockPattern(luma=0, chroma=0)
+        frame_luma = np.zeros((16, 16), dtype=np.uint8)
+        nz_counts = np.zeros(24, dtype=np.int32)
+
+        result = decode_and_reconstruct_i8x8_luma(
+            reader=reader,
+            modes=modes,
+            cbp=cbp,
+            qp=28,
+            frame_luma=frame_luma,
+            mb_x=0,
+            mb_y=0,
+            nz_counts=nz_counts,
+        )
+
+        assert result.shape == (16, 16)
+        # DC fallback should produce 128
+        assert np.all(result == 128)
+
+
+class TestMacroblockDataI8x8Fields:
+    """Tests for I_8x8 fields in MacroblockData."""
+
+    def test_macroblock_data_has_i8x8_fields(self):
+        """MacroblockData should have I_8x8 fields."""
+        from reconstruct.macroblock import MacroblockData
+
+        mb = MacroblockData()
+        assert hasattr(mb, 'intra_8x8_pred_modes')
+        assert hasattr(mb, 'transform_size_8x8_flag')
+
+    def test_macroblock_data_i8x8_defaults(self):
+        """MacroblockData I_8x8 fields have correct defaults."""
+        from reconstruct.macroblock import MacroblockData
+
+        mb = MacroblockData()
+        assert mb.intra_8x8_pred_modes == []
+        assert mb.transform_size_8x8_flag is False

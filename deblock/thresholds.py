@@ -4,6 +4,18 @@
 H.264 Spec Reference: Section 8.7.2.2 - Tables 8-16, 8-17
 """
 
+# QPC table: maps luma QP (qPI) to chroma QP (QPC)
+# From H.264 Table 8-15
+# For qPI <= 29, QPC = qPI. For qPI > 29, QPC grows slower.
+QPC_TABLE = [
+    0, 1, 2, 3, 4, 5, 6, 7, 8, 9,           # qPI 0-9
+    10, 11, 12, 13, 14, 15, 16, 17, 18, 19,  # qPI 10-19
+    20, 21, 22, 23, 24, 25, 26, 27, 28, 29,  # qPI 20-29
+    29, 30, 31, 32, 32, 33, 34, 34, 35, 35,  # qPI 30-39
+    36, 36, 37, 37, 37, 38, 38, 38, 39, 39,  # qPI 40-49
+    39, 39,                                   # qPI 50-51
+]
+
 # Alpha threshold table indexed by indexA (0-51)
 # From H.264 Table 8-16
 ALPHA_TABLE = [
@@ -79,3 +91,16 @@ def get_tc0(index_a: int, bs: int) -> int:
         return 0
     index_a = max(0, min(51, index_a))
     return TC0_TABLE[index_a][bs - 1]
+
+
+def get_chroma_qp(luma_qp: int) -> int:
+    """Get chroma QP from luma QP using QPC table.
+
+    Args:
+        luma_qp: Luma quantization parameter (0-51)
+
+    Returns:
+        Chroma QP (QPC)
+    """
+    qp_clamped = max(0, min(51, luma_qp))
+    return QPC_TABLE[qp_clamped]
