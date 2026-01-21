@@ -22,6 +22,15 @@ import numpy as np
 logger = logging.getLogger(__name__)
 
 
+def _rshift_toward_zero(x: np.ndarray, n: int) -> np.ndarray:
+    """Right shift with truncation toward zero (C-style semantics).
+
+    Python's >> truncates toward -∞, C truncates toward 0.
+    H.264 spec uses C semantics.
+    """
+    return np.where(x >= 0, x >> n, -(-x >> n))
+
+
 # LevelScale lookup table from H.264 spec Table 8-13
 # Indexed by [qp % 6][position_type]
 # position_type: 0 = (0,0), (0,2), (2,0), (2,2) - corners
@@ -184,7 +193,8 @@ def dequant_dc_4x4(
         dequant = dc_coeffs * scale
     else:
         # For qp < 6: shift right with rounding
-        dequant = (dc_coeffs * scale + 1) >> 1
+        # Use C-style truncation toward zero
+        dequant = _rshift_toward_zero(dc_coeffs * scale + 1, 1)
 
     return dequant.astype(np.int32)
 
@@ -221,7 +231,8 @@ def dequant_dc_2x2(
     if qp_div_6 >= 1:
         dequant = (dc_coeffs * scale) << (qp_div_6 - 1)
     else:
-        dequant = (dc_coeffs * scale + 1) >> 1
+        # Use C-style truncation toward zero
+        dequant = _rshift_toward_zero(dc_coeffs * scale + 1, 1)
 
     return dequant.astype(np.int32)
 
