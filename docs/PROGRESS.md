@@ -2,8 +2,8 @@
 
 ## Current Status
 
-**Working:** I-frame decoder for Baseline profile (I_16x16 and I_4x4 macroblocks)
-**Tests:** 471 passing
+**Working:** I-frame and P-frame decoder for Baseline profile
+**Tests:** 566 passing
 
 ## What Works
 
@@ -11,7 +11,7 @@
 |---------|--------|-------|
 | NAL unit parsing | ✅ | Start codes, emulation prevention |
 | SPS/PPS parsing | ✅ | Baseline through High profile syntax |
-| Slice header parsing | ✅ | I-slices fully supported |
+| Slice header parsing | ✅ | I-slices and P-slices supported |
 | CAVLC entropy decoding | ✅ | All VLC tables, correct scan order |
 | Inverse quantization | ✅ | QP 0-51, DC/AC scaling |
 | 4x4 Integer IDCT | ✅ | Spec-compliant |
@@ -21,6 +21,11 @@
 | Chroma prediction | ✅ | All 4 modes |
 | YCbCr → RGB | ✅ | BT.601 and BT.709 |
 | Multi-MB frames | ✅ | Neighbor pixel handling |
+| Reference frame buffer | ✅ | FIFO with configurable size |
+| Motion compensation | ✅ | Integer and fractional (quarter-pixel) |
+| MV prediction | ✅ | Spatial median prediction |
+| P_Skip macroblocks | ✅ | Zero-residual inter prediction |
+| P_L0_16x16 macroblocks | ✅ | Single partition inter |
 
 ## What Does NOT Work
 
@@ -28,12 +33,11 @@
 |---------|--------|-------|
 | I_8x8 macroblocks | ❌ | High profile only |
 | I_PCM macroblocks | ❌ | Raw sample blocks not implemented |
-| P-frames | ❌ | Motion compensation not implemented |
+| P_16x8, P_8x16, P_8x8 | ⚠️ | Partial - falls back to skip |
 | B-frames | ❌ | Bi-directional prediction not implemented |
 | CABAC entropy | ❌ | Main/High profile only |
 | Deblocking filter | ❌ | Post-processing not implemented |
 | Multiple slices | ⚠️ | Untested |
-| Multiple frames | ⚠️ | Only first frame decoded |
 | Interlaced video | ❌ | Frame-only |
 
 ## Known Issues
@@ -53,10 +57,10 @@
 | dequant/ | ✅ Complete | `dequant_4x4`, `dequant_dc_4x4` |
 | transform/ | ✅ Complete | `idct_4x4`, `hadamard_4x4`, `hadamard_2x2` |
 | intra/ | ✅ Complete | `predict_intra_16x16`, `predict_intra_4x4` |
-| inter/ | ❌ Not Started | Motion compensation |
+| inter/ | ✅ Complete | `ReferenceFrameBuffer`, `get_luma_block_fractional`, `MVCache`, `predict_mv_*`, `reconstruct_p_*` |
 | reconstruct/ | ✅ Complete | `reconstruct_i16x16_luma`, `reconstruct_i4x4_luma` |
 | color/ | ✅ Complete | `ycbcr_to_rgb`, `upsample_420` |
-| decoder/ | 🟡 Partial | `decode_h264_bytes` (I-frames only) |
+| decoder/ | ✅ Complete | `decode_h264_bytes` (I and P frames) |
 | test_utils/ | ✅ Complete | `compare_with_jm`, `load_yuv_420` |
 
 ## Decoder Accuracy
@@ -85,15 +89,20 @@ Tested against JM reference decoder:
 - [x] I_4x4 prediction (9 modes)
 - [x] I_4x4 macroblock reconstruction
 - [x] Fix CAVLC coefficient scan order
-- [ ] I_PCM macroblocks
+- [ ] I_PCM macroblocks (optional)
 
-### ❌ Phase 3: P-frame Support
-- [ ] Motion vector prediction
-- [ ] Motion compensation
-- [ ] Reference frame buffer
-- [ ] Inter prediction modes
+### ✅ Phase 3: P-frame Support
+- [x] Reference frame buffer
+- [x] Motion vector prediction (spatial median)
+- [x] Motion compensation (integer + fractional)
+- [x] 6-tap filter for half-pixel interpolation
+- [x] P_Skip macroblock reconstruction
+- [x] P_L0_16x16 macroblock reconstruction
+- [x] Decoder integration
 
 ### ❌ Phase 4: Polish
+- [ ] P_16x8, P_8x16, P_8x8 partitions
+- [ ] Residual decoding for P-macroblocks
 - [ ] Deblocking filter
 - [ ] Multiple slice support
 - [ ] Streaming decoder API
@@ -104,6 +113,7 @@ Tested against JM reference decoder:
 ```
 bitstream/     106 tests
 reconstruct/   102 tests
+inter/          95 tests
 intra/          62 tests
 parameters/     45 tests
 entropy/        35 tests
@@ -113,5 +123,5 @@ transform/      26 tests
 dequant/        25 tests
 color/          15 tests
 ─────────────────────────
-Total:         471 tests
+Total:         566 tests
 ```
