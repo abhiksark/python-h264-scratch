@@ -30,7 +30,7 @@ from bitstream import BitReader
 from parameters import SPS, PPS
 from dequant import dequant_4x4, dequant_dc_4x4, dequant_dc_2x2, get_chroma_qp
 from transform import idct_4x4, hadamard_4x4, hadamard_2x2
-from intra import predict_intra_16x16, Intra16x16Mode
+from intra import predict_intra_16x16, Intra16x16Mode, predict_intra_4x4
 from entropy import decode_residual_block, calculate_nC, ZIGZAG_4x4
 
 logger = logging.getLogger(__name__)
@@ -268,6 +268,425 @@ def _clip_block(block: np.ndarray) -> np.ndarray:
     return np.clip(block, 0, 255).astype(np.uint8)
 
 
+# Block scan order for 4x4 blocks within 16x16 macroblock
+# Uses raster scan within 8x8 blocks, then 8x8 blocks in raster order
+# Block layout:
+#   0  1  4  5
+#   2  3  6  7
+#   8  9  12 13
+#   10 11 14 15
+BLOCK_SCAN_ORDER = [
+    (0, 0), (0, 4), (4, 0), (4, 4),       # 8x8 block 0 (top-left)
+    (0, 8), (0, 12), (4, 8), (4, 12),     # 8x8 block 1 (top-right)
+    (8, 0), (8, 4), (12, 0), (12, 4),     # 8x8 block 2 (bottom-left)
+    (8, 8), (8, 12), (12, 8), (12, 12),   # 8x8 block 3 (bottom-right)
+]
+
+
+def decode_intra4x4_pred_modes(
+    reader: BitReader,
+    neighbor_modes: Optional[List[int]] = None,
+) -> List[int]:
+    """Decode 16 Intra_4x4 prediction modes from bitstream.
+
+    H.264 Spec 7.3.5.1, 8.3.1.1:
+    For each 4x4 block:
+    - prev_intra4x4_pred_mode_flag: if 1, use predicted mode
+    - rem_intra4x4_pred_mode: if flag=0, provides mode (3 bits)
+
+    The predicted mode is min(modeA, modeB) where A and B are
+    left and top neighbor block modes.
+
+    Args:
+        reader: Bit reader positioned at prediction mode data
+        neighbor_modes: Modes from neighboring MBs (for blocks on edge)
+
+    Returns:
+        List of 16 prediction modes (0-8)
+    """
+    modes = []
+    # Track modes as we decode for prediction
+    decoded_modes = {}  # block_idx -> mode
+
+    for block_idx in range(16):
+        # Get predicted mode from neighbors
+        row, col = BLOCK_SCAN_ORDER[block_idx]
+
+        # Find left neighbor mode
+        if col > 0:
+            # Left neighbor is within this MB
+            left_idx = _find_block_at_position(row, col - 4)
+            mode_a = decoded_modes.get(left_idx, 2)  # Default DC
+        else:
+            # Left neighbor from external MB (or unavailable)
+            mode_a = 2  # DC as default
+
+        # Find top neighbor mode
+        if row > 0:
+            # Top neighbor is within this MB
+            top_idx = _find_block_at_position(row - 4, col)
+            mode_b = decoded_modes.get(top_idx, 2)  # Default DC
+        else:
+            # Top neighbor from external MB (or unavailable)
+            mode_b = 2  # DC as default
+
+        predicted_mode = min(mode_a, mode_b)
+
+        # Read flag
+        prev_flag = reader.read_bits(1)
+
+        if prev_flag == 1:
+            mode = predicted_mode
+        else:
+            rem = reader.read_bits(3)
+            if rem < predicted_mode:
+                mode = rem
+            else:
+                mode = rem + 1
+
+        modes.append(mode)
+        decoded_modes[block_idx] = mode
+
+    return modes
+
+
+def _find_block_at_position(row: int, col: int) -> int:
+    """Find block index for given (row, col) position."""
+    for idx, (r, c) in enumerate(BLOCK_SCAN_ORDER):
+        if r == row and c == col:
+            return idx
+    return -1
+
+
+def get_4x4_block_neighbors(
+    frame: np.ndarray,
+    block_row: int,
+    block_col: int,
+    mb_row: int,
+    mb_col: int,
+    frame_width_mbs: int = 0,
+) -> dict:
+    """Get neighbor pixels for a 4x4 block.
+
+    Args:
+        frame: Reconstructed frame so far (or current MB buffer)
+        block_row: Row position of block within MB (0, 4, 8, or 12)
+        block_col: Column position of block within MB (0, 4, 8, or 12)
+        mb_row: Macroblock row in frame
+        mb_col: Macroblock column in frame
+        frame_width_mbs: Frame width in macroblocks
+
+    Returns:
+        Dict with:
+        - top: 4 pixels above (or None)
+        - left: 4 pixels to left (or None)
+        - top_left: corner pixel (or None)
+        - top_right: 4 pixels above-right (or None)
+        - top_available, left_available, top_right_available: booleans
+    """
+    result = {
+        'top': None,
+        'left': None,
+        'top_left': None,
+        'top_right': None,
+        'top_available': False,
+        'left_available': False,
+        'top_right_available': False,
+    }
+
+    frame_height, frame_width = frame.shape
+    # Absolute position in frame
+    abs_row = mb_row * 16 + block_row
+    abs_col = mb_col * 16 + block_col
+
+    # Top neighbors
+    if abs_row > 0:
+        result['top'] = frame[abs_row - 1, abs_col:abs_col + 4].copy()
+        result['top_available'] = True
+
+    # Left neighbors
+    if abs_col > 0:
+        result['left'] = frame[abs_row:abs_row + 4, abs_col - 1].copy()
+        result['left_available'] = True
+
+    # Top-left neighbor
+    if abs_row > 0 and abs_col > 0:
+        result['top_left'] = int(frame[abs_row - 1, abs_col - 1])
+
+    # Top-right neighbors (4 pixels above and to the right)
+    if abs_row > 0 and abs_col + 4 < frame_width:
+        # Check if top-right block is available
+        # Top-right is not available for rightmost block in each 8x8
+        if block_col < 12 or (block_col == 12 and block_row >= 4):
+            # More complex availability check needed per spec
+            result['top_right'] = frame[abs_row - 1, abs_col + 4:abs_col + 8].copy()
+            if len(result['top_right']) == 4:
+                result['top_right_available'] = True
+
+    return result
+
+
+def reconstruct_i4x4_block(
+    mode: int,
+    residual: np.ndarray,
+    top: Optional[np.ndarray],
+    left: Optional[np.ndarray],
+    top_left: Optional[int],
+    top_right: Optional[np.ndarray],
+    top_available: bool,
+    left_available: bool,
+    top_right_available: bool,
+) -> np.ndarray:
+    """Reconstruct a single 4x4 block.
+
+    Args:
+        mode: Intra 4x4 prediction mode (0-8)
+        residual: 4x4 residual block (from IDCT)
+        top, left, top_left, top_right: Neighbor pixels
+        *_available: Neighbor availability flags
+
+    Returns:
+        Reconstructed 4x4 block (uint8)
+    """
+    from intra import predict_intra_4x4
+
+    # Generate prediction
+    prediction = predict_intra_4x4(
+        mode=mode,
+        top=top,
+        left=left,
+        top_left=top_left,
+        top_right=top_right,
+        top_available=top_available,
+        left_available=left_available,
+        top_right_available=top_right_available,
+    )
+
+    # Add residual
+    result = prediction.astype(np.int32) + residual
+
+    # Clip to valid range
+    return _clip_block(result)
+
+
+def reconstruct_i4x4_luma(
+    modes: List[int],
+    residuals: List[np.ndarray],
+    neighbors_top: Optional[np.ndarray],
+    neighbors_left: Optional[np.ndarray],
+    neighbor_top_left: Optional[int],
+) -> np.ndarray:
+    """Reconstruct I_4x4 (I_NxN) luma macroblock.
+
+    Processes 16 4x4 blocks in scan order, using previously
+    reconstructed blocks as neighbors for later blocks.
+
+    Args:
+        modes: 16 prediction modes (one per 4x4 block)
+        residuals: 16 residual blocks (4x4 each)
+        neighbors_top: Top neighbor row (16 pixels) or None
+        neighbors_left: Left neighbor column (16 pixels) or None
+        neighbor_top_left: Top-left corner pixel or None
+
+    Returns:
+        Reconstructed 16x16 luma block
+    """
+    from intra import predict_intra_4x4
+
+    # Initialize output buffer
+    luma = np.zeros((16, 16), dtype=np.uint8)
+    DEFAULT_VALUE = 128
+
+    for block_idx in range(16):
+        row, col = BLOCK_SCAN_ORDER[block_idx]
+        mode = modes[block_idx]
+        residual = residuals[block_idx]
+
+        # Determine neighbor availability and values
+        # Top neighbors
+        if row == 0:
+            # Use external top neighbors
+            if neighbors_top is not None:
+                top = neighbors_top[col:col + 4].copy()
+                top_available = True
+            else:
+                top = None
+                top_available = False
+        else:
+            # Use from reconstructed luma buffer
+            top = luma[row - 1, col:col + 4].copy()
+            top_available = True
+
+        # Left neighbors
+        if col == 0:
+            # Use external left neighbors
+            if neighbors_left is not None:
+                left = neighbors_left[row:row + 4].copy()
+                left_available = True
+            else:
+                left = None
+                left_available = False
+        else:
+            # Use from reconstructed luma buffer
+            left = luma[row:row + 4, col - 1].copy()
+            left_available = True
+
+        # Top-left neighbor
+        if row == 0 and col == 0:
+            top_left = neighbor_top_left
+        elif row == 0:
+            # Top-left is from external top
+            if neighbors_top is not None and col > 0:
+                top_left = int(neighbors_top[col - 1])
+            else:
+                top_left = None
+        elif col == 0:
+            # Top-left is from external left
+            if neighbors_left is not None and row > 0:
+                top_left = int(neighbors_left[row - 1])
+            else:
+                top_left = None
+        else:
+            # Top-left is from reconstructed buffer
+            top_left = int(luma[row - 1, col - 1])
+
+        # Top-right neighbors
+        top_right = None
+        top_right_available = False
+        if row == 0 and col + 4 <= 12:
+            # External top-right
+            if neighbors_top is not None:
+                top_right = neighbors_top[col + 4:col + 8].copy()
+                if len(top_right) == 4:
+                    top_right_available = True
+        elif row > 0 and col + 4 < 16:
+            # Internal top-right - but need to check if that block
+            # is already decoded (it's to the right, so not yet)
+            # Top-right comes from row above
+            if _is_top_right_available(block_idx):
+                top_right = luma[row - 1, col + 4:col + 8].copy()
+                if len(top_right) == 4:
+                    top_right_available = True
+
+        # Generate prediction
+        prediction = predict_intra_4x4(
+            mode=mode,
+            top=top,
+            left=left,
+            top_left=top_left,
+            top_right=top_right,
+            top_available=top_available,
+            left_available=left_available,
+            top_right_available=top_right_available,
+        )
+
+        # Add residual and clip
+        result = prediction.astype(np.int32) + residual
+        luma[row:row + 4, col:col + 4] = _clip_block(result)
+
+    return luma
+
+
+def _is_top_right_available(block_idx: int) -> bool:
+    """Check if top-right neighbor is available for a block.
+
+    H.264 Spec 6.4.4: Top-right is not available for:
+    - Blocks 3, 7, 11, 15 (rightmost in each row of 8x8)
+    - Block 13 (special case in bottom-right 8x8)
+    """
+    # Blocks where top-right is NOT available
+    unavailable = {3, 7, 11, 13, 15}
+    return block_idx not in unavailable
+
+
+def _get_i4x4_neighbors(
+    frame_luma: np.ndarray,
+    mb_luma: np.ndarray,
+    mb_x: int,
+    mb_y: int,
+    row: int,
+    col: int,
+    block_idx: int
+) -> Tuple[Optional[np.ndarray], Optional[np.ndarray], Optional[int], Optional[np.ndarray]]:
+    """Get neighbor pixels for I_4x4 prediction.
+
+    Combines pixels from:
+    - Frame buffer (for neighbors outside this MB)
+    - Already-reconstructed blocks in current MB
+
+    Args:
+        frame_luma: Full frame luma buffer
+        mb_luma: Current macroblock's partially reconstructed luma
+        mb_x, mb_y: Macroblock position
+        row, col: 4x4 block position within MB (0,4,8,12)
+        block_idx: Block index (0-15)
+
+    Returns:
+        Tuple of (top_4, left_4, top_left, top_right_4)
+        Each may be None if unavailable
+    """
+    luma_y = mb_y * 16
+    luma_x = mb_x * 16
+
+    # Absolute position in frame
+    abs_y = luma_y + row
+    abs_x = luma_x + col
+
+    # Top neighbors (4 pixels above this block)
+    if row > 0:
+        # Inside MB - use already reconstructed
+        top = mb_luma[row - 1, col:col + 4].copy()
+    elif mb_y > 0:
+        # Use frame buffer
+        top = frame_luma[abs_y - 1, abs_x:abs_x + 4].copy()
+    else:
+        top = None
+
+    # Left neighbors (4 pixels to the left)
+    if col > 0:
+        # Inside MB
+        left = mb_luma[row:row + 4, col - 1].copy()
+    elif mb_x > 0:
+        # Use frame buffer
+        left = frame_luma[abs_y:abs_y + 4, abs_x - 1].copy()
+    else:
+        left = None
+
+    # Top-left corner
+    if row > 0 and col > 0:
+        # Inside MB
+        top_left = int(mb_luma[row - 1, col - 1])
+    elif row > 0 and col == 0 and mb_x > 0:
+        # Left edge of MB, top-left is in frame buffer
+        top_left = int(frame_luma[abs_y - 1, abs_x - 1])
+    elif row == 0 and col > 0 and mb_y > 0:
+        # Top edge of MB, top-left is in frame buffer
+        top_left = int(frame_luma[abs_y - 1, abs_x - 1])
+    elif row == 0 and col == 0 and mb_y > 0 and mb_x > 0:
+        # Corner of MB
+        top_left = int(frame_luma[abs_y - 1, abs_x - 1])
+    else:
+        top_left = None
+
+    # Top-right neighbors (4 pixels above and to the right)
+    # Availability depends on block position (H.264 6.4.4)
+    top_right = None
+    if _is_top_right_available(block_idx):
+        if row > 0 and col + 4 < 16:
+            # Inside MB
+            top_right = mb_luma[row - 1, col + 4:col + 8].copy()
+        elif row == 0 and mb_y > 0:
+            # Top edge - check if we can get from frame
+            if abs_x + 4 < frame_luma.shape[1]:
+                top_right = frame_luma[abs_y - 1, abs_x + 4:abs_x + 8].copy()
+
+    # If top_right not available but top is, extend with last top pixel
+    if top_right is None and top is not None:
+        top_right = np.full(4, top[-1], dtype=top.dtype)
+
+    return top, left, top_left, top_right
+
+
 def reconstruct_i16x16_luma(
     reader: BitReader,
     pred_mode: int,
@@ -319,8 +738,9 @@ def reconstruct_i16x16_luma(
     nz_counts[0] = dc_block.total_coeff  # Store for context
 
     # Arrange DC coefficients in 4x4 and apply inverse Hadamard
-    # Use raster order for coefficient placement
-    # NOTE: This works for uniform-color MBs. Complex gradients may need investigation.
+    # The DC block coefficients are in scan order (position in array = scan index)
+    # Place directly in raster order - the scan order for I_16x16 DC
+    # matches the spatial block arrangement
     dc_4x4 = np.zeros((4, 4), dtype=np.int32)
     for i in range(min(16, len(dc_block.coefficients))):
         row, col = i // 4, i % 4
@@ -536,18 +956,12 @@ def decode_macroblock(
 
     # Determine MB properties based on type
     if mb.mb_type == MBType.I_NxN:
-        # I_4x4: Parse 4x4 prediction modes
-        # Each block has prev_intra4x4_pred_mode_flag, and optionally rem_intra4x4_pred_mode
-        mb.intra_4x4_pred_modes = []
-        for _ in range(16):
-            prev_flag = reader.read_bit()
-            if prev_flag:
-                # Use predicted mode (DC for now since we don't track neighbors)
-                mb.intra_4x4_pred_modes.append(2)  # DC mode
-            else:
-                # Read remaining prediction mode (3 bits)
-                rem_mode = reader.read_bits(3)
-                mb.intra_4x4_pred_modes.append(rem_mode)
+        # I_4x4: Parse prediction modes using proper neighbor-based prediction
+        # decode_intra4x4_pred_modes handles:
+        #   - prev_intra4x4_pred_mode_flag and rem_intra4x4_pred_mode parsing
+        #   - predicted mode calculation from neighbors (min of left and top)
+        #   - mode mapping formula: rem < pred ? rem : rem + 1
+        mb.intra_4x4_pred_modes = decode_intra4x4_pred_modes(reader, neighbor_modes=None)
 
         # Parse coded_block_pattern
         cbp_coded = reader.read_ue()
@@ -614,25 +1028,54 @@ def decode_macroblock(
             mb.nz_counts
         )
     else:
-        # I_4x4 - simplified: decode coefficients to keep sync, use DC prediction
-        prediction = np.full((16, 16), 128, dtype=np.int32)
-        if neighbors_top_luma is not None:
-            prediction[:8, :] = int(np.mean(neighbors_top_luma))
-        if neighbors_left_luma is not None:
-            prediction[:, :8] = int(np.mean(neighbors_left_luma))
+        # I_4x4: Full reconstruction with 9 prediction modes per block
+        # Process blocks in scan order, each using previously reconstructed neighbors
+        mb.luma = np.zeros((16, 16), dtype=np.uint8)
 
-        # Read coefficients for each 4x4 block to keep bitstream in sync
-        # I_4x4 has all 16 coefficients per block (DC included, no separate Hadamard)
         for block_idx in range(16):
+            row, col = BLOCK_SCAN_ORDER[block_idx]
+
+            # Get neighbor pixels for this 4x4 block
+            # Must use reconstructed pixels from: frame buffer + already-done blocks in this MB
+            top, left, top_left, top_right = _get_i4x4_neighbors(
+                frame_luma, mb.luma, mb_x, mb_y, row, col, block_idx
+            )
+
+            # Generate prediction using the decoded mode
+            mode = mb.intra_4x4_pred_modes[block_idx]
+            pred = predict_intra_4x4(mode, top, left, top_left, top_right)
+
             # Check if this 8x8 region has coefficients
-            block_8x8_idx = (block_idx // 4)  # 0-3
+            block_8x8_idx = block_idx // 4  # 0-3 (which quadrant)
             if mb.cbp.has_luma_8x8(block_8x8_idx):
-                # Read the 4x4 block coefficients (all 16, DC included)
-                nC = calculate_nC(None, None)  # Simplified
+                # Decode residual coefficients (all 16, no separate DC Hadamard for I_4x4)
+                nC = calculate_nC(None, None)  # TODO: use proper neighbor nC
                 block = decode_residual_block(reader, nC, max_coeffs=16)
                 mb.nz_counts[block_idx] = block.total_coeff
 
-        mb.luma = _clip_block(prediction)
+                # Dequantize and inverse transform
+                if block.total_coeff > 0:
+                    coeffs = np.zeros(16, dtype=np.int32)
+                    for i, (level, pos) in enumerate(zip(block.levels, block.run_before)):
+                        coeffs[pos] = level
+                    # Reorder from zigzag to raster
+                    coeffs_2d = np.zeros((4, 4), dtype=np.int32)
+                    for i in range(16):
+                        coeffs_2d[ZIGZAG_4x4[i] // 4, ZIGZAG_4x4[i] % 4] = coeffs[i]
+                    dequant = dequant_4x4(coeffs_2d, qp)
+                    residual = idct_4x4(dequant)
+                else:
+                    residual = np.zeros((4, 4), dtype=np.int32)
+            else:
+                residual = np.zeros((4, 4), dtype=np.int32)
+                mb.nz_counts[block_idx] = 0
+
+            # Add prediction + residual and clip
+            result = pred.astype(np.int32) + residual
+            result = np.clip(result, 0, 255).astype(np.uint8)
+
+            # Store in macroblock luma
+            mb.luma[row:row+4, col:col+4] = result
 
     # Reconstruct chroma
     mb.cb = reconstruct_chroma(
