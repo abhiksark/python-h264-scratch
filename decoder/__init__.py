@@ -16,6 +16,13 @@ from .decoder import (
     decode_h264_bytes,
 )
 
+from .poc import (
+    POCCalculator,
+    calculate_poc,
+)
+
+from . import poc  # For 'from decoder import poc' style imports
+
 from .i8x8 import (
     is_i8x8_macroblock,
     validate_i8x8_profile,
@@ -76,6 +83,10 @@ __all__ = [
     "DecoderState",
     "decode_h264_file",
     "decode_h264_bytes",
+    # POC Calculator
+    "poc",
+    "POCCalculator",
+    "calculate_poc",
     # I_8x8 support
     "is_i8x8_macroblock",
     "validate_i8x8_profile",
