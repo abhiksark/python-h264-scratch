@@ -505,8 +505,10 @@ class TestFullMacroblockCABAC:
         from entropy.cabac_context import init_context_models
         from entropy.cabac_macroblock import decode_macroblock_layer_cabac
 
-        # Construct bitstream for I_4x4 MB
-        data = bytes([0x00, 0x00, 0x00, 0x00] * 50)
+        # Construct bitstream for I_4x4 MB - needs sufficient data for
+        # mb_type + 16 intra pred modes + CBP + qp_delta decoding
+        # Use varied data to ensure CABAC terminates properly
+        data = bytes([0x80, 0x40, 0x20, 0x10, 0x08, 0x04, 0x02, 0x01] * 200)
         reader = BitReader(data)
         decoder = CABACDecoder(reader)
         contexts = init_context_models(slice_type=2, slice_qp=26)

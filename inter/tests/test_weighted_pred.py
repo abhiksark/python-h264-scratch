@@ -1351,8 +1351,8 @@ class TestWeightedPredictionHighProfile:
             pred, weight=128, offset=100, log2_denom=6, bit_depth=10
         )
 
-        # 512 * 2 + 100 = 1124, should be within 10-bit range
-        np.testing.assert_array_equal(result, 1024)  # Clipped to max 10-bit
+        # 512 * 2 + 100 = 1124, clipped to 10-bit max (2^10 - 1 = 1023)
+        np.testing.assert_array_equal(result, 1023)  # Clipped to max 10-bit
 
     def test_weight_offset_range_8bit_vs_10bit(self):
         """Weight/offset ranges differ by bit depth."""
