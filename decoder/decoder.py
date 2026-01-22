@@ -327,15 +327,16 @@ class H264Decoder:
         # Check slice type
         is_i_slice = slice_header.is_i_slice
         is_p_slice = slice_header.is_p_slice if hasattr(slice_header, 'is_p_slice') else False
+        is_b_slice = slice_header.is_b_slice if hasattr(slice_header, 'is_b_slice') else False
 
-        if not is_i_slice and not is_p_slice:
+        if not is_i_slice and not is_p_slice and not is_b_slice:
             logger.warning(f"Skipping unsupported slice: {slice_header.slice_type_name}")
             return None
 
-        # P-slices need reference frames
-        if is_p_slice:
+        # P/B-slices need reference frames
+        if is_p_slice or is_b_slice:
             if self.state.ref_buffer is None or len(self.state.ref_buffer) == 0:
-                logger.warning("P-slice but no reference frames available")
+                logger.warning(f"{'P' if is_p_slice else 'B'}-slice but no reference frames available")
                 return None
 
         # Update current parameter sets
@@ -350,8 +351,8 @@ class H264Decoder:
         slice_qp = 26 + pps.pic_init_qp_minus26 + slice_header.slice_qp_delta
         logger.debug(f"Slice QP: {slice_qp}")
 
-        # Initialize MV cache for P-slices
-        if is_p_slice:
+        # Initialize MV cache for P/B-slices
+        if is_p_slice or is_b_slice:
             self.state.init_mv_cache(sps)
 
         # Create BitReader for slice data (positioned after slice header)
@@ -361,8 +362,10 @@ class H264Decoder:
         # Decode macroblocks
         if is_i_slice:
             self._decode_slice_data(reader, slice_header, sps, pps, slice_qp)
-        else:
+        elif is_p_slice:
             self._decode_p_slice_data(reader, slice_header, sps, pps, slice_qp)
+        else:  # B-slice
+            self._decode_b_slice_data(reader, slice_header, sps, pps, slice_qp)
 
         # Return completed frame
         # For simplicity, assume each slice is a complete frame
@@ -1277,6 +1280,9 @@ class H264Decoder:
         # Get direct mode flag
         use_spatial = getattr(slice_header, 'direct_spatial_mv_pred_flag', True)
         current_poc = getattr(slice_header, 'pic_order_cnt_lsb', 0)
+
+        # Build L0/L1 reference lists before decoding B-slice
+        self._build_b_slice_ref_lists(slice_header)
 
         while mb_idx < total_mbs:
             mb_x = mb_idx % mb_width

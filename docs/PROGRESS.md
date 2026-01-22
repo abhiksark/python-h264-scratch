@@ -3,7 +3,7 @@
 ## Current Status
 
 **Working:** I-frame, P-frame, and B-frame decoder with CAVLC and CABAC support
-**Tests:** 1,449 passing (2,435 total with TDD red tests)
+**Tests:** 1,623 passing (2,435 total with TDD red tests)
 
 ## What Works
 
