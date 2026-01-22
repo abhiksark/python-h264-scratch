@@ -55,6 +55,22 @@ class POCCalculator:
         self.prev_frame_num_offset = 0
         logger.debug("POC state reset")
 
+    def _compute_expected_delta(self, sps: 'SPS') -> int:
+        """Compute ExpectedDeltaPerPicOrderCntCycle for POC type 1.
+
+        H.264 Spec Section 8.2.1.2:
+        ExpectedDeltaPerPicOrderCntCycle = sum(offset_for_ref_frame[i])
+        for i = 0 to num_ref_frames_in_pic_order_cnt_cycle - 1
+
+        Args:
+            sps: Sequence Parameter Set with POC type 1 parameters
+
+        Returns:
+            Sum of offset_for_ref_frame values
+        """
+        offset_for_ref_frame = getattr(sps, 'offset_for_ref_frame', [])
+        return sum(offset_for_ref_frame) if offset_for_ref_frame else 0
+
     def calculate(
         self,
         sps: 'SPS',

@@ -37,6 +37,7 @@ from slice import SliceHeader, SliceType, parse_slice_header
 from reconstruct import decode_macroblock, MacroblockData
 from color import ycbcr_to_rgb, ColorMatrix
 from inter.reference import ReferenceFrame, ReferenceFrameBuffer
+from decoder.poc import POCCalculator
 from inter.mv_prediction import (
     MVCache,
     predict_mv_16x16,
@@ -233,6 +234,7 @@ class H264Decoder:
         """
         self.state = DecoderState()
         self.deblocking_enabled = deblocking_enabled
+        self.poc_calculator = POCCalculator()
 
     def decode_file(self, path: str):
         """Decode H.264 file and yield frames.

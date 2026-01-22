@@ -1074,7 +1074,6 @@ class TestPOCEdgeCases:
 class TestPOCIntegrationWithDecoder:
     """Tests for POC integration with main decoder."""
 
-    @pytest.mark.xfail(reason="Decoder integration with POC not yet implemented")
     def test_decoder_uses_poc_calculator(self):
         """Main decoder should use POCCalculator for POC calculation."""
         from decoder.decoder import H264Decoder
@@ -1123,7 +1122,6 @@ class TestPOCIntegrationWithDecoder:
 class TestPOCType1ExpectedDelta:
     """Tests for POC type 1 ExpectedDeltaPerPicOrderCntCycle calculation."""
 
-    @pytest.mark.xfail(reason="Internal method _compute_expected_delta not exposed")
     def test_expected_delta_calculation(self):
         """ExpectedDeltaPerPicOrderCntCycle is sum of offset_for_ref_frame."""
         from decoder.poc import POCCalculator
