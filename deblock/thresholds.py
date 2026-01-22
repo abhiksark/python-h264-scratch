@@ -104,3 +104,98 @@ def get_chroma_qp(luma_qp: int) -> int:
     """
     qp_clamped = max(0, min(51, luma_qp))
     return QPC_TABLE[qp_clamped]
+
+
+def get_effective_alpha(base_qp: int = None, offset: int = 0, qp: int = None) -> int:
+    """Get alpha threshold with offset applied.
+
+    H.264 Spec: indexA = Clip3(0, 51, QP + offset)
+
+    Args:
+        base_qp: Base quantization parameter (preferred)
+        offset: Slice alpha_c0_offset_div2 * 2
+        qp: Alias for base_qp (for backward compatibility)
+
+    Returns:
+        Alpha threshold value
+    """
+    if base_qp is None and qp is None:
+        raise ValueError("Either base_qp or qp must be provided")
+    qp_val = base_qp if base_qp is not None else qp
+    index_a = max(0, min(51, qp_val + offset))
+    return ALPHA_TABLE[index_a]
+
+
+def get_effective_beta(base_qp: int = None, offset: int = 0, qp: int = None) -> int:
+    """Get beta threshold with offset applied.
+
+    H.264 Spec: indexB = Clip3(0, 51, QP + offset)
+
+    Args:
+        base_qp: Base quantization parameter (preferred)
+        offset: Slice beta_offset_div2 * 2
+        qp: Alias for base_qp (for backward compatibility)
+
+    Returns:
+        Beta threshold value
+    """
+    if base_qp is None and qp is None:
+        raise ValueError("Either base_qp or qp must be provided")
+    qp_val = base_qp if base_qp is not None else qp
+    index_b = max(0, min(51, qp_val + offset))
+    return BETA_TABLE[index_b]
+
+
+def validate_offset(offset: int) -> bool:
+    """Validate deblocking filter offset is in valid range.
+
+    H.264 Spec: Offsets are stored as -6 to +6 in slice header (div2 values).
+    This function validates the div2 value range.
+
+    Args:
+        offset: Alpha or beta offset div2 value
+
+    Returns:
+        True if offset is valid
+
+    Raises:
+        ValueError: If offset is outside [-6, 6] range
+    """
+    if not -6 <= offset <= 6:
+        raise ValueError(f"Offset {offset} outside valid range [-6, 6]")
+    return True
+
+
+def get_chroma_qp_with_offset(luma_qp: int, offset: int = 0) -> int:
+    """Get chroma QP with offset for deblocking.
+
+    First applies offset to luma QP, then maps to chroma QP.
+
+    Args:
+        luma_qp: Luma quantization parameter
+        offset: Deblocking offset
+
+    Returns:
+        Chroma QP for deblocking
+    """
+    effective_luma = max(0, min(51, luma_qp + offset))
+    return QPC_TABLE[effective_luma]
+
+
+def get_deblock_params_from_pps(pps) -> tuple:
+    """Extract deblocking alpha/beta offsets from PPS.
+
+    Args:
+        pps: Picture Parameter Set (dict or object with same fields)
+
+    Returns:
+        Tuple of (alpha_offset, beta_offset) in effective values (div2 * 2)
+    """
+    if isinstance(pps, dict):
+        alpha_div2 = pps.get('default_alpha_c0_offset_div2', 0)
+        beta_div2 = pps.get('default_beta_offset_div2', 0)
+    else:
+        alpha_div2 = getattr(pps, 'default_alpha_c0_offset_div2', 0)
+        beta_div2 = getattr(pps, 'default_beta_offset_div2', 0)
+
+    return (alpha_div2 * 2, beta_div2 * 2)

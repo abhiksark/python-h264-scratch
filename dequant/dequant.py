@@ -184,6 +184,67 @@ def dequant_4x4_simple(
     return dequant.astype(np.int32)
 
 
+def dequant_4x4_with_scaling_list(
+    coeffs: np.ndarray,
+    qp: int,
+    scaling_list: list,
+) -> np.ndarray:
+    """Dequantize a 4x4 block using a custom scaling list.
+
+    This function applies position-dependent scaling from a custom
+    scaling list, as used in High profile for custom quantization.
+
+    Args:
+        coeffs: 4x4 quantized coefficients (int32)
+        qp: Quantization parameter (0-51)
+        scaling_list: 16-element scaling list in zigzag scan order
+
+    Returns:
+        4x4 dequantized coefficients (int32)
+
+    H.264 Spec: Section 8.5.9, 8.5.11
+    Formula: d[i,j] = c[i,j] * LevelScale[qp%6][pos] * ScalingList[k] >> shift
+    where k = zigzag index of position (i, j)
+    """
+    if coeffs.shape != (4, 4):
+        raise ValueError(f"Expected 4x4 block, got {coeffs.shape}")
+
+    if len(scaling_list) != 16:
+        raise ValueError(f"Scaling list must have 16 elements, got {len(scaling_list)}")
+
+    qp = max(0, min(51, qp))  # Clamp QP to valid range
+
+    qp_div_6 = qp // 6
+    qp_mod_6 = qp % 6
+
+    # Zigzag scan order for 4x4 block (maps linear index to (row, col))
+    zigzag_4x4 = [
+        (0, 0), (0, 1), (1, 0), (2, 0),
+        (1, 1), (0, 2), (0, 3), (1, 2),
+        (2, 1), (3, 0), (3, 1), (2, 2),
+        (1, 3), (2, 3), (3, 2), (3, 3)
+    ]
+
+    # Get base scale matrix
+    scale_matrix = get_scale_matrix(qp)
+
+    # Apply scaling list (position-dependent)
+    dequant = np.zeros((4, 4), dtype=np.int32)
+    for k, (i, j) in enumerate(zigzag_4x4):
+        # Combine level scale with custom scaling list
+        # H.264 normative: scale by scaling_list[k] / 16
+        combined_scale = (scale_matrix[i, j] * scaling_list[k]) // 16
+        dequant[i, j] = coeffs[i, j] * combined_scale
+
+    # Apply QP-based shift
+    if qp_div_6 >= 1:
+        dequant = dequant << (qp_div_6 - 1)
+
+    logger.debug(f"Dequant 4x4 with scaling list: QP={qp}, max_coeff={np.max(np.abs(dequant))}")
+
+    return dequant.astype(np.int32)
+
+
 def dequant_dc_4x4(
     dc_coeffs: np.ndarray,
     qp: int

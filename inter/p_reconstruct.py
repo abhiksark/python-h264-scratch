@@ -851,3 +851,479 @@ def reconstruct_p_16x16_weighted(
     )
 
     return luma, cb, cr
+
+
+def reconstruct_p_skip_weighted(
+    ref_buffer: ReferenceFrameBuffer,
+    mv_cache: MVCache,
+    mb_x: int,
+    mb_y: int,
+    weight_luma: int,
+    offset_luma: int,
+    log2_denom_luma: int,
+    weight_cb: int,
+    offset_cb: int,
+    weight_cr: int,
+    offset_cr: int,
+    log2_denom_chroma: int,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Reconstruct P_Skip macroblock with weighted prediction.
+
+    P_Skip uses predicted MV and ref_idx=0, but weighted prediction
+    still applies when weighted_pred_flag=1 in PPS.
+
+    H.264 Spec: Section 8.4.2.3.1
+
+    Args:
+        ref_buffer: Reference frame buffer
+        mv_cache: MV cache for prediction
+        mb_x, mb_y: Macroblock position
+        weight_luma: Luma weight
+        offset_luma: Luma offset
+        log2_denom_luma: Luma weight denominator
+        weight_cb, offset_cb: Cb weight and offset
+        weight_cr, offset_cr: Cr weight and offset
+        log2_denom_chroma: Chroma weight denominator
+
+    Returns:
+        Tuple of (luma, cb, cr) reconstructed blocks
+    """
+    from inter.weighted_pred import apply_weighted_prediction, apply_weighted_prediction_chroma
+
+    # Get predicted MV (P_Skip uses predicted MV with no residual)
+    mvp_x, mvp_y = predict_mv_16x16(mv_cache, mb_x, mb_y)
+
+    # MV to integer + fractional
+    int_mvx = mvp_x >> 2
+    int_mvy = mvp_y >> 2
+    frac_x = mvp_x & 3
+    frac_y = mvp_y & 3
+
+    ref_x = mb_x * 16 + int_mvx
+    ref_y = mb_y * 16 + int_mvy
+
+    # P_Skip always uses ref_idx=0
+    ref_frame = ref_buffer.get_frame(0)
+
+    # Luma prediction
+    pred_luma = apply_inter_prediction(
+        ref_frame.luma, ref_x, ref_y, frac_x, frac_y, 16, 16
+    )
+
+    # Apply weighted prediction to luma
+    luma = apply_weighted_prediction(
+        pred_luma, weight_luma, offset_luma, log2_denom_luma
+    )
+
+    # Chroma prediction
+    chroma_mvx = mvp_x >> 1
+    chroma_mvy = mvp_y >> 1
+    int_cmvx = chroma_mvx >> 2
+    int_cmvy = chroma_mvy >> 2
+    frac_cx = chroma_mvx & 3
+    frac_cy = chroma_mvy & 3
+
+    ref_cx = mb_x * 8 + int_cmvx
+    ref_cy = mb_y * 8 + int_cmvy
+
+    pred_cb = apply_chroma_prediction(
+        ref_frame.cb, ref_cx, ref_cy, frac_cx, frac_cy, 8, 8
+    )
+    pred_cr = apply_chroma_prediction(
+        ref_frame.cr, ref_cx, ref_cy, frac_cx, frac_cy, 8, 8
+    )
+
+    # Apply weighted prediction to chroma
+    cb, cr = apply_weighted_prediction_chroma(
+        pred_cb, pred_cr,
+        weight_cb, offset_cb,
+        weight_cr, offset_cr,
+        log2_denom_chroma,
+    )
+
+    # Update MV cache
+    mv_cache.set_mv_16x16(mb_x, mb_y, mvp_x, mvp_y)
+
+    logger.debug(
+        f"P_Skip_weighted MB({mb_x},{mb_y}): MV=({mvp_x},{mvp_y}), w={weight_luma}"
+    )
+
+    return luma, cb, cr
+
+
+def reconstruct_p_16x8_weighted(
+    ref_buffer: ReferenceFrameBuffer,
+    mv_cache: MVCache,
+    ref_idx: list,
+    mvx: list,
+    mvy: list,
+    weights_luma: list,
+    offsets_luma: list,
+    log2_denom_luma: int,
+    weights_cb: list,
+    offsets_cb: list,
+    weights_cr: list,
+    offsets_cr: list,
+    log2_denom_chroma: int,
+    residual_luma: Optional[list],
+    residual_cb: Optional[np.ndarray],
+    residual_cr: Optional[np.ndarray],
+    mb_x: int,
+    mb_y: int,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Reconstruct P_L0_L0_16x8 macroblock with weighted prediction.
+
+    Each 16x8 partition can use different reference frames and weights.
+
+    Args:
+        ref_buffer: Reference frame buffer
+        mv_cache: MV cache
+        ref_idx: List of 2 reference indices [top, bottom]
+        mvx, mvy: Lists of 2 motion vectors
+        weights_luma: List of 2 luma weights
+        offsets_luma: List of 2 luma offsets
+        log2_denom_luma: Luma weight denominator
+        weights_cb, offsets_cb: Cb weights/offsets for each partition
+        weights_cr, offsets_cr: Cr weights/offsets for each partition
+        log2_denom_chroma: Chroma weight denominator
+        residual_luma: List of 2 residual blocks or None
+        residual_cb, residual_cr: 8x8 chroma residuals or None
+        mb_x, mb_y: Macroblock position
+
+    Returns:
+        Tuple of (luma, cb, cr) reconstructed blocks
+    """
+    from inter.weighted_pred import apply_weighted_prediction
+
+    luma = np.zeros((16, 16), dtype=np.uint8)
+
+    # Process each 16x8 partition
+    for part in range(2):
+        part_y = part * 8
+
+        ref_frame = ref_buffer.get_frame(ref_idx[part])
+
+        # MV to integer + fractional
+        int_mvx = mvx[part] >> 2
+        int_mvy = mvy[part] >> 2
+        frac_x = mvx[part] & 3
+        frac_y = mvy[part] & 3
+
+        ref_x = mb_x * 16 + int_mvx
+        ref_y = mb_y * 16 + part_y + int_mvy
+
+        # Prediction
+        pred = apply_inter_prediction(
+            ref_frame.luma, ref_x, ref_y, frac_x, frac_y, 16, 8
+        )
+
+        # Apply weighted prediction
+        weighted = apply_weighted_prediction(
+            pred, weights_luma[part], offsets_luma[part], log2_denom_luma
+        )
+
+        # Add residual
+        if residual_luma is not None and residual_luma[part] is not None:
+            weighted = np.clip(
+                weighted.astype(np.int32) + residual_luma[part], 0, 255
+            ).astype(np.uint8)
+
+        luma[part_y:part_y + 8, :] = weighted
+
+    # Update MV cache
+    for bx in range(4):
+        for by in range(2):
+            mv_cache.set_mv(mb_x, mb_y, bx, by, mvx[0], mvy[0])
+        for by in range(2, 4):
+            mv_cache.set_mv(mb_x, mb_y, bx, by, mvx[1], mvy[1])
+
+    # Chroma reconstruction (simplified - use top partition weights)
+    cb, cr = _reconstruct_chroma_weighted(
+        ref_buffer, ref_idx[0], mvx[0], mvy[0],
+        weights_cb[0], offsets_cb[0], weights_cr[0], offsets_cr[0],
+        log2_denom_chroma, residual_cb, residual_cr, mb_x, mb_y
+    )
+
+    logger.debug(f"P_16x8_weighted MB({mb_x},{mb_y})")
+
+    return luma, cb, cr
+
+
+def reconstruct_p_8x16_weighted(
+    ref_buffer: ReferenceFrameBuffer,
+    mv_cache: MVCache,
+    ref_idx: list,
+    mvx: list,
+    mvy: list,
+    weights_luma: list,
+    offsets_luma: list,
+    log2_denom_luma: int,
+    weights_cb: list,
+    offsets_cb: list,
+    weights_cr: list,
+    offsets_cr: list,
+    log2_denom_chroma: int,
+    residual_luma: Optional[list],
+    residual_cb: Optional[np.ndarray],
+    residual_cr: Optional[np.ndarray],
+    mb_x: int,
+    mb_y: int,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Reconstruct P_L0_L0_8x16 macroblock with weighted prediction.
+
+    Each 8x16 partition can use different reference frames and weights.
+
+    Args:
+        ref_buffer: Reference frame buffer
+        mv_cache: MV cache
+        ref_idx: List of 2 reference indices [left, right]
+        mvx, mvy: Lists of 2 motion vectors
+        weights_luma: List of 2 luma weights
+        offsets_luma: List of 2 luma offsets
+        log2_denom_luma: Luma weight denominator
+        weights_cb, offsets_cb: Cb weights/offsets for each partition
+        weights_cr, offsets_cr: Cr weights/offsets for each partition
+        log2_denom_chroma: Chroma weight denominator
+        residual_luma: List of 2 residual blocks or None
+        residual_cb, residual_cr: 8x8 chroma residuals or None
+        mb_x, mb_y: Macroblock position
+
+    Returns:
+        Tuple of (luma, cb, cr) reconstructed blocks
+    """
+    from inter.weighted_pred import apply_weighted_prediction
+
+    luma = np.zeros((16, 16), dtype=np.uint8)
+
+    # Process each 8x16 partition
+    for part in range(2):
+        part_x = part * 8
+
+        ref_frame = ref_buffer.get_frame(ref_idx[part])
+
+        # MV to integer + fractional
+        int_mvx = mvx[part] >> 2
+        int_mvy = mvy[part] >> 2
+        frac_x = mvx[part] & 3
+        frac_y = mvy[part] & 3
+
+        ref_x = mb_x * 16 + part_x + int_mvx
+        ref_y = mb_y * 16 + int_mvy
+
+        # Prediction
+        pred = apply_inter_prediction(
+            ref_frame.luma, ref_x, ref_y, frac_x, frac_y, 8, 16
+        )
+
+        # Apply weighted prediction
+        weighted = apply_weighted_prediction(
+            pred, weights_luma[part], offsets_luma[part], log2_denom_luma
+        )
+
+        # Add residual
+        if residual_luma is not None and residual_luma[part] is not None:
+            weighted = np.clip(
+                weighted.astype(np.int32) + residual_luma[part], 0, 255
+            ).astype(np.uint8)
+
+        luma[:, part_x:part_x + 8] = weighted
+
+    # Update MV cache
+    for by in range(4):
+        for bx in range(2):
+            mv_cache.set_mv(mb_x, mb_y, bx, by, mvx[0], mvy[0])
+        for bx in range(2, 4):
+            mv_cache.set_mv(mb_x, mb_y, bx, by, mvx[1], mvy[1])
+
+    # Chroma reconstruction (use left partition weights)
+    cb, cr = _reconstruct_chroma_weighted(
+        ref_buffer, ref_idx[0], mvx[0], mvy[0],
+        weights_cb[0], offsets_cb[0], weights_cr[0], offsets_cr[0],
+        log2_denom_chroma, residual_cb, residual_cr, mb_x, mb_y
+    )
+
+    logger.debug(f"P_8x16_weighted MB({mb_x},{mb_y})")
+
+    return luma, cb, cr
+
+
+def reconstruct_p_8x8_weighted(
+    ref_buffer: ReferenceFrameBuffer,
+    mv_cache: MVCache,
+    ref_idx: list,
+    mvx: list,
+    mvy: list,
+    sub_mb_types: list,
+    weights_luma: list,
+    offsets_luma: list,
+    log2_denom_luma: int,
+    weights_cb: list,
+    offsets_cb: list,
+    weights_cr: list,
+    offsets_cr: list,
+    log2_denom_chroma: int,
+    residual_luma: Optional[list],
+    residual_cb: Optional[np.ndarray],
+    residual_cr: Optional[np.ndarray],
+    mb_x: int,
+    mb_y: int,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Reconstruct P_8x8 macroblock with weighted prediction.
+
+    Each 8x8 sub-macroblock can use different reference frames and weights.
+
+    Args:
+        ref_buffer: Reference frame buffer
+        mv_cache: MV cache
+        ref_idx: List of 4 reference indices
+        mvx, mvy: Lists of 4 motion vectors
+        sub_mb_types: List of 4 sub-MB types
+        weights_luma: List of 4 luma weights
+        offsets_luma: List of 4 luma offsets
+        log2_denom_luma: Luma weight denominator
+        weights_cb, offsets_cb: Cb weights/offsets for each sub-MB
+        weights_cr, offsets_cr: Cr weights/offsets for each sub-MB
+        log2_denom_chroma: Chroma weight denominator
+        residual_luma: List of 4 residual blocks or None
+        residual_cb, residual_cr: 8x8 chroma residuals or None
+        mb_x, mb_y: Macroblock position
+
+    Returns:
+        Tuple of (luma, cb, cr) reconstructed blocks
+    """
+    from inter.weighted_pred import apply_weighted_prediction
+
+    luma = np.zeros((16, 16), dtype=np.uint8)
+
+    # Sub-MB offsets
+    sub_offsets = [(0, 0), (8, 0), (0, 8), (8, 8)]
+
+    for sub_idx in range(4):
+        part_x, part_y = sub_offsets[sub_idx]
+
+        ref_frame = ref_buffer.get_frame(ref_idx[sub_idx])
+
+        # MV to integer + fractional
+        int_mvx = mvx[sub_idx] >> 2
+        int_mvy = mvy[sub_idx] >> 2
+        frac_x = mvx[sub_idx] & 3
+        frac_y = mvy[sub_idx] & 3
+
+        ref_x = mb_x * 16 + part_x + int_mvx
+        ref_y = mb_y * 16 + part_y + int_mvy
+
+        # Prediction (simplified: assume 8x8 sub-MB type)
+        pred = apply_inter_prediction(
+            ref_frame.luma, ref_x, ref_y, frac_x, frac_y, 8, 8
+        )
+
+        # Apply weighted prediction
+        weighted = apply_weighted_prediction(
+            pred, weights_luma[sub_idx], offsets_luma[sub_idx], log2_denom_luma
+        )
+
+        # Add residual
+        if residual_luma is not None and residual_luma[sub_idx] is not None:
+            weighted = np.clip(
+                weighted.astype(np.int32) + residual_luma[sub_idx], 0, 255
+            ).astype(np.uint8)
+
+        luma[part_y:part_y + 8, part_x:part_x + 8] = weighted
+
+        # Update MV cache for this 8x8 sub-MB
+        bx_start = part_x // 4
+        by_start = part_y // 4
+        for by in range(by_start, by_start + 2):
+            for bx in range(bx_start, bx_start + 2):
+                mv_cache.set_mv(mb_x, mb_y, bx, by, mvx[sub_idx], mvy[sub_idx])
+
+    # Chroma reconstruction (use first sub-MB weights)
+    cb, cr = _reconstruct_chroma_weighted(
+        ref_buffer, ref_idx[0], mvx[0], mvy[0],
+        weights_cb[0], offsets_cb[0], weights_cr[0], offsets_cr[0],
+        log2_denom_chroma, residual_cb, residual_cr, mb_x, mb_y
+    )
+
+    logger.debug(f"P_8x8_weighted MB({mb_x},{mb_y})")
+
+    return luma, cb, cr
+
+
+def _reconstruct_chroma_weighted(
+    ref_buffer: ReferenceFrameBuffer,
+    ref_idx: int,
+    mvx: int,
+    mvy: int,
+    weight_cb: int,
+    offset_cb: int,
+    weight_cr: int,
+    offset_cr: int,
+    log2_denom: int,
+    residual_cb: Optional[np.ndarray],
+    residual_cr: Optional[np.ndarray],
+    mb_x: int,
+    mb_y: int,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Reconstruct chroma with weighted prediction.
+
+    Helper function for weighted P-MB reconstruction.
+
+    Args:
+        ref_buffer: Reference frame buffer
+        ref_idx: Reference frame index
+        mvx, mvy: Motion vector
+        weight_cb, offset_cb: Cb weight and offset
+        weight_cr, offset_cr: Cr weight and offset
+        log2_denom: Chroma weight denominator
+        residual_cb, residual_cr: Chroma residuals or None
+        mb_x, mb_y: Macroblock position
+
+    Returns:
+        Tuple of (cb, cr) reconstructed blocks
+    """
+    from inter.weighted_pred import apply_weighted_prediction_chroma
+
+    ref_frame = ref_buffer.get_frame(ref_idx)
+
+    # Chroma MV is half of luma
+    chroma_mvx = mvx >> 1
+    chroma_mvy = mvy >> 1
+    int_cmvx = chroma_mvx >> 2
+    int_cmvy = chroma_mvy >> 2
+    frac_cx = chroma_mvx & 3
+    frac_cy = chroma_mvy & 3
+
+    ref_cx = mb_x * 8 + int_cmvx
+    ref_cy = mb_y * 8 + int_cmvy
+
+    pred_cb = apply_chroma_prediction(
+        ref_frame.cb, ref_cx, ref_cy, frac_cx, frac_cy, 8, 8
+    )
+    pred_cr = apply_chroma_prediction(
+        ref_frame.cr, ref_cx, ref_cy, frac_cx, frac_cy, 8, 8
+    )
+
+    # Apply weighted prediction
+    weighted_cb, weighted_cr = apply_weighted_prediction_chroma(
+        pred_cb, pred_cr,
+        weight_cb, offset_cb,
+        weight_cr, offset_cr,
+        log2_denom,
+    )
+
+    # Add residual
+    if residual_cb is not None:
+        cb = np.clip(
+            weighted_cb.astype(np.int32) + residual_cb, 0, 255
+        ).astype(np.uint8)
+    else:
+        cb = weighted_cb
+
+    if residual_cr is not None:
+        cr = np.clip(
+            weighted_cr.astype(np.int32) + residual_cr, 0, 255
+        ).astype(np.uint8)
+    else:
+        cr = weighted_cr
+
+    return cb, cr

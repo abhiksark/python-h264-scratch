@@ -1661,6 +1661,31 @@ class H264Decoder:
         # 2 = implicit weighted
         return weighted_bipred_idc > 0
 
+    def get_weighted_pred_mode(self) -> int:
+        """Get weighted prediction mode from current PPS.
+
+        Returns:
+            0 = no weighted prediction (default)
+            1 = explicit weighted prediction (P-slices)
+            2 = implicit weighted prediction (B-slices only)
+
+        For P-slices: weighted_pred_flag (0 or 1)
+        For B-slices: weighted_bipred_idc (0, 1, or 2)
+        """
+        if self.state.current_pps is None:
+            return 0
+
+        pps = self.state.current_pps
+
+        # weighted_pred_flag controls P-slice weighted prediction
+        weighted_pred_flag = getattr(pps, 'weighted_pred_flag', False)
+        if weighted_pred_flag:
+            return 1
+
+        # weighted_bipred_idc controls B-slice weighted prediction
+        weighted_bipred_idc = getattr(pps, 'weighted_bipred_idc', 0)
+        return weighted_bipred_idc
+
     def _store_mvs_in_ref(
         self,
         ref_frame: 'ReferenceFrame',

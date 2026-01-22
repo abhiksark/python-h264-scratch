@@ -265,3 +265,102 @@ def decode_coeff_abs_level(
     suffix += (1 << suffix_len) - 1
 
     return 14 + suffix
+
+
+def decode_exp_golomb_bypass(
+    decoder: 'CABACDecoder',
+    k: int = 0,
+) -> int:
+    """Decode exp-golomb coded value using bypass mode.
+
+    UEGk (Unsigned Exp-Golomb order k) binarization.
+
+    Args:
+        decoder: CABAC arithmetic decoder
+        k: Exp-golomb order (default 0)
+
+    Returns:
+        Decoded value
+
+    H.264 Spec Reference: Section 9.3.2.3
+    """
+    # Count leading zeros
+    leading_zeros = 0
+    while decoder.decode_bypass() == 0:
+        leading_zeros += 1
+        if leading_zeros > 32:
+            break  # Sanity limit
+
+    # Read (leading_zeros + k) suffix bits
+    suffix_len = leading_zeros + k
+    suffix = 0
+    for _ in range(suffix_len):
+        suffix = (suffix << 1) | decoder.decode_bypass()
+
+    # Calculate value
+    # value = (1 << leading_zeros) - 1 + suffix for order 0
+    # For order k: includes the k offset
+    if k == 0:
+        value = ((1 << leading_zeros) - 1) + suffix
+    else:
+        value = ((1 << leading_zeros) - 1) * (1 << k) + suffix
+
+    return value
+
+
+def binarize_ref_idx(ref_idx: int, max_ref_idx: int) -> List[int]:
+    """Binarize reference index using truncated unary.
+
+    Args:
+        ref_idx: Reference index value
+        max_ref_idx: Maximum reference index (num_ref - 1)
+
+    Returns:
+        List of binary values
+
+    H.264 Spec Reference: Section 9.3.2.1
+    """
+    bins = []
+
+    # Truncated unary: output 1s up to value, then 0 (unless at max)
+    for i in range(ref_idx):
+        bins.append(1)
+
+    # If not at max, append terminating 0
+    if ref_idx < max_ref_idx:
+        bins.append(0)
+
+    return bins
+
+
+def decode_ref_idx_bins(
+    decoder: 'CABACDecoder',
+    contexts: List['CABACContext'],
+    ctx_base: int,
+    max_ref_idx: int,
+) -> int:
+    """Decode reference index using truncated unary.
+
+    Args:
+        decoder: CABAC arithmetic decoder
+        contexts: Context models
+        ctx_base: Base context index
+        max_ref_idx: Maximum reference index
+
+    Returns:
+        Decoded reference index
+    """
+    if max_ref_idx == 0:
+        return 0
+
+    ref_idx = 0
+
+    while ref_idx < max_ref_idx:
+        ctx_inc = min(2, ref_idx)
+        ctx_idx = ctx_base + ctx_inc
+
+        if decoder.decode_decision(contexts[ctx_idx]) == 0:
+            break
+        ref_idx += 1
+
+    return ref_idx

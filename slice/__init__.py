@@ -15,6 +15,7 @@ from .slice_header import (
     RefPicListModification,
     DecRefPicMarking,
     parse_slice_header,
+    parse_slice_header_weighted,
 )
 
 __all__ = [
@@ -23,4 +24,5 @@ __all__ = [
     "RefPicListModification",
     "DecRefPicMarking",
     "parse_slice_header",
+    "parse_slice_header_weighted",
 ]

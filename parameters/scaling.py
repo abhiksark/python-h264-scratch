@@ -211,33 +211,43 @@ def get_effective_scaling_list_8x8(
 
 
 def get_chroma_scaling_list_4x4(
-    sps: 'SPS',
-    pps: Optional['PPS'],
-    index: int,
-    is_cb: bool = True,
+    sps_lists: Optional[List[Optional[List[int]]]] = None,
+    pps_lists: Optional[List[Optional[List[int]]]] = None,
+    chroma_format_idc: int = 1,
+    is_intra: bool = True,
+    cb_cr: int = 0,
 ) -> List[int]:
     """Get 4x4 scaling list for chroma components.
 
     For 4:2:0 format, chroma uses the same scaling lists as luma.
     For 4:2:2 and 4:4:4, separate chroma lists may be used.
 
+    H.264 Spec: Section 7.4.2.1.1
+    For chroma_format_idc=1 (4:2:0):
+    - Cb/Cr Intra: Use luma Intra list (index 0)
+    - Cb/Cr Inter: Use luma Inter list (index 3)
+
     Args:
-        sps: Sequence parameter set
-        pps: Picture parameter set
-        index: List index
-        is_cb: True for Cb component, False for Cr
+        sps_lists: List of SPS 4x4 scaling lists (may contain None)
+        pps_lists: List of PPS 4x4 scaling lists (may contain None)
+        chroma_format_idc: Chroma format (1=4:2:0, 2=4:2:2, 3=4:4:4)
+        is_intra: True for Intra blocks, False for Inter
+        cb_cr: 0 for Cb component, 1 for Cr component
 
     Returns:
         List of 16 scaling values
     """
     # For 4:2:0, chroma uses same lists as luma
-    chroma_format_idc = getattr(sps, 'chroma_format_idc', 1)
-    if chroma_format_idc == 1:  # 4:2:0
-        return get_scaling_list_4x4(sps, pps, index)
+    if chroma_format_idc == 1:
+        # Map to luma list index: Intra=0, Inter=3
+        list_idx = 0 if is_intra else 3
+        return get_effective_scaling_list_4x4(sps_lists, pps_lists, list_idx)
 
-    # For other formats, would need additional list indices
-    # Currently fallback to luma lists
-    return get_scaling_list_4x4(sps, pps, index)
+    # For 4:2:2 and 4:4:4, would have separate chroma lists
+    # H.264 defines additional lists 8-11 for 4:4:4
+    # For now, fallback to luma lists
+    list_idx = 0 if is_intra else 3
+    return get_effective_scaling_list_4x4(sps_lists, pps_lists, list_idx)
 
 
 def get_scaling_list_4x4(

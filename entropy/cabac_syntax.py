@@ -472,3 +472,76 @@ def decode_coded_block_flag(
     """
     ctx_idx = CTX_CODED_BLOCK_FLAG_START + cat * 4 + ctx_block_cat
     return decoder.decode_decision(contexts[ctx_idx])
+
+
+def decode_mvd_lx_suffix_bypass(
+    decoder: 'CABACDecoder',
+    prefix_value: int,
+) -> int:
+    """Decode MVD suffix using bypass mode.
+
+    For MVD values > 9, the suffix is exp-golomb coded in bypass mode.
+
+    Args:
+        decoder: CABAC decoder
+        prefix_value: Value decoded from prefix (>= 9)
+
+    Returns:
+        Suffix value to add to prefix
+
+    H.264 Spec Reference: Section 9.3.2.3
+    """
+    if prefix_value < 9:
+        return 0
+
+    # Use UEG3 (exp-golomb order 3)
+    from entropy.cabac_binarize import decode_exp_golomb_bypass
+    suffix = decode_exp_golomb_bypass(decoder, k=3)
+
+    return suffix
+
+
+def decode_mvd_sign_bypass(
+    decoder: 'CABACDecoder',
+) -> int:
+    """Decode MVD sign using bypass mode.
+
+    Args:
+        decoder: CABAC decoder
+
+    Returns:
+        Sign value: 0 = positive, 1 = negative
+    """
+    return decoder.decode_bypass()
+
+
+def get_ref_idx_ctx_idx(
+    list_idx: int,
+    bin_idx: int = None,
+    ctx_inc: int = None,
+) -> int:
+    """Get context index for ref_idx decoding.
+
+    Args:
+        list_idx: Reference list (0=L0, 1=L1)
+        bin_idx: Bin index within binarization (alternative to ctx_inc)
+        ctx_inc: Context increment (alternative to bin_idx)
+
+    Returns:
+        Context index
+
+    H.264 Spec Reference: Section 9.3.3.1.1.5
+    """
+    # Context base for ref_idx_lX
+    # L0: contexts 54-55, L1: contexts 56-57
+    ctx_base = 54 if list_idx == 0 else 56
+
+    # Use ctx_inc if provided, otherwise derive from bin_idx
+    if ctx_inc is not None:
+        inc = min(2, ctx_inc)
+    elif bin_idx is not None:
+        inc = min(2, bin_idx)
+    else:
+        inc = 0
+
+    return ctx_base + inc

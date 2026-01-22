@@ -175,3 +175,257 @@ def calc_implicit_bipred_weights(
     w1 = max(-64, min(128, w1))
 
     return w0, w1
+
+
+def implicit_bipred(
+    pred_l0: np.ndarray,
+    pred_l1: np.ndarray,
+    current_poc: int,
+    l0_poc: int,
+    l1_poc: int,
+) -> np.ndarray:
+    """Apply implicit weighted bi-prediction.
+
+    For implicit mode (weighted_bipred_idc=2), weights are derived from
+    POC distances. Uses log2_denom=5.
+
+    Args:
+        pred_l0: L0 prediction block
+        pred_l1: L1 prediction block
+        current_poc: POC of current picture
+        l0_poc: POC of L0 reference
+        l1_poc: POC of L1 reference
+
+    Returns:
+        Weighted prediction block, uint8
+
+    H.264 Spec: Section 8.4.2.3.2
+    """
+    w0, w1 = calc_implicit_bipred_weights(current_poc, l0_poc, l1_poc)
+
+    # Implicit uses log2_denom=5, offsets=0
+    return weighted_bipred(pred_l0, pred_l1, w0, 0, w1, 0, log2_denom=5)
+
+
+# Alias for explicit naming
+apply_implicit_weighted_bipred = implicit_bipred
+
+
+def b_direct_weighted(
+    pred_l0: np.ndarray,
+    pred_l1: np.ndarray,
+    current_poc: int,
+    l0_poc: int,
+    l1_poc: int,
+    weighted_bipred_idc: int,
+    w0: int = 64,
+    o0: int = 0,
+    w1: int = 64,
+    o1: int = 0,
+    log2_denom: int = 6,
+) -> np.ndarray:
+    """Apply weighted prediction for B_Direct mode.
+
+    B_Direct uses co-located MVs from the reference picture.
+    Supports both explicit and implicit weighted prediction.
+
+    Args:
+        pred_l0: L0 prediction block
+        pred_l1: L1 prediction block
+        current_poc: POC of current picture
+        l0_poc: POC of L0 reference
+        l1_poc: POC of L1 reference
+        weighted_bipred_idc: 0=no weighted, 1=explicit, 2=implicit
+        w0, o0: L0 weight and offset (for explicit)
+        w1, o1: L1 weight and offset (for explicit)
+        log2_denom: Weight denominator (for explicit)
+
+    Returns:
+        Weighted prediction block, uint8
+
+    H.264 Spec: Section 8.4.2.3
+    """
+    if weighted_bipred_idc == 0:
+        return bipred_average(pred_l0, pred_l1)
+    elif weighted_bipred_idc == 1:
+        return weighted_bipred(pred_l0, pred_l1, w0, o0, w1, o1, log2_denom)
+    else:  # weighted_bipred_idc == 2
+        return implicit_bipred(pred_l0, pred_l1, current_poc, l0_poc, l1_poc)
+
+
+def b_skip_weighted(
+    pred_l0: np.ndarray,
+    pred_l1: np.ndarray,
+    current_poc: int,
+    l0_poc: int,
+    l1_poc: int,
+    weighted_bipred_idc: int,
+    w0: int = 64,
+    o0: int = 0,
+    w1: int = 64,
+    o1: int = 0,
+    log2_denom: int = 6,
+) -> np.ndarray:
+    """Apply weighted prediction for B_Skip mode.
+
+    B_Skip uses direct mode MVs with no residual.
+
+    Args:
+        pred_l0: L0 prediction block
+        pred_l1: L1 prediction block
+        current_poc: POC of current picture
+        l0_poc: POC of L0 reference
+        l1_poc: POC of L1 reference
+        weighted_bipred_idc: 0=no weighted, 1=explicit, 2=implicit
+        w0, o0, w1, o1: Weights and offsets (for explicit)
+        log2_denom: Weight denominator (for explicit)
+
+    Returns:
+        Weighted prediction block, uint8
+    """
+    if weighted_bipred_idc == 0:
+        return bipred_average(pred_l0, pred_l1)
+    elif weighted_bipred_idc == 1:
+        return weighted_bipred(pred_l0, pred_l1, w0, o0, w1, o1, log2_denom)
+    else:  # weighted_bipred_idc == 2
+        return implicit_bipred(pred_l0, pred_l1, current_poc, l0_poc, l1_poc)
+
+
+def b_16x16_weighted(
+    pred_l0: np.ndarray,
+    pred_l1: np.ndarray,
+    ref_idx_l0: int,
+    ref_idx_l1: int,
+    weight_table_l0: dict,
+    weight_table_l1: dict,
+    log2_denom: int,
+    weighted_bipred_idc: int,
+    current_poc: int = 0,
+    l0_poc: int = 0,
+    l1_poc: int = 0,
+) -> np.ndarray:
+    """Apply weighted bi-prediction for B_16x16 macroblock.
+
+    Args:
+        pred_l0: L0 prediction (16x16)
+        pred_l1: L1 prediction (16x16)
+        ref_idx_l0: L0 reference index
+        ref_idx_l1: L1 reference index
+        weight_table_l0: Dict mapping ref_idx to (weight, offset)
+        weight_table_l1: Dict mapping ref_idx to (weight, offset)
+        log2_denom: Weight denominator
+        weighted_bipred_idc: 0=no weighted, 1=explicit, 2=implicit
+        current_poc, l0_poc, l1_poc: POC values (for implicit)
+
+    Returns:
+        Weighted prediction block, uint8
+    """
+    if weighted_bipred_idc == 0:
+        return bipred_average(pred_l0, pred_l1)
+
+    if weighted_bipred_idc == 2:
+        return implicit_bipred(pred_l0, pred_l1, current_poc, l0_poc, l1_poc)
+
+    # Explicit weighted biprediction
+    w0, o0 = weight_table_l0.get(ref_idx_l0, (64, 0))
+    w1, o1 = weight_table_l1.get(ref_idx_l1, (64, 0))
+
+    return weighted_bipred(pred_l0, pred_l1, w0, o0, w1, o1, log2_denom)
+
+
+def b_8x8_weighted(
+    preds_l0: list,
+    preds_l1: list,
+    ref_indices_l0: list,
+    ref_indices_l1: list,
+    weight_table_l0: dict,
+    weight_table_l1: dict,
+    log2_denom: int,
+    weighted_bipred_idc: int,
+    current_poc: int = 0,
+    l0_pocs: list = None,
+    l1_pocs: list = None,
+) -> list:
+    """Apply weighted bi-prediction for B_8x8 macroblock.
+
+    Each 8x8 partition can use different reference frames with
+    different weights.
+
+    Args:
+        preds_l0: List of 4 L0 prediction blocks (8x8 each)
+        preds_l1: List of 4 L1 prediction blocks (8x8 each)
+        ref_indices_l0: List of 4 L0 reference indices
+        ref_indices_l1: List of 4 L1 reference indices
+        weight_table_l0: Dict mapping ref_idx to (weight, offset)
+        weight_table_l1: Dict mapping ref_idx to (weight, offset)
+        log2_denom: Weight denominator
+        weighted_bipred_idc: 0=no weighted, 1=explicit, 2=implicit
+        current_poc: Current POC (for implicit)
+        l0_pocs, l1_pocs: POC lists for each reference (for implicit)
+
+    Returns:
+        List of 4 weighted prediction blocks (8x8 each)
+    """
+    results = []
+
+    for i in range(4):
+        if weighted_bipred_idc == 0:
+            result = bipred_average(preds_l0[i], preds_l1[i])
+        elif weighted_bipred_idc == 2:
+            # Implicit: derive weights from POC
+            l0_poc = l0_pocs[ref_indices_l0[i]] if l0_pocs else 0
+            l1_poc = l1_pocs[ref_indices_l1[i]] if l1_pocs else 0
+            result = implicit_bipred(
+                preds_l0[i], preds_l1[i], current_poc, l0_poc, l1_poc
+            )
+        else:
+            # Explicit weighted
+            w0, o0 = weight_table_l0.get(ref_indices_l0[i], (64, 0))
+            w1, o1 = weight_table_l1.get(ref_indices_l1[i], (64, 0))
+            result = weighted_bipred(
+                preds_l0[i], preds_l1[i], w0, o0, w1, o1, log2_denom
+            )
+        results.append(result)
+
+    return results
+
+
+def weighted_bipred_with_fallback(
+    pred_l0: np.ndarray,
+    pred_l1: np.ndarray,
+    w0: int,
+    o0: int,
+    w1: int,
+    o1: int,
+    log2_denom: int,
+) -> np.ndarray:
+    """Apply weighted bi-prediction with fallback for missing references.
+
+    When one reference is unavailable (None), falls back to uniprediction
+    using the available reference.
+
+    Args:
+        pred_l0: L0 prediction or None
+        pred_l1: L1 prediction or None
+        w0, o0: L0 weight and offset
+        w1, o1: L1 weight and offset
+        log2_denom: Weight denominator
+
+    Returns:
+        Weighted prediction block, uint8
+    """
+    from inter.weighted_pred import apply_weighted_prediction
+
+    if pred_l0 is None and pred_l1 is None:
+        raise ValueError("Both L0 and L1 predictions are None")
+
+    if pred_l0 is None:
+        # Use L1 only
+        return apply_weighted_prediction(pred_l1, w1, o1, log2_denom)
+
+    if pred_l1 is None:
+        # Use L0 only
+        return apply_weighted_prediction(pred_l0, w0, o0, log2_denom)
+
+    # Both available - use full bi-prediction
+    return weighted_bipred(pred_l0, pred_l1, w0, o0, w1, o1, log2_denom)

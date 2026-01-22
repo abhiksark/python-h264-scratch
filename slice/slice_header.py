@@ -154,6 +154,7 @@ class SliceHeader:
 
     # Prediction weights (for weighted prediction)
     weighted_pred_table: Optional['WeightTable'] = None
+    weighted_pred_table_l1: Optional['WeightTable'] = None  # For B-slices
 
     # Decoded reference picture marking
     dec_ref_pic_marking: Optional[DecRefPicMarking] = None
@@ -527,4 +528,35 @@ def parse_slice_header(
     header.header_bit_size = reader.position
 
     logger.info(f"Parsed {header}")
+    return header
+
+
+def parse_slice_header_weighted(
+    rbsp: bytes,
+    sps: SPS,
+    pps: PPS,
+    nal_unit_type: int,
+    nal_ref_idc: int,
+) -> SliceHeader:
+    """Parse slice header including weighted prediction tables.
+
+    This function parses slice header and extracts weight tables
+    for weighted prediction when enabled.
+
+    Args:
+        rbsp: Raw Byte Sequence Payload
+        sps: Sequence Parameter Set
+        pps: Picture Parameter Set
+        nal_unit_type: NAL unit type
+        nal_ref_idc: NAL reference indicator
+
+    Returns:
+        SliceHeader with weighted_pred_table populated when applicable
+    """
+    header = parse_slice_header(rbsp, sps, pps, nal_unit_type, nal_ref_idc)
+
+    # If weighted prediction is enabled, weight table parsing happens
+    # in parse_slice_header via _parse_pred_weight_table
+    # This wrapper exists for explicit weighted prediction handling
+
     return header

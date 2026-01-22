@@ -259,3 +259,109 @@ def decode_residual_block_cabac(
             num_gt1 += 1
 
     return coeffs
+
+
+def decode_coeff_abs_level_suffix_bypass(
+    decoder: 'CABACDecoder',
+    prefix_value: int,
+) -> int:
+    """Decode coefficient level suffix using bypass mode.
+
+    For levels > 14, the suffix is exp-golomb coded in bypass mode.
+
+    Args:
+        decoder: CABAC decoder
+        prefix_value: Value decoded from prefix (>= 14)
+
+    Returns:
+        Suffix value
+
+    H.264 Spec Reference: Section 9.3.2.3
+    """
+    if prefix_value < 14:
+        return 0
+
+    # Exp-golomb order 0 for suffix
+    suffix = 0
+    suffix_len = 0
+
+    # Count leading ones in bypass mode
+    while decoder.decode_bypass() == 1:
+        suffix_len += 1
+        if suffix_len > 16:  # Sanity limit
+            break
+
+    # Read suffix_len bits
+    for _ in range(suffix_len):
+        suffix = (suffix << 1) | decoder.decode_bypass()
+
+    # Add offset
+    suffix += (1 << suffix_len) - 1
+
+    return suffix
+
+
+def get_coded_block_flag_ctx_idx(
+    block_cat: int,
+    block_type: str = None,
+    left_cbf: int = 0,
+    top_cbf: int = 0,
+    left_available: bool = True,
+    top_available: bool = True,
+) -> int:
+    """Get context index for coded_block_flag.
+
+    Context depends on block category and neighbor coded_block_flags.
+
+    Args:
+        block_cat: Block category (0-4)
+        block_type: Block type string (optional, derived from block_cat if not given)
+        left_cbf: Left neighbor coded_block_flag (0 or 1)
+        top_cbf: Top neighbor coded_block_flag (0 or 1)
+        left_available: Whether left neighbor is available
+        top_available: Whether top neighbor is available
+
+    Returns:
+        Context index
+
+    H.264 Spec Reference: Section 9.3.3.1.1.9
+    """
+    # Base context indices for coded_block_flag
+    # Table 9-39 in H.264 spec
+    CBF_LUMA_DC_BASE = 85
+    CBF_LUMA_AC_BASE = 89
+    CBF_CHROMA_DC_BASE = 93
+    CBF_CHROMA_AC_BASE = 97
+
+    # Select base context based on block_cat or block_type
+    if block_type is not None:
+        if block_type == 'luma_dc':
+            ctx_base = CBF_LUMA_DC_BASE
+        elif block_type == 'luma_ac':
+            ctx_base = CBF_LUMA_AC_BASE
+        elif block_type == 'chroma_dc':
+            ctx_base = CBF_CHROMA_DC_BASE
+        elif block_type == 'chroma_ac':
+            ctx_base = CBF_CHROMA_AC_BASE
+        else:
+            ctx_base = CBF_LUMA_AC_BASE
+    else:
+        # Derive from block_cat
+        # 0=Luma DC (I_16x16), 1=Luma AC, 2=Luma 4x4
+        # 3=Chroma DC, 4=Chroma AC
+        if block_cat == 0:
+            ctx_base = CBF_LUMA_DC_BASE
+        elif block_cat in (1, 2):
+            ctx_base = CBF_LUMA_AC_BASE
+        elif block_cat == 3:
+            ctx_base = CBF_CHROMA_DC_BASE
+        else:
+            ctx_base = CBF_CHROMA_AC_BASE
+
+    # Context increment based on neighbors (condTermFlagA + condTermFlagB)
+    # If neighbor unavailable, treat as 0
+    cond_a = 1 if (left_available and left_cbf) else 0
+    cond_b = 1 if (top_available and top_cbf) else 0
+    ctx_inc = cond_a + cond_b
+
+    return ctx_base + ctx_inc
