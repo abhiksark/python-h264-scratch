@@ -1468,7 +1468,12 @@ def decode_macroblock(
 
             # Generate prediction using the decoded mode
             mode = mb.intra_4x4_pred_modes[block_idx]
-            pred = predict_intra_4x4(mode, top, left, top_left, top_right)
+            pred = predict_intra_4x4(
+                mode, top, left, top_left, top_right,
+                top_available=(top is not None),
+                left_available=(left is not None),
+                top_right_available=(top_right is not None)
+            )
 
             # Check if this 8x8 region has coefficients
             block_8x8_idx = block_idx // 4  # 0-3 (which quadrant)
