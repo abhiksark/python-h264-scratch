@@ -184,3 +184,29 @@ class CABACDecoder:
         while self.codIRange < 256:
             self.codIRange <<= 1
             self.codIOffset = (self.codIOffset << 1) | self.reader.read_bits(1)
+
+    def byte_align(self) -> None:
+        """Align bitstream reader to next byte boundary.
+
+        Used after I_PCM macroblock to resume CABAC from byte-aligned position.
+        Reinitializes the arithmetic decoder state.
+
+        H.264 Section 9.3.1.2 - Initialization process
+        """
+        # Align underlying reader to byte boundary
+        self.reader.byte_align()
+
+        # Reinitialize CABAC state
+        self.codIRange = 510
+        self.codIOffset = self.reader.read_bits(9)
+
+    def read_bits(self, n: int) -> int:
+        """Read n bypass bits for I_PCM samples.
+
+        Args:
+            n: Number of bits to read
+
+        Returns:
+            Value read from bitstream
+        """
+        return self.reader.read_bits(n)

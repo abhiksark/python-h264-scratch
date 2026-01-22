@@ -123,7 +123,8 @@ def decode_mb_type_i(
         else:
             chroma = 1
 
-    return 1 + prefix + suffix * 4 + chroma
+    # H.264 Table 7-11: mb_type = 1 + pred_mode + 4*cbp_chroma + 12*(cbp_luma!=0)
+    return 1 + suffix + chroma * 4 + prefix
 
 
 def decode_mb_type_p(
@@ -341,24 +342,74 @@ def decode_cbp_luma(
     decoder: 'CABACDecoder',
     contexts: List['CABACContext'],
     mb_type: int,
+    left_cbp: int = -1,
+    top_cbp: int = -1,
 ) -> int:
     """Decode coded_block_pattern luma part.
 
-    4 bits, one per 8x8 block.
+    4 bits, one per 8x8 block. Context depends on neighbor CBP values.
+
+    8x8 block layout in MB:
+        +---+---+
+        | 0 | 1 |
+        +---+---+
+        | 2 | 3 |
+        +---+---+
+
+    H.264 Spec Reference: Section 9.3.3.1.1.3
 
     Args:
         decoder: CABAC decoder
         contexts: Context models
         mb_type: Current mb_type
+        left_cbp: Left neighbor's CBP luma (-1 if unavailable)
+        top_cbp: Top neighbor's CBP luma (-1 if unavailable)
 
     Returns:
         CBP luma (0-15)
     """
     ctx_base = CTX_CODED_BLOCK_PATTERN_START
 
+    # Decode 4 bits, one per 8x8 block
     cbp = 0
     for i in range(4):
-        ctx_idx = ctx_base + i
+        # Derive condTermFlagA (left adjacent block)
+        # condTermFlag = 1 if block has NO coded coeffs or unavailable, else 0
+        if i == 0:  # Top-left: left neighbor is block 1 of left MB
+            if left_cbp < 0:  # Unavailable
+                cond_a = 1
+            else:
+                cond_a = 0 if (left_cbp & 0x02) else 1  # Block 1 = bit 1
+        elif i == 1:  # Top-right: left neighbor is block 0 in same MB
+            cond_a = 0 if (cbp & 0x01) else 1
+        elif i == 2:  # Bottom-left: left neighbor is block 3 of left MB
+            if left_cbp < 0:
+                cond_a = 1
+            else:
+                cond_a = 0 if (left_cbp & 0x08) else 1  # Block 3 = bit 3
+        else:  # Bottom-right (i=3): left neighbor is block 2 in same MB
+            cond_a = 0 if (cbp & 0x04) else 1
+
+        # Derive condTermFlagB (top adjacent block)
+        if i == 0:  # Top-left: top neighbor is block 2 of top MB
+            if top_cbp < 0:
+                cond_b = 1
+            else:
+                cond_b = 0 if (top_cbp & 0x04) else 1  # Block 2 = bit 2
+        elif i == 1:  # Top-right: top neighbor is block 3 of top MB
+            if top_cbp < 0:
+                cond_b = 1
+            else:
+                cond_b = 0 if (top_cbp & 0x08) else 1  # Block 3 = bit 3
+        elif i == 2:  # Bottom-left: top neighbor is block 0 in same MB
+            cond_b = 0 if (cbp & 0x01) else 1
+        else:  # Bottom-right (i=3): top neighbor is block 1 in same MB
+            cond_b = 0 if (cbp & 0x02) else 1
+
+        # ctx_inc = condTermFlagA + 2*condTermFlagB (range 0-3)
+        ctx_inc = cond_a + 2 * cond_b
+        ctx_idx = ctx_base + ctx_inc
+
         if decoder.decode_decision(contexts[ctx_idx]) == 1:
             cbp |= (1 << i)
 
@@ -369,25 +420,61 @@ def decode_cbp_chroma(
     decoder: 'CABACDecoder',
     contexts: List['CABACContext'],
     mb_type: int,
+    left_cbp_chroma: int = -1,
+    top_cbp_chroma: int = -1,
 ) -> int:
     """Decode coded_block_pattern chroma part.
 
     0=none, 1=DC only, 2=DC+AC.
+    Context depends on neighbor chroma CBP values.
+
+    H.264 Spec Reference: Section 9.3.3.1.1.3
 
     Args:
         decoder: CABAC decoder
         contexts: Context models
         mb_type: Current mb_type
+        left_cbp_chroma: Left neighbor's CBP chroma (-1 if unavailable)
+        top_cbp_chroma: Top neighbor's CBP chroma (-1 if unavailable)
 
     Returns:
         CBP chroma (0-2)
     """
     ctx_base = CTX_CODED_BLOCK_PATTERN_START + 4
 
-    if decoder.decode_decision(contexts[ctx_base]) == 0:
+    # First bin: distinguishes 0 vs non-zero
+    # condTermFlag = 1 if neighbor chroma CBP is 0 or unavailable, else 0
+    if left_cbp_chroma < 0:
+        cond_a = 1
+    else:
+        cond_a = 0 if left_cbp_chroma > 0 else 1
+
+    if top_cbp_chroma < 0:
+        cond_b = 1
+    else:
+        cond_b = 0 if top_cbp_chroma > 0 else 1
+
+    ctx_inc = cond_a + 2 * cond_b
+    ctx_idx = ctx_base + ctx_inc
+
+    if decoder.decode_decision(contexts[ctx_idx]) == 0:
         return 0
 
-    ctx_idx = ctx_base + 1
+    # Second bin: distinguishes 1 (DC only) vs 2 (DC+AC)
+    # Similar context derivation for second bin
+    if left_cbp_chroma < 0:
+        cond_a = 1
+    else:
+        cond_a = 0 if left_cbp_chroma > 1 else 1
+
+    if top_cbp_chroma < 0:
+        cond_b = 1
+    else:
+        cond_b = 0 if top_cbp_chroma > 1 else 1
+
+    ctx_inc = cond_a + 2 * cond_b
+    ctx_idx = ctx_base + 4 + ctx_inc  # Second set of contexts
+
     if decoder.decode_decision(contexts[ctx_idx]) == 0:
         return 1
     else:

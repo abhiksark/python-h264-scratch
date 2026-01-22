@@ -209,6 +209,38 @@ class TestMBQPDeltaDecoding:
         assert isinstance(result, int)
 
 
+class MockCABACDecoder:
+    """Mock CABAC decoder that tracks context indices used.
+
+    This mock allows us to verify the correct context derivation
+    by recording which context indices are passed to decode_decision.
+    """
+
+    def __init__(self, return_values=None):
+        """Initialize mock decoder.
+
+        Args:
+            return_values: List of values to return from decode_decision.
+                           If None, always returns 0.
+        """
+        self.return_values = return_values or []
+        self.call_index = 0
+        self.context_indices_used = []
+
+    def decode_decision(self, context):
+        """Record context index and return predetermined value."""
+        # Find the context index by checking which context was passed
+        # We store the context object itself for later inspection
+        self.context_indices_used.append(context)
+
+        if self.call_index < len(self.return_values):
+            result = self.return_values[self.call_index]
+        else:
+            result = 0
+        self.call_index += 1
+        return result
+
+
 class TestCodedBlockPattern:
     """Tests for coded_block_pattern decoding."""
 
@@ -253,6 +285,439 @@ class TestCodedBlockPattern:
         result = decode_cbp_chroma(decoder, contexts, mb_type=0)
 
         assert 0 <= result <= 2
+
+
+class TestCBPLumaNeighborContext:
+    """Tests for CBP luma neighbor-based context derivation.
+
+    H.264 Spec Reference: Section 9.3.3.1.1.3
+
+    8x8 block layout in MB:
+        +---+---+
+        | 0 | 1 |
+        +---+---+
+        | 2 | 3 |
+        +---+---+
+
+    Context increment: ctx_inc = condTermFlagA + 2*condTermFlagB
+    condTermFlag = 1 if neighbor block has NO coded coeffs or unavailable
+    condTermFlag = 0 if neighbor block HAS coded coeffs
+    """
+
+    def test_cbp_luma_unavailable_neighbors_use_ctx_inc_3(self):
+        """Block 0 with unavailable neighbors should use ctx_inc=3.
+
+        When left_cbp=-1 and top_cbp=-1 (unavailable):
+        - condTermFlagA = 1 (unavailable)
+        - condTermFlagB = 1 (unavailable)
+        - ctx_inc = 1 + 2*1 = 3
+        """
+        from entropy.cabac_context import (
+            CTX_CODED_BLOCK_PATTERN_START,
+            init_context_models,
+        )
+        from entropy.cabac_syntax import decode_cbp_luma
+
+        contexts = init_context_models(slice_type=0, slice_qp=26)
+        decoder = MockCABACDecoder(return_values=[0, 0, 0, 0])
+
+        decode_cbp_luma(decoder, contexts, mb_type=0, left_cbp=-1, top_cbp=-1)
+
+        # Block 0: ctx_inc = 1 + 2*1 = 3 (both unavailable)
+        expected_ctx_idx_block0 = CTX_CODED_BLOCK_PATTERN_START + 3
+        assert decoder.context_indices_used[0] is contexts[expected_ctx_idx_block0]
+
+    def test_cbp_luma_left_neighbor_has_coded_coeffs(self):
+        """Block 0 with left neighbor having coded coeffs uses different ctx.
+
+        left_cbp=0x02 means block 1 of left MB has coded coeffs.
+        Block 0's left neighbor is block 1 of left MB.
+        - condTermFlagA = 0 (left has coeffs, bit 1 set)
+        - condTermFlagB = 1 (top unavailable)
+        - ctx_inc = 0 + 2*1 = 2
+        """
+        from entropy.cabac_context import (
+            CTX_CODED_BLOCK_PATTERN_START,
+            init_context_models,
+        )
+        from entropy.cabac_syntax import decode_cbp_luma
+
+        contexts = init_context_models(slice_type=0, slice_qp=26)
+        decoder = MockCABACDecoder(return_values=[0, 0, 0, 0])
+
+        # left_cbp=0x02: block 1 of left MB has coded coeffs
+        decode_cbp_luma(decoder, contexts, mb_type=0, left_cbp=0x02, top_cbp=-1)
+
+        # Block 0: condTermFlagA=0 (left has coeffs), condTermFlagB=1 (unavailable)
+        # ctx_inc = 0 + 2*1 = 2
+        expected_ctx_idx_block0 = CTX_CODED_BLOCK_PATTERN_START + 2
+        assert decoder.context_indices_used[0] is contexts[expected_ctx_idx_block0]
+
+    def test_cbp_luma_left_neighbor_no_coded_coeffs(self):
+        """Block 0 with left neighbor having NO coded coeffs.
+
+        left_cbp=0x00 means block 1 of left MB has NO coded coeffs.
+        - condTermFlagA = 1 (left has no coeffs)
+        - condTermFlagB = 1 (top unavailable)
+        - ctx_inc = 1 + 2*1 = 3
+        """
+        from entropy.cabac_context import (
+            CTX_CODED_BLOCK_PATTERN_START,
+            init_context_models,
+        )
+        from entropy.cabac_syntax import decode_cbp_luma
+
+        contexts = init_context_models(slice_type=0, slice_qp=26)
+        decoder = MockCABACDecoder(return_values=[0, 0, 0, 0])
+
+        # left_cbp=0x00: block 1 of left MB has NO coded coeffs (bit 1 not set)
+        decode_cbp_luma(decoder, contexts, mb_type=0, left_cbp=0x00, top_cbp=-1)
+
+        # Block 0: condTermFlagA=1 (no coeffs), condTermFlagB=1 (unavailable)
+        # ctx_inc = 1 + 2*1 = 3
+        expected_ctx_idx_block0 = CTX_CODED_BLOCK_PATTERN_START + 3
+        assert decoder.context_indices_used[0] is contexts[expected_ctx_idx_block0]
+
+    def test_cbp_luma_top_neighbor_has_coded_coeffs(self):
+        """Block 0 with top neighbor having coded coeffs.
+
+        top_cbp=0x04 means block 2 of top MB has coded coeffs.
+        Block 0's top neighbor is block 2 of top MB.
+        - condTermFlagA = 1 (left unavailable)
+        - condTermFlagB = 0 (top has coeffs, bit 2 set)
+        - ctx_inc = 1 + 2*0 = 1
+        """
+        from entropy.cabac_context import (
+            CTX_CODED_BLOCK_PATTERN_START,
+            init_context_models,
+        )
+        from entropy.cabac_syntax import decode_cbp_luma
+
+        contexts = init_context_models(slice_type=0, slice_qp=26)
+        decoder = MockCABACDecoder(return_values=[0, 0, 0, 0])
+
+        # top_cbp=0x04: block 2 of top MB has coded coeffs
+        decode_cbp_luma(decoder, contexts, mb_type=0, left_cbp=-1, top_cbp=0x04)
+
+        # Block 0: condTermFlagA=1 (unavailable), condTermFlagB=0 (top has coeffs)
+        # ctx_inc = 1 + 2*0 = 1
+        expected_ctx_idx_block0 = CTX_CODED_BLOCK_PATTERN_START + 1
+        assert decoder.context_indices_used[0] is contexts[expected_ctx_idx_block0]
+
+    def test_cbp_luma_both_neighbors_have_coded_coeffs(self):
+        """Block 0 with both neighbors having coded coeffs uses ctx_inc=0.
+
+        left_cbp=0x02 (block 1 has coeffs), top_cbp=0x04 (block 2 has coeffs)
+        - condTermFlagA = 0 (left has coeffs)
+        - condTermFlagB = 0 (top has coeffs)
+        - ctx_inc = 0 + 2*0 = 0
+        """
+        from entropy.cabac_context import (
+            CTX_CODED_BLOCK_PATTERN_START,
+            init_context_models,
+        )
+        from entropy.cabac_syntax import decode_cbp_luma
+
+        contexts = init_context_models(slice_type=0, slice_qp=26)
+        decoder = MockCABACDecoder(return_values=[0, 0, 0, 0])
+
+        decode_cbp_luma(decoder, contexts, mb_type=0, left_cbp=0x02, top_cbp=0x04)
+
+        # Block 0: ctx_inc = 0 + 2*0 = 0
+        expected_ctx_idx_block0 = CTX_CODED_BLOCK_PATTERN_START + 0
+        assert decoder.context_indices_used[0] is contexts[expected_ctx_idx_block0]
+
+    def test_cbp_luma_block1_uses_block0_as_left_neighbor(self):
+        """Block 1's left neighbor is block 0 within same MB.
+
+        When block 0 is decoded as having coeffs (return 1), block 1 sees it.
+        - condTermFlagA = 0 (block 0 has coeffs)
+        """
+        from entropy.cabac_context import (
+            CTX_CODED_BLOCK_PATTERN_START,
+            init_context_models,
+        )
+        from entropy.cabac_syntax import decode_cbp_luma
+
+        contexts = init_context_models(slice_type=0, slice_qp=26)
+        # Block 0 returns 1 (has coeffs), subsequent blocks return 0
+        decoder = MockCABACDecoder(return_values=[1, 0, 0, 0])
+
+        # top_cbp=0x08 means block 3 of top MB has coeffs (block 1's top neighbor)
+        decode_cbp_luma(decoder, contexts, mb_type=0, left_cbp=-1, top_cbp=0x08)
+
+        # Block 1: left=block0 (just decoded as 1), top=block3 of top (has coeffs)
+        # condTermFlagA = 0 (block 0 has coeffs)
+        # condTermFlagB = 0 (top block 3 has coeffs)
+        # ctx_inc = 0 + 2*0 = 0
+        expected_ctx_idx_block1 = CTX_CODED_BLOCK_PATTERN_START + 0
+        assert decoder.context_indices_used[1] is contexts[expected_ctx_idx_block1]
+
+    def test_cbp_luma_block2_uses_block3_of_left_mb(self):
+        """Block 2's left neighbor is block 3 of left MB.
+
+        left_cbp=0x08 means block 3 of left MB has coded coeffs.
+        """
+        from entropy.cabac_context import (
+            CTX_CODED_BLOCK_PATTERN_START,
+            init_context_models,
+        )
+        from entropy.cabac_syntax import decode_cbp_luma
+
+        contexts = init_context_models(slice_type=0, slice_qp=26)
+        # Block 0, 1 return 0, then block 2's context is checked
+        decoder = MockCABACDecoder(return_values=[0, 0, 0, 0])
+
+        # left_cbp=0x08: block 3 of left MB has coded coeffs
+        decode_cbp_luma(decoder, contexts, mb_type=0, left_cbp=0x08, top_cbp=-1)
+
+        # Block 2: left=block3 of left MB (has coeffs), top=block0 (no coeffs)
+        # condTermFlagA = 0 (block 3 of left has coeffs)
+        # condTermFlagB = 1 (block 0 has no coeffs, decoded as 0)
+        # ctx_inc = 0 + 2*1 = 2
+        expected_ctx_idx_block2 = CTX_CODED_BLOCK_PATTERN_START + 2
+        assert decoder.context_indices_used[2] is contexts[expected_ctx_idx_block2]
+
+    def test_cbp_luma_block3_uses_internal_neighbors(self):
+        """Block 3's neighbors are block 2 (left) and block 1 (top) within MB.
+
+        Both are internal to current MB.
+        """
+        from entropy.cabac_context import (
+            CTX_CODED_BLOCK_PATTERN_START,
+            init_context_models,
+        )
+        from entropy.cabac_syntax import decode_cbp_luma
+
+        contexts = init_context_models(slice_type=0, slice_qp=26)
+        # Blocks 0,1,2 return 1 (have coeffs)
+        decoder = MockCABACDecoder(return_values=[1, 1, 1, 0])
+
+        decode_cbp_luma(decoder, contexts, mb_type=0, left_cbp=-1, top_cbp=-1)
+
+        # Block 3: left=block2 (has coeffs), top=block1 (has coeffs)
+        # condTermFlagA = 0 (block 2 has coeffs)
+        # condTermFlagB = 0 (block 1 has coeffs)
+        # ctx_inc = 0 + 2*0 = 0
+        expected_ctx_idx_block3 = CTX_CODED_BLOCK_PATTERN_START + 0
+        assert decoder.context_indices_used[3] is contexts[expected_ctx_idx_block3]
+
+    def test_cbp_luma_returns_correct_value_from_bits(self):
+        """CBP luma correctly assembles bits from all 4 blocks."""
+        from entropy.cabac_context import init_context_models
+        from entropy.cabac_syntax import decode_cbp_luma
+
+        contexts = init_context_models(slice_type=0, slice_qp=26)
+        # Return pattern: block0=1, block1=0, block2=1, block3=1
+        decoder = MockCABACDecoder(return_values=[1, 0, 1, 1])
+
+        result = decode_cbp_luma(decoder, contexts, mb_type=0, left_cbp=-1, top_cbp=-1)
+
+        # CBP = bit0 | bit1<<1 | bit2<<2 | bit3<<3 = 1 | 0 | 4 | 8 = 13 (0b1101)
+        assert result == 0b1101
+
+
+class TestCBPChromaNeighborContext:
+    """Tests for CBP chroma neighbor-based context derivation.
+
+    H.264 Spec Reference: Section 9.3.3.1.1.3
+
+    CBP chroma: 0=none, 1=DC only, 2=DC+AC
+    First bin: 0 vs non-zero
+    Second bin (if first=1): 1 vs 2
+    """
+
+    def test_cbp_chroma_unavailable_neighbors_use_ctx_inc_3(self):
+        """Unavailable neighbors should use ctx_inc=3 for first bin.
+
+        When left_cbp_chroma=-1 and top_cbp_chroma=-1:
+        - condTermFlagA = 1 (unavailable)
+        - condTermFlagB = 1 (unavailable)
+        - ctx_inc = 1 + 2*1 = 3
+        """
+        from entropy.cabac_context import (
+            CTX_CODED_BLOCK_PATTERN_START,
+            init_context_models,
+        )
+        from entropy.cabac_syntax import decode_cbp_chroma
+
+        contexts = init_context_models(slice_type=0, slice_qp=26)
+        # First bin returns 0 (cbp_chroma=0)
+        decoder = MockCABACDecoder(return_values=[0])
+
+        decode_cbp_chroma(
+            decoder, contexts, mb_type=0, left_cbp_chroma=-1, top_cbp_chroma=-1
+        )
+
+        # First bin: ctx_base + 4 + ctx_inc = 73 + 4 + 3 = 80
+        expected_ctx_idx = CTX_CODED_BLOCK_PATTERN_START + 4 + 3
+        assert decoder.context_indices_used[0] is contexts[expected_ctx_idx]
+
+    def test_cbp_chroma_left_neighbor_has_nonzero_cbp(self):
+        """Left neighbor with non-zero chroma CBP.
+
+        left_cbp_chroma=1 means left has DC chroma coeffs.
+        - condTermFlagA = 0 (left has non-zero cbp)
+        """
+        from entropy.cabac_context import (
+            CTX_CODED_BLOCK_PATTERN_START,
+            init_context_models,
+        )
+        from entropy.cabac_syntax import decode_cbp_chroma
+
+        contexts = init_context_models(slice_type=0, slice_qp=26)
+        decoder = MockCABACDecoder(return_values=[0])
+
+        decode_cbp_chroma(
+            decoder, contexts, mb_type=0, left_cbp_chroma=1, top_cbp_chroma=-1
+        )
+
+        # condTermFlagA = 0 (left > 0), condTermFlagB = 1 (unavailable)
+        # ctx_inc = 0 + 2*1 = 2
+        expected_ctx_idx = CTX_CODED_BLOCK_PATTERN_START + 4 + 2
+        assert decoder.context_indices_used[0] is contexts[expected_ctx_idx]
+
+    def test_cbp_chroma_top_neighbor_has_nonzero_cbp(self):
+        """Top neighbor with non-zero chroma CBP.
+
+        top_cbp_chroma=2 means top has DC+AC chroma coeffs.
+        - condTermFlagB = 0 (top has non-zero cbp)
+        """
+        from entropy.cabac_context import (
+            CTX_CODED_BLOCK_PATTERN_START,
+            init_context_models,
+        )
+        from entropy.cabac_syntax import decode_cbp_chroma
+
+        contexts = init_context_models(slice_type=0, slice_qp=26)
+        decoder = MockCABACDecoder(return_values=[0])
+
+        decode_cbp_chroma(
+            decoder, contexts, mb_type=0, left_cbp_chroma=-1, top_cbp_chroma=2
+        )
+
+        # condTermFlagA = 1 (unavailable), condTermFlagB = 0 (top > 0)
+        # ctx_inc = 1 + 2*0 = 1
+        expected_ctx_idx = CTX_CODED_BLOCK_PATTERN_START + 4 + 1
+        assert decoder.context_indices_used[0] is contexts[expected_ctx_idx]
+
+    def test_cbp_chroma_both_neighbors_have_zero_cbp(self):
+        """Both neighbors with zero chroma CBP.
+
+        left_cbp_chroma=0 and top_cbp_chroma=0.
+        - condTermFlagA = 1 (left == 0)
+        - condTermFlagB = 1 (top == 0)
+        - ctx_inc = 1 + 2*1 = 3
+        """
+        from entropy.cabac_context import (
+            CTX_CODED_BLOCK_PATTERN_START,
+            init_context_models,
+        )
+        from entropy.cabac_syntax import decode_cbp_chroma
+
+        contexts = init_context_models(slice_type=0, slice_qp=26)
+        decoder = MockCABACDecoder(return_values=[0])
+
+        decode_cbp_chroma(
+            decoder, contexts, mb_type=0, left_cbp_chroma=0, top_cbp_chroma=0
+        )
+
+        # Both neighbors have cbp=0
+        # ctx_inc = 1 + 2*1 = 3
+        expected_ctx_idx = CTX_CODED_BLOCK_PATTERN_START + 4 + 3
+        assert decoder.context_indices_used[0] is contexts[expected_ctx_idx]
+
+    def test_cbp_chroma_both_neighbors_have_nonzero_cbp(self):
+        """Both neighbors with non-zero chroma CBP uses ctx_inc=0."""
+        from entropy.cabac_context import (
+            CTX_CODED_BLOCK_PATTERN_START,
+            init_context_models,
+        )
+        from entropy.cabac_syntax import decode_cbp_chroma
+
+        contexts = init_context_models(slice_type=0, slice_qp=26)
+        decoder = MockCABACDecoder(return_values=[0])
+
+        decode_cbp_chroma(
+            decoder, contexts, mb_type=0, left_cbp_chroma=2, top_cbp_chroma=1
+        )
+
+        # Both neighbors have cbp > 0
+        # ctx_inc = 0 + 2*0 = 0
+        expected_ctx_idx = CTX_CODED_BLOCK_PATTERN_START + 4 + 0
+        assert decoder.context_indices_used[0] is contexts[expected_ctx_idx]
+
+    def test_cbp_chroma_second_bin_context_derivation(self):
+        """Second bin uses different context based on neighbor cbp > 1.
+
+        When first bin returns 1 (non-zero), second bin distinguishes 1 vs 2.
+        Context derivation for second bin uses cbp > 1 condition.
+        """
+        from entropy.cabac_context import (
+            CTX_CODED_BLOCK_PATTERN_START,
+            init_context_models,
+        )
+        from entropy.cabac_syntax import decode_cbp_chroma
+
+        contexts = init_context_models(slice_type=0, slice_qp=26)
+        # First bin=1 (non-zero), second bin=0 (result=1, DC only)
+        decoder = MockCABACDecoder(return_values=[1, 0])
+
+        # left_cbp_chroma=2 (>1), top_cbp_chroma=1 (not >1)
+        decode_cbp_chroma(
+            decoder, contexts, mb_type=0, left_cbp_chroma=2, top_cbp_chroma=1
+        )
+
+        # Second bin: condTermFlagA = 0 (left > 1), condTermFlagB = 1 (top not > 1)
+        # ctx_inc = 0 + 2*1 = 2
+        # Second bin uses ctx_base + 4 + 4 + ctx_inc = 73 + 4 + 4 + 2 = 83
+        expected_ctx_idx_bin2 = CTX_CODED_BLOCK_PATTERN_START + 4 + 4 + 2
+        assert decoder.context_indices_used[1] is contexts[expected_ctx_idx_bin2]
+
+    def test_cbp_chroma_returns_0_when_first_bin_0(self):
+        """CBP chroma returns 0 when first bin is 0."""
+        from entropy.cabac_context import init_context_models
+        from entropy.cabac_syntax import decode_cbp_chroma
+
+        contexts = init_context_models(slice_type=0, slice_qp=26)
+        decoder = MockCABACDecoder(return_values=[0])
+
+        result = decode_cbp_chroma(
+            decoder, contexts, mb_type=0, left_cbp_chroma=-1, top_cbp_chroma=-1
+        )
+
+        assert result == 0
+        assert len(decoder.context_indices_used) == 1
+
+    def test_cbp_chroma_returns_1_when_first_bin_1_second_bin_0(self):
+        """CBP chroma returns 1 (DC only) when bins are 1,0."""
+        from entropy.cabac_context import init_context_models
+        from entropy.cabac_syntax import decode_cbp_chroma
+
+        contexts = init_context_models(slice_type=0, slice_qp=26)
+        decoder = MockCABACDecoder(return_values=[1, 0])
+
+        result = decode_cbp_chroma(
+            decoder, contexts, mb_type=0, left_cbp_chroma=-1, top_cbp_chroma=-1
+        )
+
+        assert result == 1
+        assert len(decoder.context_indices_used) == 2
+
+    def test_cbp_chroma_returns_2_when_first_bin_1_second_bin_1(self):
+        """CBP chroma returns 2 (DC+AC) when bins are 1,1."""
+        from entropy.cabac_context import init_context_models
+        from entropy.cabac_syntax import decode_cbp_chroma
+
+        contexts = init_context_models(slice_type=0, slice_qp=26)
+        decoder = MockCABACDecoder(return_values=[1, 1])
+
+        result = decode_cbp_chroma(
+            decoder, contexts, mb_type=0, left_cbp_chroma=-1, top_cbp_chroma=-1
+        )
+
+        assert result == 2
+        assert len(decoder.context_indices_used) == 2
 
 
 class TestIntraPredModeDecoding:

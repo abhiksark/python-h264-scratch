@@ -60,6 +60,13 @@ from inter.b_reconstruct import (
     reconstruct_b_bi_16x16,
     reconstruct_b_direct_16x16,
 )
+from entropy.cabac_arith import CABACDecoder
+from entropy.cabac_context import init_context_models
+from entropy.cabac_macroblock import (
+    decode_macroblock_layer_cabac,
+    decode_end_of_slice_flag_cabac,
+)
+from entropy.cabac_residual import decode_residual_block_cabac
 
 logger = logging.getLogger(__name__)
 
@@ -135,6 +142,7 @@ class DecoderState:
     # Per-MB info for deblocking filter
     mb_types: Optional[np.ndarray] = None  # MB type per MB
     mb_coeffs: Optional[np.ndarray] = None  # Has non-zero coeffs per 4x4 block
+    mb_cbps: Optional[np.ndarray] = None  # CBP per MB for CABAC context
 
     # Slice tracking for multiple slice support
     mb_slice_ids: Optional[np.ndarray] = None  # Which slice each MB belongs to
@@ -185,6 +193,8 @@ class DecoderState:
         self.mb_types = np.zeros(mb_count, dtype=np.int32)
         # 16 luma + 8 chroma 4x4 blocks per MB
         self.mb_coeffs = np.zeros((mb_count, 24), dtype=bool)
+        # CBP per MB for CABAC neighbor context
+        self.mb_cbps = np.zeros(mb_count, dtype=np.int32)
 
         # Slice tracking
         self.mb_slice_ids = np.zeros(mb_count, dtype=np.int32)
@@ -359,8 +369,21 @@ class H264Decoder:
         reader = BitReader(nal.rbsp)
         reader.position = slice_header.header_bit_size
 
+        # Check entropy coding mode
+        use_cabac = getattr(pps, 'entropy_coding_mode_flag', 0) == 1
+
+        # For CABAC, align to byte boundary (skip cabac_alignment_one_bit + zeros)
+        if use_cabac:
+            reader.byte_align()
+
         # Decode macroblocks
-        if is_i_slice:
+        if use_cabac:
+            # CABAC entropy coding
+            self._decode_slice_cabac(
+                reader, slice_header, sps, pps, slice_qp,
+                is_i_slice, is_p_slice, is_b_slice
+            )
+        elif is_i_slice:
             self._decode_slice_data(reader, slice_header, sps, pps, slice_qp)
         elif is_p_slice:
             self._decode_p_slice_data(reader, slice_header, sps, pps, slice_qp)
@@ -1340,6 +1363,613 @@ class H264Decoder:
                 )
 
             mb_idx += 1
+
+    def _decode_slice_cabac(
+        self,
+        reader: 'BitReader',
+        slice_header: 'SliceHeader',
+        sps: 'SPS',
+        pps: 'PPS',
+        slice_qp: int,
+        is_i_slice: bool,
+        is_p_slice: bool,
+        is_b_slice: bool,
+    ) -> None:
+        """Decode slice data using CABAC entropy coding.
+
+        Handles I, P, and B slices with CABAC-encoded syntax elements.
+
+        Args:
+            reader: BitReader positioned at slice data
+            slice_header: Parsed slice header
+            sps: Active SPS
+            pps: Active PPS
+            slice_qp: Slice-level QP
+            is_i_slice, is_p_slice, is_b_slice: Slice type flags
+        """
+        mb_width = sps.pic_width_in_mbs
+        mb_height = sps.frame_height_in_mbs
+        total_mbs = mb_width * mb_height
+
+        # Determine slice type for context initialization
+        if is_i_slice:
+            slice_type = 2  # I
+        elif is_p_slice:
+            slice_type = 0  # P
+        else:
+            slice_type = 1  # B
+
+        # Initialize CABAC contexts
+        contexts = init_context_models(slice_type, slice_qp)
+
+        # Create CABAC decoder
+        cabac = CABACDecoder(reader)
+
+        logger.debug(f"Decoding CABAC slice: {total_mbs} MBs, type={slice_type}")
+
+        # Build reference lists for P/B slices
+        if is_b_slice:
+            self._build_b_slice_ref_lists(slice_header)
+
+        current_qp = slice_qp
+        mb_idx = slice_header.first_mb_in_slice
+
+        while mb_idx < total_mbs:
+            mb_x = mb_idx % mb_width
+            mb_y = mb_idx // mb_width
+
+            # Build neighbor info for context derivation
+            mb_info = self._build_cabac_mb_info(mb_x, mb_y, mb_width, sps, pps)
+
+            # Decode macroblock syntax using CABAC
+            mb_data = decode_macroblock_layer_cabac(
+                cabac, contexts, slice_type, mb_info
+            )
+
+            logger.debug(
+                f"CABAC MB ({mb_x}, {mb_y}): skip={mb_data.get('mb_skip_flag', 0)}, "
+                f"type={mb_data.get('mb_type', 0)}, cbp={mb_data.get('cbp', 0):#x}, "
+                f"left_cbp={mb_info.get('left_cbp', -1)}, top_cbp={mb_info.get('top_cbp', -1)}"
+            )
+
+            # Process the decoded macroblock
+            self._process_cabac_macroblock(
+                cabac, contexts, mb_data, mb_x, mb_y,
+                current_qp, sps, pps, slice_type
+            )
+
+            # Update QP
+            current_qp = (current_qp + mb_data.get('mb_qp_delta', 0) + 52) % 52
+
+            # Check for end of slice
+            if decode_end_of_slice_flag_cabac(cabac, contexts) == 1:
+                break
+
+            mb_idx += 1
+
+    def _build_cabac_mb_info(
+        self,
+        mb_x: int,
+        mb_y: int,
+        mb_width: int,
+        sps: 'SPS',
+        pps: 'PPS',
+    ) -> dict:
+        """Build neighbor information for CABAC context derivation.
+
+        Args:
+            mb_x, mb_y: Macroblock position
+            mb_width: Frame width in macroblocks
+            sps, pps: Parameter sets
+
+        Returns:
+            Dict with neighbor availability and types
+        """
+        mb_idx = mb_y * mb_width + mb_x
+
+        # Get neighbor MB types and CBPs
+        left_mb_type = None
+        top_mb_type = None
+        left_cbp = -1  # -1 = unavailable
+        top_cbp = -1
+
+        if mb_x > 0 and self.state.mb_types is not None:
+            left_idx = mb_idx - 1
+            if left_idx >= 0:
+                left_mb_type = self.state.mb_types[left_idx]
+                if self.state.mb_cbps is not None:
+                    left_cbp = int(self.state.mb_cbps[left_idx])
+
+        if mb_y > 0 and self.state.mb_types is not None:
+            top_idx = mb_idx - mb_width
+            if top_idx >= 0:
+                top_mb_type = self.state.mb_types[top_idx]
+                if self.state.mb_cbps is not None:
+                    top_cbp = int(self.state.mb_cbps[top_idx])
+
+        return {
+            'mb_x': mb_x,
+            'mb_y': mb_y,
+            'mb_idx': mb_idx,
+            'left_available': mb_x > 0,
+            'top_available': mb_y > 0,
+            'left_mb_type': left_mb_type,
+            'top_mb_type': top_mb_type,
+            'left_cbp': left_cbp,
+            'top_cbp': top_cbp,
+            'transform_8x8_mode_flag': getattr(pps, 'transform_8x8_mode_flag', 0),
+        }
+
+    def _process_cabac_macroblock(
+        self,
+        cabac: 'CABACDecoder',
+        contexts: list,
+        mb_data: dict,
+        mb_x: int,
+        mb_y: int,
+        qp: int,
+        sps: 'SPS',
+        pps: 'PPS',
+        slice_type: int,
+    ) -> None:
+        """Process a CABAC-decoded macroblock and reconstruct pixels.
+
+        Args:
+            cabac: CABAC decoder for residual
+            contexts: Context models
+            mb_data: Decoded MB syntax from CABAC
+            mb_x, mb_y: Macroblock position
+            qp: Current QP
+            sps, pps: Parameter sets
+            slice_type: Slice type (0=P, 1=B, 2=I)
+        """
+        mb_width = sps.pic_width_in_mbs
+        mb_idx = mb_y * mb_width + mb_x
+
+        # Store MB type and CBP for neighbor reference
+        if self.state.mb_types is not None:
+            self.state.mb_types[mb_idx] = mb_data.get('mb_type', 0)
+        if self.state.mb_cbps is not None:
+            self.state.mb_cbps[mb_idx] = mb_data.get('cbp', 0)
+
+        ly, lx = mb_y * 16, mb_x * 16
+        cy, cx = mb_y * 8, mb_x * 8
+
+        # Handle skip macroblock
+        if mb_data.get('mb_skip_flag', 0) == 1:
+            self._reconstruct_skip_mb_cabac(mb_x, mb_y, slice_type)
+            return
+
+        mb_type = mb_data.get('mb_type', 0)
+
+        # Handle I-macroblock in any slice
+        if self._is_intra_mb_cabac(mb_type, slice_type):
+            self._reconstruct_intra_mb_cabac(
+                cabac, contexts, mb_data, mb_x, mb_y, qp, sps, pps, slice_type
+            )
+        else:
+            # Inter macroblock (P or B prediction)
+            self._reconstruct_inter_mb_cabac(
+                cabac, contexts, mb_data, mb_x, mb_y, qp, sps, pps, slice_type
+            )
+
+    def _is_intra_mb_cabac(self, mb_type: int, slice_type: int) -> bool:
+        """Check if macroblock type is intra.
+
+        Args:
+            mb_type: Macroblock type code
+            slice_type: Slice type
+
+        Returns:
+            True if intra macroblock
+        """
+        if slice_type == 2:  # I-slice
+            return True
+        elif slice_type == 0:  # P-slice
+            # In P-slice, mb_type >= 5 means intra
+            return mb_type >= 5
+        else:  # B-slice
+            # In B-slice, mb_type >= 23 means intra
+            return mb_type >= 23
+
+    def _reconstruct_skip_mb_cabac(
+        self,
+        mb_x: int,
+        mb_y: int,
+        slice_type: int,
+    ) -> None:
+        """Reconstruct a skipped macroblock.
+
+        Args:
+            mb_x, mb_y: Macroblock position
+            slice_type: Slice type (0=P, 1=B)
+        """
+        ly, lx = mb_y * 16, mb_x * 16
+        cy, cx = mb_y * 8, mb_x * 8
+
+        if slice_type == 0:  # P-skip
+            luma, cb, cr = reconstruct_p_skip(
+                ref_buffer=self.state.ref_buffer,
+                mv_cache=self.state.mv_cache,
+                mb_x=mb_x,
+                mb_y=mb_y,
+            )
+        else:  # B-skip
+            use_spatial = True
+            current_poc = 0
+            luma, cb, cr = reconstruct_b_skip(
+                ref_buffer=self.state.ref_buffer,
+                mv_cache=self.state.mv_cache,
+                mb_x=mb_x,
+                mb_y=mb_y,
+                use_spatial=use_spatial,
+                current_poc=current_poc,
+            )
+
+        # Copy to frame buffers
+        self.state.frame_luma[ly:ly+16, lx:lx+16] = luma
+        self.state.frame_cb[cy:cy+8, cx:cx+8] = cb
+        self.state.frame_cr[cy:cy+8, cx:cx+8] = cr
+
+    def _reconstruct_intra_mb_cabac(
+        self,
+        cabac: 'CABACDecoder',
+        contexts: list,
+        mb_data: dict,
+        mb_x: int,
+        mb_y: int,
+        qp: int,
+        sps: 'SPS',
+        pps: 'PPS',
+        slice_type: int,
+    ) -> None:
+        """Reconstruct an intra macroblock decoded with CABAC.
+
+        Args:
+            cabac: CABAC decoder
+            contexts: Context models
+            mb_data: Decoded MB syntax
+            mb_x, mb_y: Macroblock position
+            qp: Current QP
+            sps, pps: Parameter sets
+            slice_type: Slice type
+        """
+        ly, lx = mb_y * 16, mb_x * 16
+        cy, cx = mb_y * 8, mb_x * 8
+
+        # Get MB type relative to I-slice
+        mb_type = mb_data.get('mb_type', 0)
+        if slice_type == 0:  # P-slice
+            mb_type = mb_type - 5
+        elif slice_type == 1:  # B-slice
+            mb_type = mb_type - 23
+
+        # Determine prediction type
+        if mb_type == 0:
+            # I_4x4
+            self._reconstruct_i4x4_cabac(
+                cabac, contexts, mb_data, mb_x, mb_y, qp, sps
+            )
+        elif 1 <= mb_type <= 24:
+            # I_16x16
+            self._reconstruct_i16x16_cabac(
+                cabac, contexts, mb_data, mb_x, mb_y, qp, sps, mb_type
+            )
+        else:
+            # I_PCM or other - fill with mid-gray for now
+            self.state.frame_luma[ly:ly+16, lx:lx+16] = 128
+            self.state.frame_cb[cy:cy+8, cx:cx+8] = 128
+            self.state.frame_cr[cy:cy+8, cx:cx+8] = 128
+
+    def _reconstruct_i16x16_cabac(
+        self,
+        cabac: 'CABACDecoder',
+        contexts: list,
+        mb_data: dict,
+        mb_x: int,
+        mb_y: int,
+        qp: int,
+        sps: 'SPS',
+        mb_type: int,
+    ) -> None:
+        """Reconstruct I_16x16 macroblock with CABAC residual.
+
+        Args:
+            cabac: CABAC decoder
+            contexts: Context models
+            mb_data: Decoded MB syntax
+            mb_x, mb_y: Macroblock position
+            qp: Current QP
+            sps: SPS
+            mb_type: I_16x16 sub-type (1-24)
+        """
+        from intra import predict_intra_16x16
+        from transform import idct_4x4, inverse_hadamard_4x4
+        from dequant import dequant_4x4
+
+        ly, lx = mb_y * 16, mb_x * 16
+        cy, cx = mb_y * 8, mb_x * 8
+
+        # Decode I_16x16 mode from mb_type
+        # mb_type 1-24 maps to mode, cbp_luma, cbp_chroma
+        mode = (mb_type - 1) % 4
+        cbp_chroma = ((mb_type - 1) // 4) % 3
+        cbp_luma = 15 if (mb_type - 1) >= 12 else 0
+
+        # Get prediction with neighbor availability
+        top_available = mb_y > 0
+        left_available = mb_x > 0
+        top = self.state.frame_luma[ly-1, lx:lx+16] if top_available else None
+        left = self.state.frame_luma[ly:ly+16, lx-1] if left_available else None
+        top_left = self.state.frame_luma[ly-1, lx-1] if (left_available and top_available) else None
+
+        pred = predict_intra_16x16(
+            mode, top, left, top_left,
+            top_available=top_available,
+            left_available=left_available
+        )
+
+        # Decode luma DC coefficients (16 values via Hadamard)
+        # Must check coded_block_flag first per H.264 spec 9.3.3.1.3
+        import numpy as np
+        from entropy.cabac_syntax import decode_coded_block_flag
+        dc_cbf = decode_coded_block_flag(cabac, contexts, 0, 0)  # cat=0 for Luma DC
+        if dc_cbf == 1:
+            dc_coeffs = decode_residual_block_cabac(cabac, contexts, 16, 0)  # block_cat=0
+        else:
+            dc_coeffs = np.zeros(16, dtype=np.int32)
+
+        # Dequant and inverse Hadamard for DC
+        dc_block = np.array(dc_coeffs[:16]).reshape(4, 4)
+        dc_block = inverse_hadamard_4x4(dc_block)
+
+        # Scale DC coefficients
+        qp_per = qp // 6
+        qp_rem = qp % 6
+        dc_scale = 1 << max(0, qp_per - 2)
+        dc_block = dc_block * dc_scale
+
+        # Decode AC coefficients for each 4x4 block
+        luma = pred.copy().astype(np.int32)
+
+        for blk_idx in range(16):
+            by = (blk_idx // 4) * 4
+            bx = (blk_idx % 4) * 4
+
+            # Get DC from Hadamard result
+            dc_val = dc_block[blk_idx // 4, blk_idx % 4]
+
+            coeffs = np.zeros(16, dtype=np.int32)
+            coeffs[0] = dc_val
+
+            if cbp_luma & (1 << (blk_idx // 4)):
+                # Check coded_block_flag before decoding AC
+                cbf = decode_coded_block_flag(cabac, contexts, 1, 0)  # cat=1 for I16x16 AC
+                if cbf == 1:
+                    # Decode AC coefficients
+                    ac_coeffs = decode_residual_block_cabac(cabac, contexts, 15, 1)
+                    coeffs[1:] = ac_coeffs[:15]
+
+            # Dequant and IDCT
+            block = coeffs.reshape(4, 4)
+            block = dequant_4x4(block, qp, is_intra=True)
+            residual = idct_4x4(block)
+
+            luma[by:by+4, bx:bx+4] += residual
+
+        # Clip and store
+        self.state.frame_luma[ly:ly+16, lx:lx+16] = np.clip(luma, 0, 255).astype(np.uint8)
+
+        # Decode chroma if needed
+        if cbp_chroma > 0:
+            self._decode_chroma_cabac(cabac, contexts, mb_x, mb_y, qp, cbp_chroma)
+        else:
+            self.state.frame_cb[cy:cy+8, cx:cx+8] = 128
+            self.state.frame_cr[cy:cy+8, cx:cx+8] = 128
+
+    def _reconstruct_i4x4_cabac(
+        self,
+        cabac: 'CABACDecoder',
+        contexts: list,
+        mb_data: dict,
+        mb_x: int,
+        mb_y: int,
+        qp: int,
+        sps: 'SPS',
+    ) -> None:
+        """Reconstruct I_4x4 macroblock with CABAC.
+
+        Decodes residual coefficients for luma and chroma blocks.
+        """
+        from entropy.cabac_residual import decode_residual_block_cabac
+        from entropy.cabac_syntax import decode_coded_block_flag
+        from intra import predict_intra_4x4
+        from transform import idct_4x4
+        from dequant import dequant_4x4
+        import numpy as np
+
+        ly, lx = mb_y * 16, mb_x * 16
+        cy, cx = mb_y * 8, mb_x * 8
+
+        # Get CBP from decoded mb_data
+        cbp = mb_data.get('cbp', 0)
+        cbp_luma = cbp & 0x0F
+        cbp_chroma = (cbp >> 4) & 0x03
+
+        # Get intra prediction modes
+        pred_modes = mb_data.get('mb_pred', {}).get('intra_pred_modes', [])
+
+        # Map 4x4 block index to 8x8 quadrant for CBP check
+        # Blocks 0-3 -> quadrant 0, blocks 4-7 -> quadrant 1, etc.
+        block_to_8x8 = [0, 0, 1, 1, 0, 0, 1, 1, 2, 2, 3, 3, 2, 2, 3, 3]
+
+        # Decode luma 4x4 blocks
+        luma = np.zeros((16, 16), dtype=np.int32)
+
+        for blk_idx in range(16):
+            # 4x4 block position within MB
+            by = ((blk_idx // 4) % 2) * 8 + ((blk_idx % 4) // 2) * 4
+            bx = ((blk_idx // 4) // 2) * 8 + ((blk_idx % 4) % 2) * 4
+
+            # Get prediction mode for this block (-1 means use predicted)
+            mode = pred_modes[blk_idx] if blk_idx < len(pred_modes) else 0
+            if mode == -1:
+                mode = 2  # Default to DC if no predicted mode available
+
+            # Absolute position in frame
+            abs_y = ly + by
+            abs_x = lx + bx
+
+            # Check neighbor availability based on absolute position
+            top_available = abs_y > 0
+            left_available = abs_x > 0
+
+            # Get neighbor samples
+            if top_available:
+                top = self.state.frame_luma[abs_y - 1, abs_x:abs_x + 4]
+            else:
+                top = None
+
+            if left_available:
+                left = self.state.frame_luma[abs_y:abs_y + 4, abs_x - 1]
+            else:
+                left = None
+
+            # Get top-left if both neighbors available
+            top_left = None
+            if top_available and left_available:
+                top_left = int(self.state.frame_luma[abs_y - 1, abs_x - 1])
+
+            # Predict block with availability flags
+            pred = predict_intra_4x4(
+                mode, top, left, top_left,
+                top_available=top_available,
+                left_available=left_available
+            )
+
+            # Check if this 8x8 quadrant has coefficients
+            quad = block_to_8x8[blk_idx]
+            if cbp_luma & (1 << quad):
+                # Decode coded_block_flag for this 4x4 block
+                cbf = decode_coded_block_flag(cabac, contexts, 2, 0)  # cat=2 for I_4x4 luma
+
+                if cbf == 1:
+                    # Decode residual coefficients
+                    coeffs = decode_residual_block_cabac(cabac, contexts, 16, 2)
+                    block = coeffs.reshape(4, 4)
+                    block = dequant_4x4(block, qp, is_intra=True)
+                    residual = idct_4x4(block)
+                    luma[by:by + 4, bx:bx + 4] = pred + residual
+                else:
+                    luma[by:by + 4, bx:bx + 4] = pred
+            else:
+                luma[by:by + 4, bx:bx + 4] = pred
+
+            # Store to frame buffer for neighbor prediction
+            self.state.frame_luma[abs_y:abs_y + 4, abs_x:abs_x + 4] = np.clip(
+                luma[by:by + 4, bx:bx + 4], 0, 255
+            ).astype(np.uint8)
+
+        # Decode chroma if needed
+        if cbp_chroma > 0:
+            # Decode chroma DC and AC
+            self._decode_chroma_cabac(cabac, contexts, mb_x, mb_y, qp, cbp_chroma)
+        else:
+            # Fill with mid-gray
+            self.state.frame_cb[cy:cy + 8, cx:cx + 8] = 128
+            self.state.frame_cr[cy:cy + 8, cx:cx + 8] = 128
+
+    def _decode_chroma_cabac(
+        self,
+        cabac: 'CABACDecoder',
+        contexts: list,
+        mb_x: int,
+        mb_y: int,
+        qp: int,
+        cbp_chroma: int,
+    ) -> None:
+        """Decode chroma coefficients using CABAC.
+
+        Args:
+            cabac: CABAC decoder
+            contexts: Context models
+            mb_x, mb_y: Macroblock position
+            qp: Current QP
+            cbp_chroma: Chroma CBP (0=none, 1=DC only, 2=DC+AC)
+        """
+        from entropy.cabac_residual import decode_residual_block_cabac
+        from entropy.cabac_syntax import decode_coded_block_flag
+        from transform import inverse_hadamard_2x2, idct_4x4
+        from dequant import dequant_4x4
+        import numpy as np
+
+        cy, cx = mb_y * 8, mb_x * 8
+
+        # Chroma QP adjustment
+        qp_c = min(51, qp)
+
+        for plane in range(2):  # Cb, Cr
+            frame = self.state.frame_cb if plane == 0 else self.state.frame_cr
+
+            # Decode DC coefficients (4 values via 2x2 Hadamard)
+            # Must check coded_block_flag first per H.264 spec 9.3.3.1.3
+            dc_cbf = decode_coded_block_flag(cabac, contexts, 3, 0)  # cat=3 for chroma DC
+            if dc_cbf == 1:
+                dc_coeffs = decode_residual_block_cabac(cabac, contexts, 4, 3)  # block_cat=3 for chroma DC
+                dc_block = np.array(dc_coeffs[:4]).reshape(2, 2)
+                dc_block = inverse_hadamard_2x2(dc_block)
+            else:
+                dc_block = np.zeros((2, 2), dtype=np.int32)
+
+            # Initialize chroma plane
+            chroma = np.full((8, 8), 128, dtype=np.int32)
+
+            # Decode AC coefficients for each 4x4 block if cbp_chroma == 2
+            for blk_idx in range(4):
+                by = (blk_idx // 2) * 4
+                bx = (blk_idx % 2) * 4
+
+                # Get DC value
+                dc_val = dc_block[blk_idx // 2, blk_idx % 2]
+
+                coeffs = np.zeros(16, dtype=np.int32)
+                coeffs[0] = dc_val
+
+                if cbp_chroma == 2:
+                    # Check coded_block_flag for AC
+                    cbf = decode_coded_block_flag(cabac, contexts, 4, 0)  # cat=4 for chroma AC
+                    if cbf == 1:
+                        ac_coeffs = decode_residual_block_cabac(cabac, contexts, 15, 4)
+                        coeffs[1:] = ac_coeffs[:15]
+
+                # Dequant and IDCT
+                block = coeffs.reshape(4, 4)
+                block = dequant_4x4(block, qp_c, is_intra=True)
+                residual = idct_4x4(block)
+
+                chroma[by:by + 4, bx:bx + 4] = 128 + residual
+
+            # Clip and store
+            frame[cy:cy + 8, cx:cx + 8] = np.clip(chroma, 0, 255).astype(np.uint8)
+
+    def _reconstruct_inter_mb_cabac(
+        self,
+        cabac: 'CABACDecoder',
+        contexts: list,
+        mb_data: dict,
+        mb_x: int,
+        mb_y: int,
+        qp: int,
+        sps: 'SPS',
+        pps: 'PPS',
+        slice_type: int,
+    ) -> None:
+        """Reconstruct an inter macroblock decoded with CABAC.
+
+        For now, uses skip reconstruction as placeholder.
+        """
+        # Use skip reconstruction as fallback
+        self._reconstruct_skip_mb_cabac(mb_x, mb_y, slice_type)
 
     def _build_b_slice_ref_lists(
         self,

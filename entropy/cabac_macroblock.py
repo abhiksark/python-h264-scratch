@@ -169,11 +169,27 @@ def decode_cbp_cabac(
     # Get mb_type from mb_info for context selection
     mb_type = mb_info.get('mb_type', 0)
 
-    # Decode luma CBP (4 bits)
-    cbp_luma = decode_cbp_luma(decoder, contexts, mb_type)
+    # Get neighbor CBP values for context derivation
+    left_available = mb_info.get('left_available', False)
+    top_available = mb_info.get('top_available', False)
 
-    # Decode chroma CBP (2 bits)
-    cbp_chroma = decode_cbp_chroma(decoder, contexts, mb_type)
+    # Extract neighbor luma CBP (bits 0-3)
+    left_cbp = mb_info.get('left_cbp', 0) if left_available else -1
+    top_cbp = mb_info.get('top_cbp', 0) if top_available else -1
+
+    # For luma CBP context, we need just the luma bits (0-3)
+    left_cbp_luma = (left_cbp & 0x0F) if left_cbp >= 0 else -1
+    top_cbp_luma = (top_cbp & 0x0F) if top_cbp >= 0 else -1
+
+    # Extract neighbor chroma CBP (bits 4-5 shifted to 0-1 range)
+    left_cbp_chroma = ((left_cbp >> 4) & 0x03) if left_cbp >= 0 else -1
+    top_cbp_chroma = ((top_cbp >> 4) & 0x03) if top_cbp >= 0 else -1
+
+    # Decode luma CBP (4 bits) with neighbor context
+    cbp_luma = decode_cbp_luma(decoder, contexts, mb_type, left_cbp_luma, top_cbp_luma)
+
+    # Decode chroma CBP (2 bits) with neighbor context
+    cbp_chroma = decode_cbp_chroma(decoder, contexts, mb_type, left_cbp_chroma, top_cbp_chroma)
 
     return cbp_luma | (cbp_chroma << 4)
 
@@ -329,9 +345,24 @@ def decode_macroblock_layer_cabac(
             decoder, contexts, mb_info,
             is_inter=not _is_intra_mb_type(result['mb_type'], slice_type)
         )
+    else:
+        # For I_16x16, CBP is embedded in mb_type
+        cbp_luma, cbp_chroma = _extract_i16x16_cbp(result['mb_type'], slice_type)
+        result['cbp_luma'] = cbp_luma
+        result['cbp_chroma'] = cbp_chroma
+        result['cbp'] = cbp_luma | (cbp_chroma << 4)
 
     # Decode mb_qp_delta (if any coded blocks)
-    if result['cbp'] != 0 or _is_i_16x16(result['mb_type'], slice_type):
+    # For I_16x16: check embedded CBP; for others: check decoded CBP
+    has_coded_blocks = False
+    if _is_i_16x16(result['mb_type'], slice_type):
+        cbp_luma = result.get('cbp_luma', 0)
+        cbp_chroma = result.get('cbp_chroma', 0)
+        has_coded_blocks = cbp_luma != 0 or cbp_chroma != 0
+    else:
+        has_coded_blocks = result['cbp'] != 0
+
+    if has_coded_blocks:
         result['mb_qp_delta'] = decode_mb_qp_delta(decoder, contexts)
 
     return result
@@ -455,6 +486,38 @@ def _is_i_pcm(mb_type: int, slice_type: int) -> bool:
         return mb_type == 48
 
 
+def _extract_i16x16_cbp(mb_type: int, slice_type: int) -> tuple:
+    """Extract CBP from I_16x16 mb_type.
+
+    For I_16x16: mb_type = 1 + pred_mode + 4*cbp_chroma + 12*(cbp_luma != 0)
+
+    Args:
+        mb_type: Macroblock type value
+        slice_type: Slice type (0=P, 1=B, 2=I)
+
+    Returns:
+        Tuple of (cbp_luma, cbp_chroma) where:
+        - cbp_luma is 0 or 15 (all blocks have AC coeffs)
+        - cbp_chroma is 0, 1, or 2
+    """
+    # Get base I_16x16 type value (0-23)
+    if slice_type == 2:  # I-slice
+        base = mb_type - 1
+    elif slice_type == 0:  # P-slice
+        base = mb_type - 6
+    else:  # B-slice
+        base = mb_type - 24
+
+    # H.264 Table 7-11 encoding:
+    # mb_type = 1 + pred_mode + 4*cbp_chroma + 12*(cbp_luma != 0)
+    # So base = pred_mode + 4*cbp_chroma + 12*(cbp_luma != 0)
+    cbp_luma = 15 if base >= 12 else 0
+    base_without_luma = base % 12
+    cbp_chroma = base_without_luma // 4
+
+    return (cbp_luma, cbp_chroma)
+
+
 def _can_use_8x8_transform(mb_type: int, slice_type: int) -> bool:
     """Check if macroblock can use 8x8 transform."""
     if _is_intra_mb_type(mb_type, slice_type):
@@ -518,11 +581,23 @@ def decode_coded_block_pattern_cabac(
     if mb_info is None:
         mb_info = {'left_available': False, 'top_available': False}
 
-    # Decode luma CBP (4 bits) - uses mb_type for context
-    cbp_luma = decode_cbp_luma(decoder, contexts, mb_type)
+    # Get neighbor CBP values for context derivation
+    left_available = mb_info.get('left_available', False)
+    top_available = mb_info.get('top_available', False)
 
-    # Decode chroma CBP (2 bits) - uses mb_type for context
-    cbp_chroma = decode_cbp_chroma(decoder, contexts, mb_type)
+    left_cbp = mb_info.get('left_cbp', 0) if left_available else -1
+    top_cbp = mb_info.get('top_cbp', 0) if top_available else -1
+
+    left_cbp_luma = (left_cbp & 0x0F) if left_cbp >= 0 else -1
+    top_cbp_luma = (top_cbp & 0x0F) if top_cbp >= 0 else -1
+    left_cbp_chroma = ((left_cbp >> 4) & 0x03) if left_cbp >= 0 else -1
+    top_cbp_chroma = ((top_cbp >> 4) & 0x03) if top_cbp >= 0 else -1
+
+    # Decode luma CBP (4 bits) with neighbor context
+    cbp_luma = decode_cbp_luma(decoder, contexts, mb_type, left_cbp_luma, top_cbp_luma)
+
+    # Decode chroma CBP (2 bits) with neighbor context
+    cbp_chroma = decode_cbp_chroma(decoder, contexts, mb_type, left_cbp_chroma, top_cbp_chroma)
 
     return (cbp_luma, cbp_chroma)
 
