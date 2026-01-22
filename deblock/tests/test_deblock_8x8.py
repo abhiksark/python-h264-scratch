@@ -157,10 +157,10 @@ class TestEdgeSelection8x8:
         assert 8 in edge_y_positions, "y=8 (8x8 boundary) must be filtered"
 
     def test_edge_count_8x8_vs_4x4(self):
-        """8x8 transforms filter 4 edges vs 16 edges for 4x4.
+        """8x8 transforms filter fewer edges than 4x4.
 
-        4x4: 4 vertical edges x 4 rows = 16 edge positions
-        8x8: 2 vertical edges x 2 rows = 4 edge positions (internal only)
+        4x4: 3 internal x positions (4,8,12) x 4 y positions = 12 internal edges
+        8x8: 1 internal x position (8) x 2 y positions = 2 internal edges
         """
         from deblock.deblock import get_luma_edge_positions, get_luma_edge_positions_8x8
 
@@ -170,13 +170,14 @@ class TestEdgeSelection8x8:
         # 8x8 should have fewer edges than 4x4
         assert len(edges_8x8) < len(edges_4x4)
 
-        # Specifically: 4 positions (x=0,8 at two y positions each for internal)
-        # but actually just 2 edge locations (x=0, x=8) with multiple y segments
+        # Internal edges only (exclude MB boundary at x=0)
         internal_8x8_edges = [(x, y) for x, y in edges_8x8 if x != 0]
         internal_4x4_edges = [(x, y) for x, y in edges_4x4 if x != 0]
 
-        # 8x8 internal edges should be 1/4 the count of 4x4
-        assert len(internal_8x8_edges) == len(internal_4x4_edges) // 4
+        # 8x8 has only 2 internal edge positions vs 12 for 4x4
+        assert len(internal_8x8_edges) == 2
+        assert len(internal_4x4_edges) == 12
+        assert len(internal_8x8_edges) < len(internal_4x4_edges)
 
 
 class TestDeblocking8x8BlockBoundaries:
@@ -190,10 +191,12 @@ class TestDeblocking8x8BlockBoundaries:
         """
         from deblock.deblock import deblock_macroblock_8x8
 
-        # Create MB with visible edge between two 8x8 blocks
+        # Create MB with edge between two 8x8 blocks
+        # Use values within alpha threshold (alpha=15 for QP=26)
+        # to ensure filtering occurs
         luma = np.zeros((16, 16), dtype=np.uint8)
-        luma[:, :8] = 100   # Left 8x8 block
-        luma[:, 8:] = 200   # Right 8x8 block
+        luma[:, :8] = 125   # Left 8x8 block
+        luma[:, 8:] = 135   # Right 8x8 block (diff=10 < alpha=15)
 
         cb = np.full((8, 8), 128, dtype=np.uint8)
         cr = np.full((8, 8), 128, dtype=np.uint8)
@@ -211,7 +214,7 @@ class TestDeblocking8x8BlockBoundaries:
         )
 
         # Pixels at x=7 and x=8 should be filtered (smoothed)
-        # The difference should be less than original (100 vs 200)
+        # The difference should be less than original (125 vs 135)
         original_diff = abs(int(luma[8, 7]) - int(luma[8, 8]))
         filtered_diff = abs(int(luma_out[8, 7]) - int(luma_out[8, 8]))
         assert filtered_diff < original_diff, "Edge at x=8 should be filtered"
@@ -765,11 +768,12 @@ class TestDeblock8x8EdgeCases:
         from deblock.deblock import deblock_macroblock_8x8
 
         # Checkerboard pattern at 8x8 block level
+        # Use values within alpha threshold (alpha=15 for QP=26)
         luma = np.zeros((16, 16), dtype=np.uint8)
-        luma[:8, :8] = 50      # Top-left 8x8
-        luma[:8, 8:] = 200     # Top-right 8x8
-        luma[8:, :8] = 200     # Bottom-left 8x8
-        luma[8:, 8:] = 50      # Bottom-right 8x8
+        luma[:8, :8] = 120     # Top-left 8x8
+        luma[:8, 8:] = 130     # Top-right 8x8 (diff=10 < alpha=15)
+        luma[8:, :8] = 130     # Bottom-left 8x8
+        luma[8:, 8:] = 120     # Bottom-right 8x8
 
         cb = np.full((8, 8), 128, dtype=np.uint8)
         cr = np.full((8, 8), 128, dtype=np.uint8)
@@ -787,8 +791,8 @@ class TestDeblock8x8EdgeCases:
         )
 
         # Edges at x=8 and y=8 should be filtered
-        # Center (x=8, y=8) should show smoothing effect
-        assert luma_out[7, 8] != 200 or luma_out[8, 8] != 50
+        # Values near boundaries should be smoothed
+        assert luma_out[7, 8] != 130 or luma_out[8, 8] != 120
 
     def test_single_pixel_difference(self):
         """Edge with minimal difference should filter minimally."""
