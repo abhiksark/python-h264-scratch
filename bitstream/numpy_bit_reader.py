@@ -212,6 +212,45 @@ class NumpyBitReader:
         logger.debug(f"read_ue() = {value} (zeros={leading_zeros}, suffix={suffix})")
         return value
 
+    def more_rbsp_data(self) -> bool:
+        """Check if more RBSP data exists before RBSP trailing bits.
+
+        Per H.264 spec 7.2, RBSP trailing bits consist of:
+        - rbsp_stop_one_bit (equal to 1)
+        - rbsp_alignment_zero_bits (0-7 zeros to reach byte boundary)
+
+        Returns:
+            True if more data exists, False if at RBSP trailing bits
+        """
+        if self.bits_remaining == 0:
+            return False
+
+        # Check if remaining bits in current byte match RBSP stop pattern
+        bit_offset = self._bit_offset
+
+        if bit_offset == 0:
+            # At byte boundary - check if all remaining bytes are zero (padding)
+            for i in range(self._byte_pos, len(self._data)):
+                if self._data[i] != 0:
+                    return True
+            return False
+
+        # Not at byte boundary - check if pattern is 1000... (stop bit + zeros)
+        current_byte = self._data[self._byte_pos]
+        bits_left_in_byte = 8 - bit_offset
+        mask = (1 << bits_left_in_byte) - 1
+        remaining_bits = current_byte & mask
+
+        # Expected pattern: 1 followed by zeros
+        expected = 1 << (bits_left_in_byte - 1)
+
+        if remaining_bits == expected:
+            # This is RBSP stop bit pattern
+            logger.debug(f"Detected RBSP stop bit at position {self.position}")
+            return False
+
+        return True
+
     def read_se(self) -> int:
         """Read signed Exp-Golomb coded value (se(v)).
 

@@ -33,7 +33,7 @@ import numpy as np
 logger = logging.getLogger(__name__)
 
 # Default to NumPy implementation (set to False to use bitstring if available)
-USE_NUMPY_READER = True
+USE_NUMPY_READER = False  # TODO: Fix NumpyBitReader compatibility
 
 
 class BitReader:
@@ -53,15 +53,20 @@ class BitReader:
         Args:
             data: RBSP bytes to read from
         """
-        if not BITSTRING_AVAILABLE:
-            raise ImportError(
-                "bitstring library required. Install with: pip install bitstring"
-            )
-
-        self._stream = BitStream(bytes=data)
-        self._data = data
-
-        logger.debug(f"BitReader initialized with {len(data)} bytes ({len(data)*8} bits)")
+        if USE_NUMPY_READER:
+            # Use NumPy-based reader (no external dependencies)
+            self._stream = NumpyBitReader(data)
+            self._data = data
+            logger.debug(f"BitReader (NumPy) initialized with {len(data)} bytes ({len(data)*8} bits)")
+        else:
+            # Use bitstring-based reader
+            if not BITSTRING_AVAILABLE:
+                raise ImportError(
+                    "bitstring library required. Install with: pip install bitstring"
+                )
+            self._stream = BitStream(bytes=data)
+            self._data = data
+            logger.debug(f"BitReader (bitstring) initialized with {len(data)} bytes ({len(data)*8} bits)")
 
     @property
     def position(self) -> int:
@@ -138,7 +143,12 @@ class BitReader:
         Returns:
             Bytes object
         """
-        return self._stream.read(f'bytes:{n}')
+        if USE_NUMPY_READER:
+            # NumpyBitReader doesn't have a bytes read method, read bits instead
+            value = self._stream.read_bits(n * 8)
+            return value.to_bytes(n, byteorder='big')
+        else:
+            return self._stream.read(f'bytes:{n}')
 
     def read_ue(self) -> int:
         """Read unsigned Exp-Golomb coded value (ue(v)).
@@ -213,6 +223,20 @@ class BitReader:
 
         logger.debug(f"read_se() = {value} (k={k})")
         return value
+
+    def more_rbsp_data(self) -> bool:
+        """Check if more RBSP data exists before RBSP trailing bits.
+
+        Per H.264 spec 7.2, checks for rbsp_stop_one_bit pattern.
+
+        Returns:
+            True if more data exists, False if at RBSP trailing bits
+        """
+        if USE_NUMPY_READER:
+            return self._stream.more_rbsp_data()
+        else:
+            # For bitstring-based reader, check bits_remaining
+            return self.bits_remaining > 8
 
     def read_te(self, max_value: int) -> int:
         """Read truncated Exp-Golomb coded value (te(v)).

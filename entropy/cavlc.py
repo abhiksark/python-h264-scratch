@@ -273,6 +273,8 @@ def decode_levels(
         suffix_length = 0
 
     for i in range(num_levels):
+        pos_before = reader.position if hasattr(reader, 'position') else -1
+
         # Decode level_prefix (number of leading zeros)
         level_prefix = 0
         while reader.read_bit() == 0:
@@ -324,8 +326,10 @@ def decode_levels(
             if abs(levels[-1]) > threshold:
                 suffix_length += 1
 
-        logger.debug(f"Level {i}: prefix={level_prefix}, suffix={level_suffix}, "
-                    f"code={level_code}, level={level}, suffix_len={suffix_length}")
+        pos_after = reader.position if hasattr(reader, 'position') else -1
+        bits_consumed = pos_after - pos_before if pos_before >= 0 else -1
+        logger.debug(f"Level {i}: prefix={level_prefix}, suffix_bits={suffix_bits}, suffix={level_suffix}, "
+                    f"code={level_code}, level={level}, consumed={bits_consumed} bits, bit_pos={pos_after}")
 
     return levels
 
@@ -471,9 +475,12 @@ def decode_residual_block(
 
     # Step 1: Decode coeff_token
     total_coeff, trailing_ones = decode_coeff_token(reader, nC)
+    pos_after_token = reader.position if hasattr(reader, 'position') else -1
+    logger.debug(f"[COEFF_TOKEN] TC={total_coeff}, T1={trailing_ones}, bit_pos={pos_after_token}")
 
     # Empty block
     if total_coeff == 0:
+        logger.debug(f"[EARLY_RETURN] total_coeff=0, returning empty block")
         return CAVLCBlock(
             total_coeff=0,
             trailing_ones=0,
@@ -522,6 +529,9 @@ def decode_residual_block(
 
     # Last coefficient gets remaining zeros
     run_befores.append(zeros_left)
+
+    pos_after_run = reader.position if hasattr(reader, 'position') else -1
+    logger.debug(f"After run_before: bit_pos={pos_after_run}, runs={run_befores}")
 
     # Build output array by placing coefficients from high to low scan position
     # H.264 Spec: Coefficients are placed starting at highest position, working down

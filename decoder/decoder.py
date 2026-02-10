@@ -577,6 +577,13 @@ class H264Decoder:
             mb_x = mb_idx % mb_width
             mb_y = mb_idx // mb_width
 
+            # Check for RBSP trailing bits (H.264 spec 7.2)
+            if not reader.more_rbsp_data():
+                logger.warning(f"Reached RBSP trailing bits after MB ({mb_x-1 if mb_x > 0 else mb_width-1}, "
+                             f"{mb_y-1 if mb_x == 0 else mb_y}), stopping slice decode "
+                             f"({mb_idx}/{total_mbs} MBs decoded)")
+                break
+
             # Get neighbor information for prediction
             neighbors = self._get_mb_neighbors(mb_x, mb_y, mb_width)
 
@@ -602,6 +609,15 @@ class H264Decoder:
 
                 logger.debug(f"Decoded MB ({mb_x}, {mb_y}): type={mb_data.mb_type}")
 
+            except ValueError as e:
+                # Check if it's an invalid mb_type error (likely RBSP trailing bits)
+                if "Invalid I_16x16 mb_type" in str(e) or "Invalid I_4x4 mb_type" in str(e):
+                    logger.warning(f"Invalid mb_type at MB ({mb_x}, {mb_y}), likely RBSP trailing bits. "
+                                 f"Stopping slice decode ({mb_idx}/{total_mbs} MBs decoded)")
+                    break
+                else:
+                    logger.error(f"Error decoding MB ({mb_x}, {mb_y}): {e}")
+                    raise
             except Exception as e:
                 logger.error(f"Error decoding MB ({mb_x}, {mb_y}): {e}")
                 raise
