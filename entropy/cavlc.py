@@ -520,8 +520,9 @@ def decode_residual_block(
         if zeros_left > 0:
             run = decode_run_before(reader, zeros_left)
             if run > zeros_left:
-                logger.error(f"run_before={run} > zeros_left={zeros_left} at coeff {i}")
-                raise ValueError(f"Invalid run_before: {run} exceeds zeros_left {zeros_left}")
+                # Encoder bug or corrupted bitstream - clamp to valid range
+                logger.warning(f"run_before={run} > zeros_left={zeros_left} at coeff {i}, clamping to {zeros_left}")
+                run = zeros_left
             run_befores.append(run)
             zeros_left -= run
         else:
