@@ -2,7 +2,8 @@
 """Tests for macroblock state machine."""
 
 import pytest
-from reconstruct.mb_state import MBState, MBDecodeContext, MBStateValidationError
+from reconstruct.mb_state import MBState, MBDecodeContext, MBStateValidationError, MacroblockDecoder
+from bitstream.bit_reader import BitReader
 
 
 def test_mb_state_enum_has_all_states():
@@ -54,3 +55,36 @@ def test_validation_error_contains_context():
     assert "bit_pos=500" in error_str or "500" in error_str
     assert "Expected 8 luma blocks" in error_str
     assert "LUMA_RESIDUAL" in error_str
+
+
+def test_mb_decoder_initialization():
+    """Test decoder initializes with correct state."""
+    reader = BitReader(b'\x00\x00\x00\x00')
+
+    decoder = MacroblockDecoder(
+        reader=reader,
+        mb_x=0,
+        mb_y=0,
+        mb_type=0,
+        cbp_luma=15,
+        cbp_chroma=2,
+        qp=26
+    )
+
+    assert decoder.context.current_state == MBState.START_MB
+    assert decoder.context.mb_x == 0
+    assert decoder.context.mb_y == 0
+
+
+def test_mb_decoder_validates_state_transition():
+    """Test decoder validates illegal state transitions."""
+    reader = BitReader(b'\x00\x00\x00\x00')
+    decoder = MacroblockDecoder(reader, 0, 0, 0, 15, 2, 26)
+
+    # Try to skip from START_MB to CHROMA_AC (illegal)
+    with pytest.raises(MBStateValidationError) as exc_info:
+        decoder._validate_transition(MBState.CHROMA_AC)
+
+    assert "Invalid state transition" in str(exc_info.value)
+    assert "START_MB" in str(exc_info.value)
+    assert "CHROMA_AC" in str(exc_info.value)
