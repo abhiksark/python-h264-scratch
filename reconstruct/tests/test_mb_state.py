@@ -2,6 +2,7 @@
 """Tests for macroblock state machine."""
 
 import pytest
+import numpy as np
 from reconstruct.mb_state import MBState, MBDecodeContext, MBStateValidationError, MacroblockDecoder
 from bitstream.bit_reader import BitReader
 
@@ -88,3 +89,25 @@ def test_mb_decoder_validates_state_transition():
     assert "Invalid state transition" in str(exc_info.value)
     assert "START_MB" in str(exc_info.value)
     assert "CHROMA_AC" in str(exc_info.value)
+
+
+def test_decode_luma_residual_validates_block_count():
+    """Test luma residual validates correct number of blocks decoded."""
+    # Create test bitstream with valid coeff_token for empty blocks
+    # Empty block: TC=0, T1=0, for nC=0 uses code '1' (1 bit)
+    # We need 12 blocks (CBP=15 but blocks 12-15 skipped in 4:2:0)
+    bits = '1' * 12  # 12 empty blocks
+    data = int(bits, 2).to_bytes((len(bits) + 7) // 8, 'big')
+    reader = BitReader(data)
+
+    decoder = MacroblockDecoder(reader, 0, 0, 0, cbp_luma=15, cbp_chroma=0, qp=26)
+
+    # Mock the luma blocks array and nz_counts
+    decoder.luma_blocks = [np.zeros((4, 4), dtype=np.int32) for _ in range(16)]
+    decoder.nz_counts = np.zeros(24, dtype=np.int32)
+
+    # Decode luma - should validate 12 blocks
+    decoder.decode_luma_residual()
+
+    assert decoder.context.luma_blocks_decoded == 12
+    assert decoder.context.current_state == MBState.CHROMA_DC

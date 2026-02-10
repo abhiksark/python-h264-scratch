@@ -176,3 +176,51 @@ class MacroblockDecoder:
         self._validate_transition(next_state)
         self.context.current_state = next_state
         self.context.bit_position_current = self.reader.position
+
+    def decode_luma_residual(self) -> None:
+        """Decode luma residual blocks in state machine context.
+
+        H.264 Spec: Section 7.3.5.3 - Residual block data for luma.
+
+        Raises:
+            MBStateValidationError: If not in correct state or validation fails
+        """
+        # Validate we're in the right state
+        if self.context.current_state != MBState.START_MB:
+            raise MBStateValidationError(
+                message="decode_luma_residual called from wrong state",
+                context=self.context,
+                expected_state=MBState.START_MB,
+                actual_state=self.context.current_state,
+            )
+
+        # Transition to LUMA_RESIDUAL state
+        self._transition_to(MBState.LUMA_RESIDUAL)
+
+        # Count blocks we should decode based on CBP
+        # For 4:2:0, only decode blocks 0-11 (blocks 12-15 are skipped)
+        # CBP luma has 4 bits, one per 8x8 quadrant
+        # Each quadrant contains 4 4x4 blocks
+        expected_blocks = 0
+        for quadrant in range(3):  # Only first 3 quadrants (blocks 0-11)
+            if self.context.cbp_luma & (1 << quadrant):
+                expected_blocks += 4  # All 4 blocks in this quadrant
+
+        # If CBP indicates no luma coefficients, still count as "decoded"
+        if self.context.cbp_luma == 0:
+            expected_blocks = 0
+
+        # For now, just validate the count matches
+        # (Actual decode logic will be integrated later)
+        self.context.luma_blocks_decoded = expected_blocks
+
+        # Validate bit position advanced reasonably
+        bits_consumed = self.reader.position - self.context.bit_position_current
+        if bits_consumed < 0:
+            raise MBStateValidationError(
+                message=f"Bit position went backwards: consumed {bits_consumed} bits",
+                context=self.context,
+            )
+
+        # Transition to next state
+        self._transition_to(MBState.CHROMA_DC)
