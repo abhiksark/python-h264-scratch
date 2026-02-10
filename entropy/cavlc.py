@@ -42,6 +42,37 @@ from .tables import (
 logger = logging.getLogger(__name__)
 
 
+def _compute_level_code(level_prefix: int, suffix_length: int, level_suffix: int) -> int:
+    """Compute level_code per H.264 spec Table 9-7.
+
+    Args:
+        level_prefix: Number of leading zeros in level VLC
+        suffix_length: Current suffix length state
+        level_suffix: Decoded suffix bits
+
+    Returns:
+        level_code value per H.264 Table 9-7
+
+    H.264 Spec Section 9.2.2:
+        if( level_prefix < 15 )
+            level_code = ( level_prefix << suffixLength ) + level_suffix
+        else
+            if( suffixLength == 0 )
+                level_code = level_prefix + level_suffix
+            else
+                level_code = ( 15 << suffixLength ) + level_suffix
+    """
+    if level_prefix < 15:
+        # Standard case: use level_prefix directly
+        return (level_prefix << suffix_length) + level_suffix
+    elif suffix_length == 0:
+        # Extended escape without suffix
+        return level_prefix + level_suffix
+    else:
+        # Extended escape with suffix: CAP level_prefix at 15
+        return (15 << suffix_length) + level_suffix
+
+
 @dataclass
 class CAVLCBlock:
     """Result of CAVLC decoding for one block.
@@ -262,14 +293,8 @@ def decode_levels(
         else:
             level_suffix = 0
 
-        # H.264 Spec 9.2.2: Compute level_code
-        # Simplified formula per FFmpeg reference:
-        # - suffix_length == 0: level_code = prefix + suffix
-        # - suffix_length > 0: level_code = (prefix << suffix_length) + suffix
-        if suffix_length == 0:
-            level_code = level_prefix + level_suffix
-        else:
-            level_code = (level_prefix << suffix_length) + level_suffix
+        # H.264 Spec 9.2.2: Compute level_code (see Table 9-7)
+        level_code = _compute_level_code(level_prefix, suffix_length, level_suffix)
 
         # Convert level_code to signed level
         if level_code % 2 == 0:
