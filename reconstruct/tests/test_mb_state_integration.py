@@ -58,14 +58,13 @@ def test_state_machine_validates_mb_complete_sequence():
 
     This verifies that a correct decode sequence passes all state validations.
 
-    Note: Each decode method expects a specific input state:
-    - decode_luma_residual() expects START_MB, ends in CHROMA_DC
-    - decode_chroma_dc() expects LUMA_RESIDUAL, ends in CHROMA_AC
-    - decode_chroma_ac() expects CHROMA_DC, ends in MB_COMPLETE
+    Note: Each decode method expects to be called in its working state:
+    - decode_luma_residual() expects START_MB, transitions to LUMA_RESIDUAL, ends in CHROMA_DC
+    - decode_chroma_dc() expects CHROMA_DC, transitions to CHROMA_AC
+    - decode_chroma_ac() expects CHROMA_AC, transitions to MB_COMPLETE
 
-    The methods do TWO transitions each (enter state, do work, exit to next state),
-    which means after decode_luma_residual() we're in CHROMA_DC but haven't decoded it yet.
-    This test manually sets states between calls to simulate the intended usage pattern.
+    After decode_luma_residual() completes, we're in CHROMA_DC ready for chroma DC decode.
+    After decode_chroma_dc() completes, we're in CHROMA_AC ready for chroma AC decode.
     """
     # Create bitstream with enough data for a complete MB
     # CBP luma=0 (no luma blocks), CBP chroma=2 (DC+AC for both Cb and Cr)
@@ -89,20 +88,17 @@ def test_state_machine_validates_mb_complete_sequence():
     # Verify initial state
     assert decoder.context.current_state == MBState.START_MB
 
-    # Step 1: Simulate luma decode by manually advancing state
-    # (since we have no luma data in bitstream)
-    decoder.context.current_state = MBState.LUMA_RESIDUAL
+    # Step 1: Simulate luma decode by manually advancing state to CHROMA_DC
+    # (luma decode would have transitioned us here after decoding luma blocks)
+    decoder.context.current_state = MBState.CHROMA_DC
     decoder.context.luma_blocks_decoded = 0
 
-    # Step 2: Decode chroma DC (expects LUMA_RESIDUAL, transitions to CHROMA_AC)
+    # Step 2: Decode chroma DC (expects CHROMA_DC, transitions to CHROMA_AC)
     decoder.decode_chroma_dc()
     assert decoder.context.current_state == MBState.CHROMA_AC
     assert decoder.context.chroma_dc_decoded is True
 
-    # Step 3: Manually set state back to CHROMA_DC since decode_chroma_ac expects it
-    decoder.context.current_state = MBState.CHROMA_DC
-
-    # Step 4: Decode chroma AC (expects CHROMA_DC, transitions to MB_COMPLETE)
+    # Step 3: Decode chroma AC (expects CHROMA_AC, transitions to MB_COMPLETE)
     decoder.decode_chroma_ac()
     assert decoder.context.current_state == MBState.MB_COMPLETE
     assert decoder.context.chroma_ac_decoded is True

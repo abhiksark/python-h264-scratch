@@ -259,17 +259,14 @@ class MacroblockDecoder:
         Raises:
             MBStateValidationError: If not in correct state or validation fails
         """
-        # Validate we're in the right state
-        if self.context.current_state != MBState.LUMA_RESIDUAL:
+        # Validate we're in the right state (luma already transitioned us to CHROMA_DC)
+        if self.context.current_state != MBState.CHROMA_DC:
             raise MBStateValidationError(
                 message="decode_chroma_dc called from wrong state",
                 context=self.context,
-                expected_state=MBState.LUMA_RESIDUAL,
+                expected_state=MBState.CHROMA_DC,
                 actual_state=self.context.current_state,
             )
-
-        # Transition to CHROMA_DC state
-        self._transition_to(MBState.CHROMA_DC)
 
         bit_position_before = self.reader.position
 
@@ -304,17 +301,14 @@ class MacroblockDecoder:
         Raises:
             MBStateValidationError: If not in correct state or validation fails
         """
-        # Validate we're in the right state
-        if self.context.current_state != MBState.CHROMA_DC:
+        # Validate we're in the right state (chroma DC already transitioned us to CHROMA_AC)
+        if self.context.current_state != MBState.CHROMA_AC:
             raise MBStateValidationError(
                 message="decode_chroma_ac called from wrong state",
                 context=self.context,
-                expected_state=MBState.CHROMA_DC,
+                expected_state=MBState.CHROMA_AC,
                 actual_state=self.context.current_state,
             )
-
-        # Transition to CHROMA_AC state
-        self._transition_to(MBState.CHROMA_AC)
 
         bit_position_before = self.reader.position
 

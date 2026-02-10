@@ -124,8 +124,8 @@ def test_decode_chroma_dc_enforces_order():
 
     decoder = MacroblockDecoder(reader, 0, 0, 0, cbp_luma=0, cbp_chroma=2, qp=26)
 
-    # Skip to CHROMA_DC state
-    decoder.context.current_state = MBState.LUMA_RESIDUAL
+    # Skip to CHROMA_DC state (luma decode would have transitioned us here)
+    decoder.context.current_state = MBState.CHROMA_DC
     decoder.context.luma_blocks_decoded = 0
 
     # Decode chroma DC
@@ -140,7 +140,7 @@ def test_decode_chroma_dc_skips_if_cbp_zero():
     reader = BitReader(b'\x00')
     decoder = MacroblockDecoder(reader, 0, 0, 0, cbp_luma=0, cbp_chroma=0, qp=26)
 
-    decoder.context.current_state = MBState.LUMA_RESIDUAL
+    decoder.context.current_state = MBState.CHROMA_DC
     decoder.decode_chroma_dc()
 
     # Should skip directly to CHROMA_AC
@@ -159,8 +159,8 @@ def test_decode_chroma_ac_enforces_order():
 
     decoder = MacroblockDecoder(reader, 0, 0, 0, cbp_luma=0, cbp_chroma=2, qp=26)
 
-    # Skip to CHROMA_AC state
-    decoder.context.current_state = MBState.CHROMA_DC
+    # Skip to CHROMA_AC state (chroma DC decode would have transitioned us here)
+    decoder.context.current_state = MBState.CHROMA_AC
     decoder.context.chroma_dc_decoded = True
 
     # Decode chroma AC
@@ -175,7 +175,7 @@ def test_decode_chroma_ac_skips_if_cbp_less_than_2():
     reader = BitReader(b'\x00')
     decoder = MacroblockDecoder(reader, 0, 0, 0, cbp_luma=0, cbp_chroma=1, qp=26)
 
-    decoder.context.current_state = MBState.CHROMA_DC
+    decoder.context.current_state = MBState.CHROMA_AC
     decoder.decode_chroma_ac()
 
     # Should skip directly to MB_COMPLETE
