@@ -181,3 +181,28 @@ def test_decode_chroma_ac_skips_if_cbp_less_than_2():
     # Should skip directly to MB_COMPLETE
     assert decoder.context.chroma_ac_decoded is False
     assert decoder.context.current_state == MBState.MB_COMPLETE
+
+
+def test_bit_position_validation_catches_excessive_consumption():
+    """Test validation catches when too many bits are consumed."""
+    # Create bitstream with enough data
+    reader = BitReader(b'\xFF' * 1000)  # Plenty of data (8000 bits)
+
+    decoder = MacroblockDecoder(reader, 0, 0, 0, cbp_luma=15, cbp_chroma=2, qp=26)
+
+    # Set state to LUMA_RESIDUAL and record the current position
+    decoder.context.current_state = MBState.LUMA_RESIDUAL
+    decoder.context.bit_position_current = reader.position
+
+    # Manually advance bit position way too far
+    for _ in range(5000):  # Consume 5000 bits (more than max_reasonable_bits of 4900)
+        reader.read_bits(1)
+
+    # Try to validate - should fail
+    with pytest.raises(MBStateValidationError) as exc_info:
+        decoder._validate_bit_position_reasonable(
+            state_name="LUMA_RESIDUAL",
+            max_bits_per_block=200
+        )
+
+    assert "exceeded reasonable bit budget" in str(exc_info.value)

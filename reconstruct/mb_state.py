@@ -177,6 +177,41 @@ class MacroblockDecoder:
         self.context.current_state = next_state
         self.context.bit_position_current = self.reader.position
 
+    def _validate_bit_position_reasonable(
+        self,
+        state_name: str,
+        max_bits_per_block: int = 200
+    ) -> None:
+        """Validate bit position hasn't advanced unreasonably.
+
+        Args:
+            state_name: Name of state for error message
+            max_bits_per_block: Maximum reasonable bits per block
+
+        Raises:
+            MBStateValidationError: If bit consumption exceeds reasonable bounds
+        """
+        bits_consumed = self.reader.position - self.context.bit_position_current
+
+        # Calculate maximum reasonable bits for this MB
+        # Luma: up to 16 blocks × max_bits_per_block
+        # Chroma DC: 2 blocks × 50 bits (much smaller)
+        # Chroma AC: 8 blocks × max_bits_per_block
+        max_reasonable_bits = (16 + 8) * max_bits_per_block + 2 * 50
+
+        if bits_consumed > max_reasonable_bits:
+            raise MBStateValidationError(
+                message=f"State {state_name} exceeded reasonable bit budget: "
+                        f"consumed {bits_consumed} bits, max reasonable {max_reasonable_bits}",
+                context=self.context,
+            )
+
+        if bits_consumed < 0:
+            raise MBStateValidationError(
+                message=f"State {state_name} bit position went backwards: {bits_consumed}",
+                context=self.context,
+            )
+
     def decode_luma_residual(self) -> None:
         """Decode luma residual blocks in state machine context.
 
@@ -209,13 +244,8 @@ class MacroblockDecoder:
         # (Actual decode logic will be integrated later)
         self.context.luma_blocks_decoded = expected_blocks
 
-        # Validate bit position advanced reasonably
-        bits_consumed = self.reader.position - self.context.bit_position_current
-        if bits_consumed < 0:
-            raise MBStateValidationError(
-                message=f"Bit position went backwards: consumed {bits_consumed} bits",
-                context=self.context,
-            )
+        # Validate bit position is reasonable
+        self._validate_bit_position_reasonable("LUMA_RESIDUAL")
 
         # Transition to next state
         self._transition_to(MBState.CHROMA_DC)
