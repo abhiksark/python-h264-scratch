@@ -95,8 +95,8 @@ def test_decode_luma_residual_validates_block_count():
     """Test luma residual validates correct number of blocks decoded."""
     # Create test bitstream with valid coeff_token for empty blocks
     # Empty block: TC=0, T1=0, for nC=0 uses code '1' (1 bit)
-    # We need 12 blocks (CBP=15 but blocks 12-15 skipped in 4:2:0)
-    bits = '1' * 12  # 12 empty blocks
+    # We need 16 blocks (CBP=15 means all 4 quadrants, each with 4 blocks)
+    bits = '1' * 16  # 16 empty blocks
     data = int(bits, 2).to_bytes((len(bits) + 7) // 8, 'big')
     reader = BitReader(data)
 
