@@ -20,6 +20,46 @@ class MBState(Enum):
     MB_COMPLETE = auto()     # MB fully decoded
 
 
+class MBStateValidationError(Exception):
+    """Exception raised when state machine validation fails.
+
+    Includes full context for debugging: current state, bit position,
+    what was expected vs what was found.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        context: 'MBDecodeContext',
+        expected_state: Optional[MBState] = None,
+        actual_state: Optional[MBState] = None,
+    ):
+        self.message = message
+        self.context = context
+        self.expected_state = expected_state
+        self.actual_state = actual_state
+
+        # Build detailed error message
+        error_parts = [
+            f"MB State Validation Error at MB({context.mb_x},{context.mb_y})",
+            f"Bit Position: {context.bit_position_current}",
+            f"Current State: {context.current_state.name}",
+        ]
+
+        if expected_state and actual_state:
+            error_parts.append(f"Expected State: {expected_state.name}")
+            error_parts.append(f"Actual State: {actual_state.name}")
+
+        error_parts.append(f"Error: {message}")
+
+        # Add context details
+        error_parts.append(f"CBP: luma={context.cbp_luma:04b}, chroma={context.cbp_chroma}")
+        error_parts.append(f"Blocks decoded: luma={context.luma_blocks_decoded}")
+
+        full_message = "\n  ".join(error_parts)
+        super().__init__(full_message)
+
+
 @dataclass
 class MBDecodeContext:
     """Context for macroblock decode state machine.
