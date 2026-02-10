@@ -33,6 +33,7 @@ from transform import idct_4x4, idct_8x8, hadamard_4x4, hadamard_2x2
 from intra import predict_intra_16x16, Intra16x16Mode, predict_intra_4x4, predict_intra_8x8
 from entropy import decode_residual_block, decode_residual_8x8, calculate_nC, ZIGZAG_4x4, ZIGZAG_8x8
 from entropy.cavlc import CAVLCBlock
+from reconstruct.mb_state import MacroblockDecoder, MBStateValidationError
 
 logger = logging.getLogger(__name__)
 
@@ -1696,6 +1697,21 @@ def decode_macroblock(
 
     logger.debug(f"MB QP: {qp}, chroma QP: {qp_chroma}, CBP: luma={mb.cbp.luma}, chroma={mb.cbp.chroma}")
 
+    # Initialize state machine for structured decode with validation
+    try:
+        mb_decoder = MacroblockDecoder(
+            reader=reader,
+            mb_x=mb_x,
+            mb_y=mb_y,
+            mb_type=mb.mb_type,
+            cbp_luma=mb.cbp.luma,
+            cbp_chroma=mb.cbp.chroma,
+            qp=qp,
+        )
+    except MBStateValidationError as e:
+        logger.error(f"State machine initialization failed: {e}")
+        raise
+
     # Get neighbor pixels for prediction
     luma_y = mb_y * 16
     luma_x = mb_x * 16
@@ -1716,6 +1732,13 @@ def decode_macroblock(
     neighbor_tl_luma = frame_luma[luma_y - 1, luma_x - 1] if mb_y > 0 and mb_x > 0 else None
     neighbor_tl_cb = frame_cb[chroma_y - 1, chroma_x - 1] if mb_y > 0 and mb_x > 0 else None
     neighbor_tl_cr = frame_cr[chroma_y - 1, chroma_x - 1] if mb_y > 0 and mb_x > 0 else None
+
+    # Decode luma residual with state machine validation
+    try:
+        mb_decoder.decode_luma_residual()
+    except MBStateValidationError as e:
+        logger.error(f"Luma residual decode validation failed: {e}")
+        raise
 
     # Reconstruct luma
     if mb.mb_type >= 1 and mb.mb_type <= 24:
@@ -1814,11 +1837,25 @@ def decode_macroblock(
     # H.264 Table 7-2: All chroma DC decoded before any chroma AC
     # Order: Cb DC -> Cr DC -> Cb AC (4 blocks) -> Cr AC (4 blocks)
 
+    # Decode chroma DC with state machine validation
+    try:
+        mb_decoder.decode_chroma_dc()
+    except MBStateValidationError as e:
+        logger.error(f"Chroma DC decode validation failed: {e}")
+        raise
+
     # Step 1: Decode Cb DC
     cb_dc_dequant = decode_chroma_dc(reader, mb.cbp.chroma, qp_chroma)
 
     # Step 2: Decode Cr DC
     cr_dc_dequant = decode_chroma_dc(reader, mb.cbp.chroma, qp_chroma)
+
+    # Decode chroma AC with state machine validation
+    try:
+        mb_decoder.decode_chroma_ac()
+    except MBStateValidationError as e:
+        logger.error(f"Chroma AC decode validation failed: {e}")
+        raise
 
     # Step 3: Decode Cb AC (4 blocks)
     cb_ac_blocks = decode_chroma_ac(
