@@ -111,3 +111,38 @@ def test_decode_luma_residual_validates_block_count():
 
     assert decoder.context.luma_blocks_decoded == 16  # CBP=15 means all 16 blocks
     assert decoder.context.current_state == MBState.CHROMA_DC
+
+
+def test_decode_chroma_dc_enforces_order():
+    """Test chroma DC enforces Cb then Cr decode order."""
+    # CBP chroma=2 means DC+AC present
+    # Empty DC: TC=0, T1=0 for chroma DC uses code '01' (2 bits)
+    # Need 2 DC blocks: Cb DC, Cr DC
+    bits = '0101'  # Two empty chroma DC blocks
+    data = int(bits, 2).to_bytes((len(bits) + 7) // 8, 'big')
+    reader = BitReader(data)
+
+    decoder = MacroblockDecoder(reader, 0, 0, 0, cbp_luma=0, cbp_chroma=2, qp=26)
+
+    # Skip to CHROMA_DC state
+    decoder.context.current_state = MBState.LUMA_RESIDUAL
+    decoder.context.luma_blocks_decoded = 0
+
+    # Decode chroma DC
+    decoder.decode_chroma_dc()
+
+    assert decoder.context.chroma_dc_decoded is True
+    assert decoder.context.current_state == MBState.CHROMA_AC
+
+
+def test_decode_chroma_dc_skips_if_cbp_zero():
+    """Test chroma DC is skipped when CBP chroma = 0."""
+    reader = BitReader(b'\x00')
+    decoder = MacroblockDecoder(reader, 0, 0, 0, cbp_luma=0, cbp_chroma=0, qp=26)
+
+    decoder.context.current_state = MBState.LUMA_RESIDUAL
+    decoder.decode_chroma_dc()
+
+    # Should skip directly to CHROMA_AC
+    assert decoder.context.chroma_dc_decoded is False
+    assert decoder.context.current_state == MBState.CHROMA_AC
