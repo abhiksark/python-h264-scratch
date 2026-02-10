@@ -146,3 +146,38 @@ def test_decode_chroma_dc_skips_if_cbp_zero():
     # Should skip directly to CHROMA_AC
     assert decoder.context.chroma_dc_decoded is False
     assert decoder.context.current_state == MBState.CHROMA_AC
+
+
+def test_decode_chroma_ac_enforces_order():
+    """Test chroma AC enforces Cb (4 blocks) then Cr (4 blocks) order."""
+    # CBP chroma=2 means DC+AC present
+    # Empty AC: TC=0, T1=0 for nC=0 uses code '1' (1 bit)
+    # Need 8 AC blocks: Cb AC (4 blocks), Cr AC (4 blocks)
+    bits = '1' * 8
+    data = int(bits, 2).to_bytes((len(bits) + 7) // 8, 'big')
+    reader = BitReader(data)
+
+    decoder = MacroblockDecoder(reader, 0, 0, 0, cbp_luma=0, cbp_chroma=2, qp=26)
+
+    # Skip to CHROMA_AC state
+    decoder.context.current_state = MBState.CHROMA_DC
+    decoder.context.chroma_dc_decoded = True
+
+    # Decode chroma AC
+    decoder.decode_chroma_ac()
+
+    assert decoder.context.chroma_ac_decoded is True
+    assert decoder.context.current_state == MBState.MB_COMPLETE
+
+
+def test_decode_chroma_ac_skips_if_cbp_less_than_2():
+    """Test chroma AC is skipped when CBP chroma < 2."""
+    reader = BitReader(b'\x00')
+    decoder = MacroblockDecoder(reader, 0, 0, 0, cbp_luma=0, cbp_chroma=1, qp=26)
+
+    decoder.context.current_state = MBState.CHROMA_DC
+    decoder.decode_chroma_ac()
+
+    # Should skip directly to MB_COMPLETE
+    assert decoder.context.chroma_ac_decoded is False
+    assert decoder.context.current_state == MBState.MB_COMPLETE

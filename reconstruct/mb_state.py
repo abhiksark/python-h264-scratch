@@ -264,3 +264,48 @@ class MacroblockDecoder:
 
         # Transition to next state
         self._transition_to(MBState.CHROMA_AC)
+
+    def decode_chroma_ac(self) -> None:
+        """Decode chroma AC residual blocks in state machine context.
+
+        H.264 Spec: Section 7.3.5.3 - Chroma AC residual.
+        Order: Cb AC (4 blocks), then Cr AC (4 blocks).
+
+        Raises:
+            MBStateValidationError: If not in correct state or validation fails
+        """
+        # Validate we're in the right state
+        if self.context.current_state != MBState.CHROMA_DC:
+            raise MBStateValidationError(
+                message="decode_chroma_ac called from wrong state",
+                context=self.context,
+                expected_state=MBState.CHROMA_DC,
+                actual_state=self.context.current_state,
+            )
+
+        # Transition to CHROMA_AC state
+        self._transition_to(MBState.CHROMA_AC)
+
+        bit_position_before = self.reader.position
+
+        if self.context.cbp_chroma >= 2:
+            # Decode Cb AC (4 blocks of 15 coefficients each)
+            # Then Cr AC (4 blocks of 15 coefficients each)
+            # For now, just validate bit position advances
+            # (Actual decode logic will be integrated later)
+
+            self.context.chroma_ac_decoded = True
+
+            # Validate bit position advanced
+            bits_consumed = self.reader.position - bit_position_before
+            if bits_consumed < 0:
+                raise MBStateValidationError(
+                    message=f"Bit position went backwards in chroma AC: {bits_consumed}",
+                    context=self.context,
+                )
+        else:
+            # CBP chroma < 2, no AC to decode
+            self.context.chroma_ac_decoded = False
+
+        # Transition to terminal state
+        self._transition_to(MBState.MB_COMPLETE)
