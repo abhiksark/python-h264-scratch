@@ -1397,10 +1397,7 @@ def decode_chroma_dc(
         return None
 
     # Decode DC coefficients (2x2 block)
-    bit_pos = reader.position
-    print(f"[DEBUG] Chroma DC: pos={bit_pos}, cbp_chroma={cbp_chroma}")
     dc_block = decode_residual_block(reader, nC=-1, max_coeffs=4)
-    print(f"[DEBUG]   -> TC={dc_block.total_coeff}, T1={dc_block.trailing_ones}, end_pos={reader.position}")
 
     # Arrange into 2x2 and inverse Hadamard
     dc_2x2 = np.zeros((2, 2), dtype=np.int32)
@@ -1451,10 +1448,7 @@ def decode_chroma_ac(
             frame_nz_counts, frame_width_mbs
         )
         ac_nC = calculate_nC(ac_nA, ac_nB)
-        bit_pos = reader.position
-        print(f"[DEBUG] {comp_name} AC {block_idx}: pos={bit_pos}, nA={ac_nA}, nB={ac_nB}, nC={ac_nC}")
         ac_block = decode_residual_block(reader, ac_nC, max_coeffs=15)
-        print(f"[DEBUG]   -> TC={ac_block.total_coeff}, T1={ac_block.trailing_ones}")
         nz_counts[nz_offset + block_idx] = ac_block.total_coeff
         ac_blocks.append(ac_block)
 
@@ -1803,10 +1797,7 @@ def decode_macroblock(
                     frame_nz_counts, frame_width_mbs or 0
                 )
                 nC = calculate_nC(nA, nB)
-                bit_pos = reader.position
-                print(f"[LUMA] MB({mb_x},{mb_y}) block {block_idx}: pos={bit_pos}, nA={nA}, nB={nB}, nC={nC}")
                 block = decode_residual_block(reader, nC, max_coeffs=16)
-                print(f"[LUMA]   -> TC={block.total_coeff}, T1={block.trailing_ones}, end_pos={reader.position}")
                 mb.nz_counts[block_idx] = block.total_coeff
 
                 # Dequantize and inverse transform
