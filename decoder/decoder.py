@@ -36,8 +36,10 @@ from parameters import SPS, PPS, parse_sps, parse_pps
 from slice import SliceHeader, SliceType, parse_slice_header
 from reconstruct import decode_macroblock, MacroblockData
 from color import ycbcr_to_rgb, ColorMatrix
+from color.chroma_format import monochrome_to_rgb, ycbcr_422_to_rgb, ycbcr_444_to_rgb
 from inter.reference import ReferenceFrame, ReferenceFrameBuffer
 from decoder.poc import POCCalculator
+from decoder.mmco import MMCOProcessor
 from inter.mv_prediction import (
     MVCache,
     predict_mv_16x16,
@@ -73,6 +75,11 @@ logger = logging.getLogger(__name__)
 
 
 @dataclass
+class DecoderStats:
+    concealed_mb_count: int = 0
+
+
+@dataclass
 class DecodedFrame:
     """Represents a decoded video frame.
 
@@ -84,15 +91,17 @@ class DecodedFrame:
         cr: Cr plane (H/2 x W/2), uint8
         width: Frame width in pixels
         height: Frame height in pixels
+        chroma_format_idc: Chroma format ID (0 = monochrome, 1 = 4:2:0, 2 = 4:2:2, 3 = 4:4:4)
     """
 
     frame_num: int
     poc: int
     luma: np.ndarray
-    cb: np.ndarray
-    cr: np.ndarray
+    cb: Optional[np.ndarray]
+    cr: Optional[np.ndarray]
     width: int
     height: int
+    chroma_format_idc: int = 1
 
     @property
     def shape(self) -> tuple:
@@ -108,7 +117,15 @@ class DecodedFrame:
         Returns:
             RGB array (H x W x 3), uint8
         """
-        return ycbcr_to_rgb(self.luma, self.cb, self.cr, color_matrix=color_matrix)
+        if self.chroma_format_idc == 0 or self.cb is None or self.cr is None:
+            return monochrome_to_rgb(self.luma)
+        if self.chroma_format_idc == 1:
+            return ycbcr_to_rgb(self.luma, self.cb, self.cr, color_matrix=color_matrix)
+        if self.chroma_format_idc == 2:
+            return ycbcr_422_to_rgb(self.luma, self.cb, self.cr, color_matrix=color_matrix)
+        if self.chroma_format_idc == 3:
+            return ycbcr_444_to_rgb(self.luma, self.cb, self.cr, color_matrix=color_matrix)
+        raise ValueError(f"Invalid chroma_format_idc: {self.chroma_format_idc}")
 
 
 @dataclass
@@ -122,6 +139,8 @@ class DecoderState:
     pps_dict: dict = field(default_factory=dict)  # id -> PPS
     current_sps: Optional[SPS] = None
     current_pps: Optional[PPS] = None
+
+    chroma_format_idc: int = 1
 
     # Frame buffers for reconstruction
     frame_luma: Optional[np.ndarray] = None
@@ -172,19 +191,43 @@ class DecoderState:
             raise ValueError(f"PPS {pps_id} not found")
         return self.pps_dict[pps_id]
 
+    def apply_sps(self, sps: SPS) -> None:
+        self.sps_dict[sps.seq_parameter_set_id] = sps
+        self.current_sps = sps
+        self.chroma_format_idc = getattr(sps, "chroma_format_idc", 1)
+
     def allocate_frame_buffers(self, sps: SPS) -> None:
         """Allocate frame buffers based on SPS dimensions."""
         height = sps.frame_height_in_mbs * 16
         width = sps.pic_width_in_mbs * 16
 
         self.frame_luma = np.zeros((height, width), dtype=np.uint8)
-        self.frame_cb = np.zeros((height // 2, width // 2), dtype=np.uint8)
-        self.frame_cr = np.zeros((height // 2, width // 2), dtype=np.uint8)
 
-        # nz_counts: 24 per MB (16 luma + 4 Cb + 4 Cr)
+        chroma_format_idc = getattr(sps, "chroma_format_idc", 1)
+        self.chroma_format_idc = chroma_format_idc
+        if chroma_format_idc == 0:
+            cb_shape = (0, 0)
+        elif chroma_format_idc == 1:
+            cb_shape = (height // 2, width // 2)
+        elif chroma_format_idc == 2:
+            cb_shape = (height, width // 2)
+        elif chroma_format_idc == 3:
+            cb_shape = (height, width)
+        else:
+            raise ValueError(f"Invalid chroma_format_idc: {chroma_format_idc}")
+
+        self.frame_cb = np.zeros(cb_shape, dtype=np.uint8)
+        self.frame_cr = np.zeros(cb_shape, dtype=np.uint8)
+
         # Stored per MB for context calculation
         mb_count = sps.frame_height_in_mbs * sps.pic_width_in_mbs
-        self.nz_counts = np.zeros((mb_count, 24), dtype=np.int32)
+        if chroma_format_idc == 0:
+            blocks_per_mb = 16
+        elif chroma_format_idc in (1, 2):
+            blocks_per_mb = 24
+        else:  # chroma_format_idc == 3
+            blocks_per_mb = 48
+        self.nz_counts = np.zeros((mb_count, blocks_per_mb), dtype=np.int32)
 
         # Initialize reference frame buffer
         max_refs = sps.max_num_ref_frames if hasattr(sps, 'max_num_ref_frames') else 4
@@ -192,8 +235,7 @@ class DecoderState:
 
         # Per-MB info for deblocking
         self.mb_types = np.zeros(mb_count, dtype=np.int32)
-        # 16 luma + 8 chroma 4x4 blocks per MB
-        self.mb_coeffs = np.zeros((mb_count, 24), dtype=bool)
+        self.mb_coeffs = np.zeros((mb_count, blocks_per_mb), dtype=bool)
         # CBP per MB for CABAC neighbor context
         self.mb_cbps = np.zeros(mb_count, dtype=np.int32)
 
@@ -226,7 +268,7 @@ class H264Decoder:
             # Display or save rgb array
     """
 
-    def __init__(self, deblocking_enabled: bool = True):
+    def __init__(self, deblocking_enabled: bool = True, aso_enabled: bool = False):
         """Initialize decoder.
 
         Args:
@@ -234,7 +276,76 @@ class H264Decoder:
         """
         self.state = DecoderState()
         self.deblocking_enabled = deblocking_enabled
+        self.aso_enabled = aso_enabled
+        self.chroma_format_idc = 1
         self.poc_calculator = POCCalculator()
+        self.error_resilience = False
+        self.on_concealment = None
+        self.stats = DecoderStats()
+        self.mmco_processor = MMCOProcessor()
+        self._mmco = self.mmco_processor
+
+    def _process_dec_ref_pic_marking(self, slice_header: SliceHeader, nal: NALUnit) -> None:
+        marking = getattr(slice_header, "dec_ref_pic_marking", None)
+        if nal.nal_ref_idc == 0 or marking is None:
+            return
+        if nal.nal_unit_type == NALUnitType.SLICE_IDR:
+            self.mmco_processor.process_idr(marking)
+
+    def _apply_dec_ref_pic_marking(
+        self,
+        slice_header: SliceHeader,
+        nal: NALUnit,
+        ref_frame: Optional[ReferenceFrame] = None,
+    ) -> None:
+        marking = getattr(slice_header, "dec_ref_pic_marking", None)
+
+        if nal.nal_ref_idc == 0:
+            self.mmco_processor.process_for_non_reference()
+            return
+        if ref_frame is None or marking is None:
+            return
+
+        if nal.nal_unit_type == NALUnitType.SLICE_IDR:
+            self.mmco_processor.process_idr(marking, idr_frame=ref_frame)
+            return
+
+        sps = getattr(self.state, "current_sps", None)
+        max_frame_num = getattr(sps, "max_frame_num", None)
+        self.mmco_processor.process_non_idr(
+            marking,
+            current_frame=ref_frame,
+            current_frame_num=slice_header.frame_num,
+            max_frame_num=max_frame_num,
+            current_poc=getattr(slice_header, "pic_order_cnt_lsb", 0),
+        )
+
+    def conceal_macroblock(self, *args, **kwargs):
+        from decoder.error_concealment import conceal_macroblock as _conceal_macroblock
+
+        result = _conceal_macroblock(*args, **kwargs)
+        try:
+            self.stats.concealed_mb_count += 1
+        except Exception:
+            pass
+
+        cb = getattr(self, "on_concealment", None)
+        if callable(cb):
+            try:
+                cb(result)
+            except Exception:
+                pass
+        return result
+
+    def _detect_aso_mode(self) -> bool:
+        return False
+
+    def configure_chroma_format(self, chroma_format_idc: int) -> None:
+        chroma_format_idc = int(chroma_format_idc)
+        if chroma_format_idc not in (0, 1, 2, 3):
+            raise ValueError(f"Invalid chroma_format_idc: {chroma_format_idc}")
+        self.chroma_format_idc = chroma_format_idc
+        self.state.chroma_format_idc = chroma_format_idc
 
     def decode_file(self, path: str):
         """Decode H.264 file and yield frames.
@@ -260,7 +371,16 @@ class H264Decoder:
             DecodedFrame objects
         """
         for nal in iter_nal_units(data):
-            frame = self._process_nal(nal)
+            try:
+                frame = self._process_nal(nal)
+            except Exception as e:
+                if not getattr(self, "error_resilience", False):
+                    raise
+                logger.warning(
+                    f"Error processing NAL type={getattr(nal, 'nal_unit_type', None)} "
+                    f"at pos={getattr(nal, 'start_position', None)}: {e}"
+                )
+                continue
             if frame is not None:
                 yield frame
 
@@ -292,7 +412,11 @@ class H264Decoder:
 
     def _process_sps(self, nal: NALUnit) -> None:
         """Parse and store SPS."""
-        sps = parse_sps(nal.rbsp)  # parse_sps expects raw bytes
+        try:
+            sps = parse_sps(nal.rbsp)  # parse_sps expects raw bytes
+        except Exception as e:
+            logger.warning(f"Failed to parse SPS (truncated or malformed): {e}")
+            return
         self.state.sps_dict[sps.seq_parameter_set_id] = sps
         logger.info(
             f"Parsed SPS {sps.seq_parameter_set_id}: "
@@ -301,7 +425,11 @@ class H264Decoder:
 
     def _process_pps(self, nal: NALUnit) -> None:
         """Parse and store PPS."""
-        pps = parse_pps(nal.rbsp)  # parse_pps expects raw bytes
+        try:
+            pps = parse_pps(nal.rbsp)  # parse_pps expects raw bytes
+        except Exception as e:
+            logger.warning(f"Failed to parse PPS (truncated or malformed): {e}")
+            return
         self.state.pps_dict[pps.pic_parameter_set_id] = pps
         logger.info(
             f"Parsed PPS {pps.pic_parameter_set_id}: "
@@ -402,6 +530,7 @@ class H264Decoder:
             cr=self.state.frame_cr.copy(),
             width=sps.pic_width_in_mbs * 16,
             height=sps.frame_height_in_mbs * 16,
+            chroma_format_idc=getattr(sps, "chroma_format_idc", 1),
         )
 
         # Add to reference buffer if this is a reference frame
@@ -464,6 +593,8 @@ class H264Decoder:
                     frame_cb=self.state.frame_cb,
                     frame_cr=self.state.frame_cr,
                     is_i_slice=True,
+                    frame_nz_counts=self.state.nz_counts,
+                    frame_width_mbs=mb_width,
                 )
 
                 # Store non-zero counts for CAVLC context
@@ -608,6 +739,8 @@ class H264Decoder:
                     frame_cb=self.state.frame_cb,
                     frame_cr=self.state.frame_cr,
                     is_i_slice=False,
+                    frame_nz_counts=self.state.nz_counts,
+                    frame_width_mbs=mb_width,
                 )
                 # Clear MV cache for intra MB
                 self.state.mv_cache.set_mv_16x16(mb_x, mb_y, 0, 0)
@@ -1356,6 +1489,8 @@ class H264Decoder:
                     frame_cb=self.state.frame_cb,
                     frame_cr=self.state.frame_cr,
                     is_i_slice=False,
+                    frame_nz_counts=self.state.nz_counts,
+                    frame_width_mbs=mb_width,
                 )
             else:
                 # B-macroblock

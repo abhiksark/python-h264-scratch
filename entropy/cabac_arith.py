@@ -200,6 +200,11 @@ class CABACDecoder:
         self.codIRange = 510
         self.codIOffset = self.reader.read_bits(9)
 
+    def init_after_pcm(self) -> None:
+        self.reader.byte_align()
+        self.codIRange = 510
+        self.codIOffset = self.reader.read_bits(9)
+
     def read_bits(self, n: int) -> int:
         """Read n bypass bits for I_PCM samples.
 

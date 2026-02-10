@@ -43,6 +43,10 @@ logger = logging.getLogger(__name__)
 DEFAULT_PIXEL_VALUE = 128
 
 
+def supports_8x8_intra_chroma(chroma_format_idc: int) -> bool:
+    return chroma_format_idc == 3
+
+
 class Intra8x8Mode(IntEnum):
     """Intra 8x8 prediction modes."""
     VERTICAL = 0

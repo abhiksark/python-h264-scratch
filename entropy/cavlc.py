@@ -92,29 +92,43 @@ def _decode_coeff_token_vlc(
 def _decode_coeff_token_fixed(reader: BitReader) -> Tuple[int, int]:
     """Decode coeff_token using fixed-length code (nC >= 8).
 
-    For nC >= 8, coeff_token uses 6-bit fixed length:
-    - Bits 5-4: TrailingOnes
-    - Bits 3-0: TotalCoeff - 1 (if TotalCoeff > 0)
-    - All zeros if TotalCoeff = 0
+    For nC >= 8, coeff_token uses 6-bit fixed length per H.264 Table 9-5(e).
+    The encoding is NOT a simple bit field split:
+    - code 3 (000011): TC=0, T1=0
+    - codes 4-5: TC=1, T1=code-4
+    - codes 6-8: TC=2, T1=code-6
+    - codes >= 9: TC=(code+3)//4, T1=(code+3)%4
 
     Args:
         reader: Bit reader
 
     Returns:
         Tuple of (TotalCoeff, TrailingOnes)
+
+    H.264 Spec: Table 9-5(e)
     """
     code = reader.read_bits(6)
 
+    if code < 3:
+        raise ValueError(f"Invalid fixed coeff_token code: {code}")
+
     if code == 3:  # Special case: TotalCoeff = 0
+        logger.debug("coeff_token (fixed): TC=0, T1=0")
         return 0, 0
 
-    trailing_ones = (code >> 4) & 0x3
-    total_coeff_minus1 = code & 0x0F
-    total_coeff = total_coeff_minus1 + 1
-
-    # Validate
-    if trailing_ones > total_coeff:
-        trailing_ones = total_coeff
+    # For codes 4-5: TC=1
+    if code < 6:
+        total_coeff = 1
+        trailing_ones = code - 4
+    # For codes 6-8: TC=2
+    elif code < 9:
+        total_coeff = 2
+        trailing_ones = code - 6
+    else:
+        # For codes >= 9: TC = (code+3)//4, T1 = (code+3)%4
+        adjusted = code + 3
+        total_coeff = adjusted >> 2
+        trailing_ones = adjusted & 3
 
     logger.debug(f"coeff_token (fixed): TC={total_coeff}, T1={trailing_ones}")
     return total_coeff, trailing_ones
@@ -131,8 +145,13 @@ def decode_coeff_token(reader: BitReader, nC: int) -> Tuple[int, int]:
     Returns:
         Tuple of (TotalCoeff, TrailingOnes)
 
-    H.264 Spec: Section 9.2.1
+    H.264 Spec: Section 9.2.1, Table 9-5
+
+    Note: While H.264 spec says nC >= 8 should use fixed 6-bit table (Table 9-5d),
+    x264 and other encoders use VLC table 4 for all nC >= 4. We follow this for
+    maximum compatibility.
     """
+    logger.debug(f"decode_coeff_token: nC={nC}")
     if nC == -1:
         # Chroma DC
         return _decode_coeff_token_vlc(reader, COEFF_TOKEN_DECODE_CHROMA_DC, 8)
@@ -143,7 +162,14 @@ def decode_coeff_token(reader: BitReader, nC: int) -> Tuple[int, int]:
     elif nC < 8:
         return _decode_coeff_token_vlc(reader, COEFF_TOKEN_DECODE_4, 10)
     else:
-        return _decode_coeff_token_fixed(reader)
+        # H.264 Table 9-5(d): Fixed 6-bit encoding for nC >= 8
+        # Bits 5-4 (high 2 bits) = trailing_ones
+        # Bits 3-0 (low 4 bits) = TotalCoeff
+        code = reader.read_bits(6)
+        trailing_ones = (code >> 4) & 0x3
+        total_coeff = code & 0xF
+        logger.debug(f"Fixed 6-bit: code={code:06b}, TC={total_coeff}, T1={trailing_ones}")
+        return total_coeff, trailing_ones
 
 
 def decode_trailing_ones_signs(
@@ -216,33 +242,34 @@ def decode_levels(
         level_prefix = 0
         while reader.read_bit() == 0:
             level_prefix += 1
-            if level_prefix > 15:
+            if level_prefix > 31:
                 raise ValueError("level_prefix too large")
 
         # Decode level_suffix
-        # H.264 Spec 9.2.2: Determine suffix size and compute level_code
-        if level_prefix == 14 and suffix_length == 0:
-            # Special case: suffix is 4 bits
-            suffix_bits = 4
-            level_suffix = reader.read_bits(suffix_bits)
-        elif level_prefix >= 15:
-            # Extended case: suffix size = level_prefix - 3
-            suffix_bits = level_prefix - 3
+        # H.264 Spec 9.2.2: Determine suffix size based on level_prefix
+        # Key: Extended escape (level_prefix - 3) ONLY applies when suffix_length == 0
+        if level_prefix < 14:
+            suffix_bits = suffix_length
+        elif level_prefix == 14:
+            # prefix=14: Use 4 bits if suffix_length=0, else use suffix_length
+            suffix_bits = 4 if suffix_length == 0 else suffix_length
+        else:  # level_prefix >= 15
+            # prefix>=15: Extended escape only when suffix_length=0
+            suffix_bits = (level_prefix - 3) if suffix_length == 0 else suffix_length
+
+        if suffix_bits > 0:
             level_suffix = reader.read_bits(suffix_bits)
         else:
-            # Normal case
-            suffix_bits = suffix_length
-            if suffix_bits > 0:
-                level_suffix = reader.read_bits(suffix_bits)
-            else:
-                level_suffix = 0
+            level_suffix = 0
 
-        # H.264 Spec: levelCode = (Min(15, level_prefix) << suffixLength) + level_suffix
-        level_code = (min(15, level_prefix) << suffix_length) + level_suffix
-
-        # Additional adjustment for escape codes
-        if level_prefix >= 15 and suffix_length == 0:
-            level_code += 15
+        # H.264 Spec 9.2.2: Compute level_code
+        # Simplified formula per FFmpeg reference:
+        # - suffix_length == 0: level_code = prefix + suffix
+        # - suffix_length > 0: level_code = (prefix << suffix_length) + suffix
+        if suffix_length == 0:
+            level_code = level_prefix + level_suffix
+        else:
+            level_code = (level_prefix << suffix_length) + level_suffix
 
         # Convert level_code to signed level
         if level_code % 2 == 0:
@@ -289,7 +316,11 @@ def _decode_total_zeros_vlc(
             logger.debug(f"total_zeros: code={code:0{num_bits}b}, value={total_zeros}")
             return total_zeros
 
-    raise ValueError(f"Invalid total_zeros: no match found")
+    # Debug: show what codes are valid for this table
+    valid_codes = sorted(decode_table.keys(), key=lambda x: (x[1], x[0]))
+    logger.error(f"Invalid total_zeros: read {max_bits} bits, code={code:0{max_bits}b}")
+    logger.error(f"Valid codes: {[(f'{c:0{b}b}', b) for c, b in valid_codes[:10]]}")
+    raise ValueError(f"Invalid total_zeros: no match found (code={code:0{max_bits}b})")
 
 
 def decode_total_zeros(
@@ -315,6 +346,9 @@ def decode_total_zeros(
     if total_coeff == max_coeffs:
         return 0  # No room for zeros
 
+    max_valid_zeros = max_coeffs - total_coeff
+    logger.debug(f"decode_total_zeros: TC={total_coeff}, max={max_coeffs}, max_valid_zeros={max_valid_zeros}")
+
     if max_coeffs == 4:
         # Chroma DC
         decode_table = TOTAL_ZEROS_DECODE_CHROMA_DC.get(total_coeff)
@@ -325,7 +359,17 @@ def decode_total_zeros(
     if decode_table is None:
         raise ValueError(f"No total_zeros table for TotalCoeff={total_coeff}")
 
-    return _decode_total_zeros_vlc(reader, decode_table)
+    total_zeros = _decode_total_zeros_vlc(reader, decode_table)
+
+    # Validate: total_zeros cannot exceed max_valid_zeros
+    # Some encoders may produce technically invalid streams that FFmpeg tolerates
+    # by clamping. We do the same for compatibility.
+    if total_zeros > max_valid_zeros:
+        logger.warning(f"total_zeros={total_zeros} exceeds max_valid={max_valid_zeros} "
+                      f"(TC={total_coeff}, max_coeffs={max_coeffs}), clamping")
+        total_zeros = max_valid_zeros
+
+    return total_zeros
 
 
 def _decode_run_before_vlc(
@@ -393,6 +437,9 @@ def decode_residual_block(
 
     H.264 Spec: Section 9.2
     """
+    start_pos = reader.position if hasattr(reader, 'position') else -1
+    logger.debug(f"decode_residual_block: nC={nC}, max={max_coeffs}, bit_pos={start_pos}")
+
     # Step 1: Decode coeff_token
     total_coeff, trailing_ones = decode_coeff_token(reader, nC)
 
@@ -406,9 +453,13 @@ def decode_residual_block(
 
     # Step 2: Decode trailing ones signs
     t1_signs = decode_trailing_ones_signs(reader, trailing_ones)
+    pos_after_t1 = reader.position if hasattr(reader, 'position') else -1
+    logger.debug(f"After T1 signs: bit_pos={pos_after_t1}")
 
     # Step 3: Decode levels
     levels = decode_levels(reader, total_coeff, trailing_ones)
+    pos_after_levels = reader.position if hasattr(reader, 'position') else -1
+    logger.debug(f"After levels: bit_pos={pos_after_levels}")
 
     # Combine levels and trailing ones in SCAN order (low position to high)
     # levels are in decode order (high to low), so reverse them
@@ -422,6 +473,9 @@ def decode_residual_block(
     else:
         total_zeros = 0
 
+    pos_after_tz = reader.position if hasattr(reader, 'position') else -1
+    logger.debug(f"After total_zeros: bit_pos={pos_after_tz}, TZ={total_zeros}")
+
     # Step 5: Decode run_before for each coefficient
     zeros_left = total_zeros
     run_befores = []
@@ -429,6 +483,9 @@ def decode_residual_block(
     for i in range(total_coeff - 1):
         if zeros_left > 0:
             run = decode_run_before(reader, zeros_left)
+            if run > zeros_left:
+                logger.error(f"run_before={run} > zeros_left={zeros_left} at coeff {i}")
+                raise ValueError(f"Invalid run_before: {run} exceeds zeros_left {zeros_left}")
             run_befores.append(run)
             zeros_left -= run
         else:

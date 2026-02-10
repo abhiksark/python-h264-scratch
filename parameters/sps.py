@@ -18,7 +18,7 @@ Profile IDCs (Annex A.2):
 
 import logging
 from dataclasses import dataclass, field
-from typing import Optional, List
+from typing import Optional, List, Tuple
 
 from bitstream import BitReader
 
@@ -219,7 +219,7 @@ class SPS:
     @property
     def cropped_width(self) -> int:
         """Picture width in pixels (after cropping)."""
-        crop_unit_x = 1 if self.chroma_format_idc == 0 else 2
+        crop_unit_x, _ = self._get_crop_units()
         return self.width - crop_unit_x * (
             self.frame_crop_left_offset + self.frame_crop_right_offset
         )
@@ -227,12 +227,72 @@ class SPS:
     @property
     def cropped_height(self) -> int:
         """Picture height in pixels (after cropping)."""
-        crop_unit_y = 1 if self.chroma_format_idc == 0 else 2
-        if not self.frame_mbs_only_flag:
-            crop_unit_y *= 2
+        _, crop_unit_y = self._get_crop_units()
         return self.height - crop_unit_y * (
             self.frame_crop_top_offset + self.frame_crop_bottom_offset
         )
+
+    def _get_subsampling_factors(self) -> Tuple[int, int]:
+        if self.separate_colour_plane_flag or self.chroma_format_idc == 0:
+            return 1, 1
+        if self.chroma_format_idc == 1:
+            return 2, 2
+        if self.chroma_format_idc == 2:
+            return 2, 1
+        if self.chroma_format_idc == 3:
+            return 1, 1
+        raise ValueError(f"Invalid chroma_format_idc: {self.chroma_format_idc}")
+
+    def _get_crop_units(self) -> Tuple[int, int]:
+        if self.separate_colour_plane_flag or self.chroma_format_idc == 0:
+            crop_unit_x = 1
+        else:
+            sub_w, _ = self._get_subsampling_factors()
+            crop_unit_x = sub_w
+
+        if self.separate_colour_plane_flag or self.chroma_format_idc == 0:
+            crop_unit_y = 2 - (1 if self.frame_mbs_only_flag else 0)
+        else:
+            _, sub_h = self._get_subsampling_factors()
+            crop_unit_y = sub_h * (2 - (1 if self.frame_mbs_only_flag else 0))
+
+        return int(crop_unit_x), int(crop_unit_y)
+
+    def get_chroma_crop_left(self) -> int:
+        if not self.frame_cropping_flag:
+            return 0
+        if self.chroma_format_idc == 0 and not self.separate_colour_plane_flag:
+            return 0
+        crop_unit_x, _ = self._get_crop_units()
+        sub_w, _ = self._get_subsampling_factors()
+        return int((self.frame_crop_left_offset * crop_unit_x) // sub_w)
+
+    def get_chroma_crop_right(self) -> int:
+        if not self.frame_cropping_flag:
+            return 0
+        if self.chroma_format_idc == 0 and not self.separate_colour_plane_flag:
+            return 0
+        crop_unit_x, _ = self._get_crop_units()
+        sub_w, _ = self._get_subsampling_factors()
+        return int((self.frame_crop_right_offset * crop_unit_x) // sub_w)
+
+    def get_chroma_crop_top(self) -> int:
+        if not self.frame_cropping_flag:
+            return 0
+        if self.chroma_format_idc == 0 and not self.separate_colour_plane_flag:
+            return 0
+        _, crop_unit_y = self._get_crop_units()
+        _, sub_h = self._get_subsampling_factors()
+        return int((self.frame_crop_top_offset * crop_unit_y) // sub_h)
+
+    def get_chroma_crop_bottom(self) -> int:
+        if not self.frame_cropping_flag:
+            return 0
+        if self.chroma_format_idc == 0 and not self.separate_colour_plane_flag:
+            return 0
+        _, crop_unit_y = self._get_crop_units()
+        _, sub_h = self._get_subsampling_factors()
+        return int((self.frame_crop_bottom_offset * crop_unit_y) // sub_h)
 
     @property
     def chroma_format_name(self) -> str:

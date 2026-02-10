@@ -53,6 +53,13 @@ class PPS:
     # Slice groups (FMO - not used in Baseline)
     num_slice_groups_minus1: int = 0
     slice_group_map_type: int = 0
+    run_length_minus1: List[int] = field(default_factory=list)
+    top_left: List[int] = field(default_factory=list)
+    bottom_right: List[int] = field(default_factory=list)
+    slice_group_change_direction_flag: bool = False
+    slice_group_change_rate_minus1: int = 0
+    slice_group_change_cycle: int = 0
+    slice_group_id: List[int] = field(default_factory=list)
 
     # Reference pictures
     num_ref_idx_l0_default_active_minus1: int = 0
@@ -112,6 +119,10 @@ class PPS:
         modes = {0: "Default", 1: "Explicit", 2: "Implicit"}
         return modes.get(self.weighted_bipred_idc, "Unknown")
 
+    def __post_init__(self) -> None:
+        if self.second_chroma_qp_index_offset == 0 and self.chroma_qp_index_offset != 0:
+            self.second_chroma_qp_index_offset = self.chroma_qp_index_offset
+
     def __repr__(self) -> str:
         return (
             f"PPS(id={self.pic_parameter_set_id}, "
@@ -139,6 +150,14 @@ def _parse_scaling_list(reader: BitReader, size: int) -> list:
         last_scale = scaling_list[j]
 
     return scaling_list
+
+
+def should_parse_second_chroma_offset(profile_idc: int) -> bool:
+    return profile_idc in (100, 110, 122, 244)
+
+
+def validate_second_chroma_offset(value: int) -> bool:
+    return -12 <= int(value) <= 12
 
 
 def parse_pps(rbsp: bytes, is_high_profile: bool = False) -> PPS:
@@ -186,21 +205,25 @@ def parse_pps(rbsp: bytes, is_high_profile: bool = False) -> PPS:
         pps.slice_group_map_type = reader.read_ue()
 
         if pps.slice_group_map_type == 0:
+            pps.run_length_minus1 = []
             for _ in range(pps.num_slice_groups_minus1 + 1):
-                reader.read_ue()  # run_length_minus1
+                pps.run_length_minus1.append(reader.read_ue())
         elif pps.slice_group_map_type == 2:
+            pps.top_left = []
+            pps.bottom_right = []
             for _ in range(pps.num_slice_groups_minus1):
-                reader.read_ue()  # top_left
-                reader.read_ue()  # bottom_right
+                pps.top_left.append(reader.read_ue())
+                pps.bottom_right.append(reader.read_ue())
         elif pps.slice_group_map_type in (3, 4, 5):
-            reader.read_flag()  # slice_group_change_direction_flag
-            reader.read_ue()    # slice_group_change_rate_minus1
+            pps.slice_group_change_direction_flag = reader.read_flag()
+            pps.slice_group_change_rate_minus1 = reader.read_ue()
         elif pps.slice_group_map_type == 6:
             pic_size_in_map_units = reader.read_ue() + 1
             num_slice_groups = pps.num_slice_groups_minus1 + 1
             bits = (num_slice_groups - 1).bit_length() or 1
+            pps.slice_group_id = []
             for _ in range(pic_size_in_map_units):
-                reader.read_bits(bits)  # slice_group_id
+                pps.slice_group_id.append(reader.read_bits(bits))
 
     # Reference picture defaults
     pps.num_ref_idx_l0_default_active_minus1 = reader.read_ue()
@@ -224,6 +247,8 @@ def parse_pps(rbsp: bytes, is_high_profile: bool = False) -> PPS:
     pps.deblocking_filter_control_present_flag = reader.read_flag()
     pps.constrained_intra_pred_flag = reader.read_flag()
     pps.redundant_pic_cnt_present_flag = reader.read_flag()
+
+    parsed_second_offset = False
 
     # High profile extensions
     if is_high_profile and reader.bits_remaining > 0:
@@ -254,9 +279,13 @@ def parse_pps(rbsp: bytes, is_high_profile: bool = False) -> PPS:
                             pps.scaling_lists_8x8.append([16] * 64)
 
             pps.second_chroma_qp_index_offset = reader.read_se()
+            parsed_second_offset = True
         except Exception:
             # Not enough data for high profile extensions
             pass
+
+    if not parsed_second_offset:
+        pps.second_chroma_qp_index_offset = pps.chroma_qp_index_offset
 
     logger.info(f"Parsed {pps}")
     return pps

@@ -21,6 +21,20 @@ from deblock.filter import (
 )
 
 
+def should_deblock_edge(
+    mb_a: int,
+    mb_b: int,
+    boundary_detector,
+    disable_idc: int,
+) -> bool:
+    if int(disable_idc) == 1:
+        return False
+    if int(disable_idc) == 2:
+        if boundary_detector is not None and boundary_detector.is_slice_boundary(mb_a=mb_a, mb_b=mb_b):
+            return False
+    return True
+
+
 def get_edge_filter_order() -> List[str]:
     """Get the order in which edges are filtered.
 

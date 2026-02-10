@@ -32,8 +32,24 @@ from dequant import dequant_4x4, dequant_dc_4x4, dequant_dc_2x2, dequant_8x8, ge
 from transform import idct_4x4, idct_8x8, hadamard_4x4, hadamard_2x2
 from intra import predict_intra_16x16, Intra16x16Mode, predict_intra_4x4, predict_intra_8x8
 from entropy import decode_residual_block, decode_residual_8x8, calculate_nC, ZIGZAG_4x4, ZIGZAG_8x8
+from entropy.cavlc import CAVLCBlock
 
 logger = logging.getLogger(__name__)
+
+
+def get_block_count_for_chroma_format(chroma_format_idc: int) -> Tuple[int, int]:
+    luma_blocks = 16
+
+    if chroma_format_idc == 0:
+        return luma_blocks, 0
+    if chroma_format_idc == 1:
+        return luma_blocks, 8
+    if chroma_format_idc == 2:
+        return luma_blocks, 8
+    if chroma_format_idc == 3:
+        return luma_blocks, 32
+
+    raise ValueError(f"Invalid chroma_format_idc: {chroma_format_idc}")
 
 
 class MBType(IntEnum):
@@ -297,6 +313,126 @@ BLOCK_SCAN_ORDER_8x8 = [
     (8, 0),   # Block 2: bottom-left
     (8, 8),   # Block 3: bottom-right
 ]
+
+# Reverse mapping: (row//4, col//4) -> block_idx for 4x4 luma blocks
+# Used to find neighbor block indices for nC calculation
+BLOCK_IDX_FROM_POS = {
+    (r // 4, c // 4): idx
+    for idx, (r, c) in enumerate(BLOCK_SCAN_ORDER)
+}
+
+
+def get_luma_neighbor_nz(
+    block_idx: int,
+    mb_x: int,
+    mb_y: int,
+    mb_nz_counts: np.ndarray,
+    frame_nz_counts: Optional[np.ndarray],
+    frame_width_mbs: int,
+) -> Tuple[Optional[int], Optional[int]]:
+    """Get left (nA) and top (nB) neighbor non-zero counts for CAVLC nC.
+
+    H.264 Spec Section 9.2.1:
+    nC is derived from neighboring blocks' non-zero coefficient counts.
+
+    Args:
+        block_idx: Index of current 4x4 block (0-15)
+        mb_x: Current macroblock X position
+        mb_y: Current macroblock Y position
+        mb_nz_counts: Current MB's nz_counts array (24 elements)
+        frame_nz_counts: All MBs' nz_counts, shape (num_mbs, 24)
+        frame_width_mbs: Picture width in macroblocks
+
+    Returns:
+        (nA, nB): Left and top neighbor nz counts, None if unavailable
+    """
+    # Get grid position (0-3, 0-3) for this block
+    row, col = BLOCK_SCAN_ORDER[block_idx]
+    grid_row, grid_col = row // 4, col // 4
+
+    # Left neighbor (nA)
+    nA = None
+    if grid_col > 0:
+        # Neighbor within same MB
+        left_idx = BLOCK_IDX_FROM_POS[(grid_row, grid_col - 1)]
+        nA = int(mb_nz_counts[left_idx])
+    elif mb_x > 0 and frame_nz_counts is not None:
+        # Neighbor in left MB (rightmost column, same row)
+        left_mb_idx = mb_y * frame_width_mbs + (mb_x - 1)
+        left_block_idx = BLOCK_IDX_FROM_POS[(grid_row, 3)]
+        nA = int(frame_nz_counts[left_mb_idx, left_block_idx])
+
+    # Top neighbor (nB)
+    nB = None
+    if grid_row > 0:
+        # Neighbor within same MB
+        top_idx = BLOCK_IDX_FROM_POS[(grid_row - 1, grid_col)]
+        nB = int(mb_nz_counts[top_idx])
+    elif mb_y > 0 and frame_nz_counts is not None:
+        # Neighbor in top MB (bottom row, same column)
+        top_mb_idx = (mb_y - 1) * frame_width_mbs + mb_x
+        top_block_idx = BLOCK_IDX_FROM_POS[(3, grid_col)]
+        nB = int(frame_nz_counts[top_mb_idx, top_block_idx])
+
+    return nA, nB
+
+
+def get_chroma_neighbor_nz(
+    chroma_block_idx: int,
+    component_offset: int,
+    mb_x: int,
+    mb_y: int,
+    mb_nz_counts: np.ndarray,
+    frame_nz_counts: Optional[np.ndarray],
+    frame_width_mbs: int,
+) -> Tuple[Optional[int], Optional[int]]:
+    """Get left (nA) and top (nB) neighbor non-zero counts for chroma blocks.
+
+    Chroma uses 2x2 block layout (4:2:0):
+      0  1
+      2  3
+
+    Args:
+        chroma_block_idx: Index within component (0-3)
+        component_offset: 16 for Cb, 20 for Cr
+        mb_x: Current macroblock X position
+        mb_y: Current macroblock Y position
+        mb_nz_counts: Current MB's nz_counts array (24 elements)
+        frame_nz_counts: All MBs' nz_counts, shape (num_mbs, 24)
+        frame_width_mbs: Picture width in macroblocks
+
+    Returns:
+        (nA, nB): Left and top neighbor nz counts, None if unavailable
+    """
+    # 2x2 grid: block 0=(0,0), 1=(0,1), 2=(1,0), 3=(1,1)
+    grid_row = chroma_block_idx // 2
+    grid_col = chroma_block_idx % 2
+
+    # Left neighbor (nA)
+    nA = None
+    if grid_col > 0:
+        # Neighbor within same MB (left column)
+        left_idx = component_offset + grid_row * 2 + (grid_col - 1)
+        nA = int(mb_nz_counts[left_idx])
+    elif mb_x > 0 and frame_nz_counts is not None:
+        # Neighbor in left MB (rightmost column, same row)
+        left_mb_idx = mb_y * frame_width_mbs + (mb_x - 1)
+        left_block_idx = component_offset + grid_row * 2 + 1
+        nA = int(frame_nz_counts[left_mb_idx, left_block_idx])
+
+    # Top neighbor (nB)
+    nB = None
+    if grid_row > 0:
+        # Neighbor within same MB (top row)
+        top_idx = component_offset + (grid_row - 1) * 2 + grid_col
+        nB = int(mb_nz_counts[top_idx])
+    elif mb_y > 0 and frame_nz_counts is not None:
+        # Neighbor in top MB (bottom row, same column)
+        top_mb_idx = (mb_y - 1) * frame_width_mbs + mb_x
+        top_block_idx = component_offset + 1 * 2 + grid_col
+        nB = int(frame_nz_counts[top_mb_idx, top_block_idx])
+
+    return nA, nB
 
 
 def decode_intra4x4_pred_modes(
@@ -865,6 +1001,8 @@ def decode_and_reconstruct_i8x8_luma(
     mb_x: int,
     mb_y: int,
     nz_counts: np.ndarray,
+    frame_nz_counts: Optional[np.ndarray] = None,
+    frame_width_mbs: int = 0,
 ) -> np.ndarray:
     """Decode and reconstruct I_8x8 luma macroblock from bitstream.
 
@@ -878,6 +1016,8 @@ def decode_and_reconstruct_i8x8_luma(
         frame_luma: Frame luma buffer for neighbor pixels
         mb_x, mb_y: Macroblock position
         nz_counts: Array to store non-zero counts for CAVLC context
+        frame_nz_counts: All MBs' nz_counts for CAVLC context
+        frame_width_mbs: Frame width in macroblocks
 
     Returns:
         Reconstructed 16x16 luma block
@@ -901,7 +1041,13 @@ def decode_and_reconstruct_i8x8_luma(
         # Decode residual if CBP indicates coefficients present
         # For I_8x8, each 8x8 block corresponds to one CBP bit
         if cbp.has_luma_8x8(block_idx):
-            nC = calculate_nC(None, None)  # Simplified context
+            # Use top-left 4x4 sub-block for nC context (block_idx*4)
+            sub_block_idx = block_idx * 4
+            nA, nB = get_luma_neighbor_nz(
+                sub_block_idx, mb_x, mb_y, nz_counts,
+                frame_nz_counts, frame_width_mbs or 0
+            )
+            nC = calculate_nC(nA, nB)
             coeffs_8x8 = decode_residual_8x8(reader, nC)
             nz_count = np.count_nonzero(coeffs_8x8)
             # Store nz_count for the 4 sub-blocks (4x4 each)
@@ -1099,7 +1245,11 @@ def reconstruct_i16x16_luma(
     neighbors_top: Optional[np.ndarray],
     neighbors_left: Optional[np.ndarray],
     neighbor_top_left: Optional[int],
-    nz_counts: np.ndarray
+    nz_counts: np.ndarray,
+    mb_x: int = 0,
+    mb_y: int = 0,
+    frame_nz_counts: Optional[np.ndarray] = None,
+    frame_width_mbs: int = 0,
 ) -> np.ndarray:
     """Reconstruct I_16x16 luma macroblock.
 
@@ -1112,6 +1262,10 @@ def reconstruct_i16x16_luma(
         neighbors_left: Left neighbor pixels (16,) or None
         neighbor_top_left: Top-left corner pixel or None
         nz_counts: Array to store non-zero counts for context
+        mb_x: Macroblock X position (for CAVLC context)
+        mb_y: Macroblock Y position (for CAVLC context)
+        frame_nz_counts: All MBs' nz_counts for CAVLC context
+        frame_width_mbs: Picture width in macroblocks
 
     Returns:
         Reconstructed 16x16 luma block
@@ -1137,9 +1291,10 @@ def reconstruct_i16x16_luma(
     # AC blocks are only coded when cbp_luma bits are set
 
     # Decode DC coefficients (Hadamard-coded 4x4 block) - ALWAYS for I_16x16
-    dc_nC = calculate_nC(None, None)  # Simplified - no neighbor context
-    dc_block = decode_residual_block(reader, dc_nC, max_coeffs=16)
-    nz_counts[0] = dc_block.total_coeff  # Store for context
+    # H.264 Spec 9.2.1: For Intra16x16DCLevel, nC is fixed at 0
+    # (DC coefficients use VLC table 0, not derived from AC neighbor context)
+    dc_block = decode_residual_block(reader, nC=0, max_coeffs=16)
+    # Note: DC total_coeff is NOT stored in nz_counts - those are for AC blocks only
 
     # Arrange DC coefficients in 4x4 for inverse Hadamard
     # CAVLC places coefficients in scan order - apply zigzag to convert to raster
@@ -1167,7 +1322,11 @@ def reconstruct_i16x16_luma(
                 continue
 
             # Decode AC (15 coefficients, DC is separate)
-            ac_nC = calculate_nC(None, None)
+            ac_nA, ac_nB = get_luma_neighbor_nz(
+                block_idx, mb_x, mb_y, nz_counts,
+                frame_nz_counts, frame_width_mbs or 0
+            )
+            ac_nC = calculate_nC(ac_nA, ac_nB)
             ac_block = decode_residual_block(reader, ac_nC, max_coeffs=15)
             nz_counts[block_idx] = ac_block.total_coeff
 
@@ -1216,69 +1375,137 @@ def reconstruct_i16x16_luma(
     return _clip_block(reconstructed)
 
 
-def reconstruct_chroma(
+def decode_chroma_dc(
     reader: BitReader,
-    pred_mode: int,
+    cbp_chroma: int,
+    qp_chroma: int,
+) -> Optional[np.ndarray]:
+    """Decode chroma DC coefficients.
+
+    H.264 Spec Section 7.3.5.3: Chroma DC is decoded before chroma AC.
+
+    Args:
+        reader: Bit reader
+        cbp_chroma: Chroma CBP (0=none, 1=DC only, 2=DC+AC)
+        qp_chroma: Chroma QP
+
+    Returns:
+        Dequantized 2x2 DC block, or None if cbp_chroma < 1
+    """
+    if cbp_chroma < 1:
+        return None
+
+    # Decode DC coefficients (2x2 block)
+    bit_pos = reader.position
+    print(f"[DEBUG] Chroma DC: pos={bit_pos}, cbp_chroma={cbp_chroma}")
+    dc_block = decode_residual_block(reader, nC=-1, max_coeffs=4)
+    print(f"[DEBUG]   -> TC={dc_block.total_coeff}, T1={dc_block.trailing_ones}, end_pos={reader.position}")
+
+    # Arrange into 2x2 and inverse Hadamard
+    dc_2x2 = np.zeros((2, 2), dtype=np.int32)
+    for i in range(min(4, len(dc_block.coefficients))):
+        dc_2x2[i // 2, i % 2] = dc_block.coefficients[i]
+
+    dc_transformed = hadamard_2x2(dc_2x2)
+    dc_dequant = dequant_dc_2x2(dc_transformed, qp_chroma)
+
+    return dc_dequant
+
+
+def decode_chroma_ac(
+    reader: BitReader,
+    cbp_chroma: int,
+    nz_counts: np.ndarray,
+    nz_offset: int,
+    mb_x: int,
+    mb_y: int,
+    frame_nz_counts: Optional[np.ndarray],
+    frame_width_mbs: int,
+) -> List[CAVLCBlock]:
+    """Decode chroma AC coefficients for all 4 blocks.
+
+    H.264 Spec Section 7.3.5.3: Chroma AC is decoded after ALL chroma DC.
+
+    Args:
+        reader: Bit reader
+        cbp_chroma: Chroma CBP (0=none, 1=DC only, 2=DC+AC)
+        nz_counts: Non-zero count array
+        nz_offset: Offset into nz_counts (16 for Cb, 20 for Cr)
+        mb_x: Macroblock X position
+        mb_y: Macroblock Y position
+        frame_nz_counts: All MBs' nz_counts for CAVLC context
+        frame_width_mbs: Picture width in macroblocks
+
+    Returns:
+        List of 4 CAVLCBlock objects, or empty list if cbp_chroma < 2
+    """
+    if cbp_chroma < 2:
+        return []
+
+    ac_blocks = []
+    comp_name = "Cb" if nz_offset == 16 else "Cr"
+    for block_idx in range(4):
+        ac_nA, ac_nB = get_chroma_neighbor_nz(
+            block_idx, nz_offset, mb_x, mb_y, nz_counts,
+            frame_nz_counts, frame_width_mbs
+        )
+        ac_nC = calculate_nC(ac_nA, ac_nB)
+        bit_pos = reader.position
+        print(f"[DEBUG] {comp_name} AC {block_idx}: pos={bit_pos}, nA={ac_nA}, nB={ac_nB}, nC={ac_nC}")
+        ac_block = decode_residual_block(reader, ac_nC, max_coeffs=15)
+        print(f"[DEBUG]   -> TC={ac_block.total_coeff}, T1={ac_block.trailing_ones}")
+        nz_counts[nz_offset + block_idx] = ac_block.total_coeff
+        ac_blocks.append(ac_block)
+
+    return ac_blocks
+
+
+def reconstruct_chroma_plane(
+    dc_dequant: Optional[np.ndarray],
+    ac_blocks: List[CAVLCBlock],
     cbp_chroma: int,
     qp_chroma: int,
     neighbors_top: Optional[np.ndarray],
     neighbors_left: Optional[np.ndarray],
-    neighbor_top_left: Optional[int],
-    nz_counts: np.ndarray,
-    nz_offset: int
 ) -> np.ndarray:
-    """Reconstruct 8x8 chroma component.
+    """Reconstruct 8x8 chroma component from decoded DC and AC.
 
     Args:
-        reader: Bit reader
-        pred_mode: Intra chroma prediction mode (0-3)
-        cbp_chroma: Chroma CBP (0=none, 1=DC, 2=DC+AC)
+        dc_dequant: Dequantized 2x2 DC block (or None)
+        ac_blocks: List of 4 AC blocks (or empty list)
+        cbp_chroma: Chroma CBP
         qp_chroma: Chroma QP
         neighbors_top: Top neighbor pixels (8,)
         neighbors_left: Left neighbor pixels (8,)
-        neighbor_top_left: Top-left corner pixel
-        nz_counts: Non-zero count array
-        nz_offset: Offset into nz_counts for this component
 
     Returns:
         Reconstructed 8x8 chroma block
     """
-    # Generate prediction (using DC mode for simplicity)
-    # Full chroma prediction would use pred_mode
+    # Generate prediction
     if neighbors_top is not None and neighbors_left is not None:
-        prediction = np.full((8, 8),
-            (np.sum(neighbors_top) + np.sum(neighbors_left) + 8) >> 4,
-            dtype=np.int32)
+        dc_val = (
+            int(np.sum(neighbors_top, dtype=np.int32))
+            + int(np.sum(neighbors_left, dtype=np.int32))
+            + 8
+        ) >> 4
+        prediction = np.full((8, 8), dc_val, dtype=np.int32)
     elif neighbors_top is not None:
-        prediction = np.full((8, 8), (np.sum(neighbors_top) + 4) >> 3, dtype=np.int32)
+        dc_val = (int(np.sum(neighbors_top, dtype=np.int32)) + 4) >> 3
+        prediction = np.full((8, 8), dc_val, dtype=np.int32)
     elif neighbors_left is not None:
-        prediction = np.full((8, 8), (np.sum(neighbors_left) + 4) >> 3, dtype=np.int32)
+        dc_val = (int(np.sum(neighbors_left, dtype=np.int32)) + 4) >> 3
+        prediction = np.full((8, 8), dc_val, dtype=np.int32)
     else:
         prediction = np.full((8, 8), 128, dtype=np.int32)
 
     residual = np.zeros((8, 8), dtype=np.int32)
 
-    if cbp_chroma >= 1:
-        # Decode DC coefficients (2x2 block)
-        dc_block = decode_residual_block(reader, nC=-1, max_coeffs=4)
-
-        # Arrange and inverse Hadamard
-        dc_2x2 = np.zeros((2, 2), dtype=np.int32)
-        for i in range(min(4, len(dc_block.coefficients))):
-            dc_2x2[i // 2, i % 2] = dc_block.coefficients[i]
-
-        dc_transformed = hadamard_2x2(dc_2x2)
-        dc_dequant = dequant_dc_2x2(dc_transformed, qp_chroma)
-
-        if cbp_chroma >= 2:
-            # Decode AC for each 4x4 block
-            for block_idx in range(4):
+    if dc_dequant is not None:
+        if ac_blocks:
+            # DC + AC
+            for block_idx, ac_block in enumerate(ac_blocks):
                 row = (block_idx // 2) * 4
                 col = (block_idx % 2) * 4
-
-                ac_nC = calculate_nC(None, None)
-                ac_block = decode_residual_block(reader, ac_nC, max_coeffs=15)
-                nz_counts[nz_offset + block_idx] = ac_block.total_coeff
 
                 # Build coefficient block
                 coeffs = np.zeros((4, 4), dtype=np.int32)
@@ -1295,7 +1522,7 @@ def reconstruct_chroma(
                 block_residual = idct_4x4(coeffs_dequant)
                 residual[row:row+4, col:col+4] = block_residual
         else:
-            # DC only - place DC values
+            # DC only
             for block_idx in range(4):
                 row = (block_idx // 2) * 4
                 col = (block_idx % 2) * 4
@@ -1304,6 +1531,61 @@ def reconstruct_chroma(
 
     reconstructed = prediction + residual
     return _clip_block(reconstructed)
+
+
+def reconstruct_chroma(
+    reader: BitReader,
+    pred_mode: int,
+    cbp_chroma: int,
+    qp_chroma: int,
+    neighbors_top: Optional[np.ndarray],
+    neighbors_left: Optional[np.ndarray],
+    neighbor_top_left: Optional[int],
+    nz_counts: np.ndarray,
+    nz_offset: int,
+    mb_x: int = 0,
+    mb_y: int = 0,
+    frame_nz_counts: Optional[np.ndarray] = None,
+    frame_width_mbs: int = 0,
+) -> np.ndarray:
+    """Reconstruct 8x8 chroma component (DEPRECATED - use new functions).
+
+    This function is kept for backward compatibility but should not be used
+    for new code. The H.264 spec requires all chroma DC to be decoded before
+    any chroma AC, which this function does not support.
+
+    Args:
+        reader: Bit reader
+        pred_mode: Intra chroma prediction mode (0-3)
+        cbp_chroma: Chroma CBP (0=none, 1=DC, 2=DC+AC)
+        qp_chroma: Chroma QP
+        neighbors_top: Top neighbor pixels (8,)
+        neighbors_left: Left neighbor pixels (8,)
+        neighbor_top_left: Top-left corner pixel
+        nz_counts: Non-zero count array
+        nz_offset: Offset into nz_counts for this component (16 for Cb, 20 for Cr)
+        mb_x: Macroblock X position
+        mb_y: Macroblock Y position
+        frame_nz_counts: All MBs' nz_counts for CAVLC context
+        frame_width_mbs: Picture width in macroblocks
+
+    Returns:
+        Reconstructed 8x8 chroma block
+    """
+    # Decode DC
+    dc_dequant = decode_chroma_dc(reader, cbp_chroma, qp_chroma)
+
+    # Decode AC
+    ac_blocks = decode_chroma_ac(
+        reader, cbp_chroma, nz_counts, nz_offset,
+        mb_x, mb_y, frame_nz_counts, frame_width_mbs
+    )
+
+    # Reconstruct
+    return reconstruct_chroma_plane(
+        dc_dequant, ac_blocks, cbp_chroma, qp_chroma,
+        neighbors_top, neighbors_left
+    )
 
 
 def decode_macroblock(
@@ -1316,7 +1598,9 @@ def decode_macroblock(
     frame_luma: np.ndarray,
     frame_cb: np.ndarray,
     frame_cr: np.ndarray,
-    is_i_slice: bool = True
+    is_i_slice: bool = True,
+    frame_nz_counts: Optional[np.ndarray] = None,
+    frame_width_mbs: Optional[int] = None,
 ) -> MacroblockData:
     """Decode and reconstruct a complete macroblock.
 
@@ -1331,6 +1615,8 @@ def decode_macroblock(
         frame_cb: Frame Cb buffer
         frame_cr: Frame Cr buffer
         is_i_slice: Whether this is an I-slice
+        frame_nz_counts: All MBs' nz_counts for CAVLC context, shape (num_mbs, 24)
+        frame_width_mbs: Picture width in macroblocks for neighbor lookup
 
     Returns:
         Decoded macroblock data
@@ -1376,7 +1662,11 @@ def decode_macroblock(
             #   - mode mapping formula: rem < pred ? rem : rem + 1
             mb.intra_4x4_pred_modes = decode_intra4x4_pred_modes(reader, neighbor_modes=None)
 
-        # Parse coded_block_pattern
+        # H.264 Table 7-3: For I_NxN, intra_chroma_pred_mode is parsed BEFORE coded_block_pattern
+        # (intra_chroma_pred_mode is part of mb_pred, coded_block_pattern follows mb_pred)
+        mb.intra_chroma_pred_mode = reader.read_ue()
+
+        # Parse coded_block_pattern (only for I_NxN, I_16x16 has CBP in mb_type)
         cbp_coded = reader.read_ue()
         cbp_luma, cbp_chroma = decode_cbp_intra(cbp_coded)
         mb.cbp = CodedBlockPattern(luma=cbp_luma, chroma=cbp_chroma)
@@ -1387,8 +1677,8 @@ def decode_macroblock(
         mb.intra_16x16_pred_mode = pred_mode
         mb.cbp = CodedBlockPattern(luma=cbp_luma, chroma=cbp_chroma)
 
-    # Parse intra_chroma_pred_mode
-    mb.intra_chroma_pred_mode = reader.read_ue()
+        # For I_16x16, intra_chroma_pred_mode is still parsed from bitstream
+        mb.intra_chroma_pred_mode = reader.read_ue()
 
     # Parse mb_qp_delta if any coded coefficients OR if I_16x16
     # Per H.264 spec 7.3.5: mb_qp_delta is present if:
@@ -1438,7 +1728,11 @@ def decode_macroblock(
             neighbors_top_luma,
             neighbors_left_luma,
             neighbor_tl_luma,
-            mb.nz_counts
+            mb.nz_counts,
+            mb_x,
+            mb_y,
+            frame_nz_counts,
+            frame_width_mbs or 0,
         )
     elif mb.transform_size_8x8_flag:
         # I_8x8: Use 8x8 transform and prediction (High profile)
@@ -1450,7 +1744,9 @@ def decode_macroblock(
             frame_luma,
             mb_x,
             mb_y,
-            mb.nz_counts
+            mb.nz_counts,
+            frame_nz_counts,
+            frame_width_mbs or 0
         )
     else:
         # I_4x4: Full reconstruction with 9 prediction modes per block
@@ -1479,8 +1775,15 @@ def decode_macroblock(
             block_8x8_idx = block_idx // 4  # 0-3 (which quadrant)
             if mb.cbp.has_luma_8x8(block_8x8_idx):
                 # Decode residual coefficients (all 16, no separate DC Hadamard for I_4x4)
-                nC = calculate_nC(None, None)  # TODO: use proper neighbor nC
+                nA, nB = get_luma_neighbor_nz(
+                    block_idx, mb_x, mb_y, mb.nz_counts,
+                    frame_nz_counts, frame_width_mbs or 0
+                )
+                nC = calculate_nC(nA, nB)
+                bit_pos = reader.position
+                print(f"[LUMA] MB({mb_x},{mb_y}) block {block_idx}: pos={bit_pos}, nA={nA}, nB={nB}, nC={nC}")
                 block = decode_residual_block(reader, nC, max_coeffs=16)
+                print(f"[LUMA]   -> TC={block.total_coeff}, T1={block.trailing_ones}, end_pos={reader.position}")
                 mb.nz_counts[block_idx] = block.total_coeff
 
                 # Dequantize and inverse transform
@@ -1508,28 +1811,37 @@ def decode_macroblock(
             mb.luma[row:row+4, col:col+4] = result
 
     # Reconstruct chroma
-    mb.cb = reconstruct_chroma(
-        reader,
-        mb.intra_chroma_pred_mode,
-        mb.cbp.chroma,
-        qp_chroma,
-        neighbors_top_cb,
-        neighbors_left_cb,
-        neighbor_tl_cb,
-        mb.nz_counts,
-        16  # Cb offset
+    # H.264 Table 7-2: All chroma DC decoded before any chroma AC
+    # Order: Cb DC -> Cr DC -> Cb AC (4 blocks) -> Cr AC (4 blocks)
+
+    # Step 1: Decode Cb DC
+    cb_dc_dequant = decode_chroma_dc(reader, mb.cbp.chroma, qp_chroma)
+
+    # Step 2: Decode Cr DC
+    cr_dc_dequant = decode_chroma_dc(reader, mb.cbp.chroma, qp_chroma)
+
+    # Step 3: Decode Cb AC (4 blocks)
+    cb_ac_blocks = decode_chroma_ac(
+        reader, mb.cbp.chroma, mb.nz_counts, 16,  # Cb offset
+        mb_x, mb_y, frame_nz_counts, frame_width_mbs or 0
     )
 
-    mb.cr = reconstruct_chroma(
-        reader,
-        mb.intra_chroma_pred_mode,
-        mb.cbp.chroma,
-        qp_chroma,
-        neighbors_top_cr,
-        neighbors_left_cr,
-        neighbor_tl_cr,
-        mb.nz_counts,
-        20  # Cr offset
+    # Step 4: Decode Cr AC (4 blocks)
+    cr_ac_blocks = decode_chroma_ac(
+        reader, mb.cbp.chroma, mb.nz_counts, 20,  # Cr offset
+        mb_x, mb_y, frame_nz_counts, frame_width_mbs or 0
+    )
+
+    # Step 5: Reconstruct Cb
+    mb.cb = reconstruct_chroma_plane(
+        cb_dc_dequant, cb_ac_blocks, mb.cbp.chroma, qp_chroma,
+        neighbors_top_cb, neighbors_left_cb
+    )
+
+    # Step 6: Reconstruct Cr
+    mb.cr = reconstruct_chroma_plane(
+        cr_dc_dequant, cr_ac_blocks, mb.cbp.chroma, qp_chroma,
+        neighbors_top_cr, neighbors_left_cr
     )
 
     # Write to frame buffers

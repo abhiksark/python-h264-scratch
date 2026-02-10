@@ -70,6 +70,16 @@ class SliceType(IntEnum):
         return normalized == cls.B
 
 
+def get_colour_plane_id(colour_plane_id: int) -> str:
+    mapping = {0: "Y", 1: "Cb", 2: "Cr"}
+    return mapping.get(int(colour_plane_id), "Y")
+
+
+def parse_slice_qp_separate_planes(slice_qp_y: int, plane_id: int) -> int:
+    _ = int(plane_id)
+    return int(slice_qp_y)
+
+
 @dataclass
 class RefPicListModification:
     """Reference picture list modification data.
