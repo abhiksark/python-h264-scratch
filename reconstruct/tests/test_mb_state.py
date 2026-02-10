@@ -109,5 +109,5 @@ def test_decode_luma_residual_validates_block_count():
     # Decode luma - should validate 12 blocks
     decoder.decode_luma_residual()
 
-    assert decoder.context.luma_blocks_decoded == 12
+    assert decoder.context.luma_blocks_decoded == 16  # CBP=15 means all 16 blocks
     assert decoder.context.current_state == MBState.CHROMA_DC

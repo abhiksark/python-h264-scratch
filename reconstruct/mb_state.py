@@ -198,17 +198,12 @@ class MacroblockDecoder:
         self._transition_to(MBState.LUMA_RESIDUAL)
 
         # Count blocks we should decode based on CBP
-        # For 4:2:0, only decode blocks 0-11 (blocks 12-15 are skipped)
-        # CBP luma has 4 bits, one per 8x8 quadrant
+        # CBP luma has 4 bits, one per 8x8 quadrant (0-3)
         # Each quadrant contains 4 4x4 blocks
         expected_blocks = 0
-        for quadrant in range(3):  # Only first 3 quadrants (blocks 0-11)
+        for quadrant in range(4):  # All 4 quadrants (blocks 0-15)
             if self.context.cbp_luma & (1 << quadrant):
                 expected_blocks += 4  # All 4 blocks in this quadrant
-
-        # If CBP indicates no luma coefficients, still count as "decoded"
-        if self.context.cbp_luma == 0:
-            expected_blocks = 0
 
         # For now, just validate the count matches
         # (Actual decode logic will be integrated later)
