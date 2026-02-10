@@ -194,11 +194,15 @@ def decode_coeff_token(reader: BitReader, nC: int) -> Tuple[int, int]:
         return _decode_coeff_token_vlc(reader, COEFF_TOKEN_DECODE_4, 10)
     else:
         # H.264 Table 9-5(d): Fixed 6-bit encoding for nC >= 8
-        # Bits 5-4 (high 2 bits) = trailing_ones
-        # Bits 3-0 (low 4 bits) = TotalCoeff
+        # Special case: code=3 means TotalCoeff=0
+        # Otherwise: T1 = code >> 4, TC = (code & 0xF) + 1
         code = reader.read_bits(6)
-        trailing_ones = (code >> 4) & 0x3
-        total_coeff = code & 0xF
+        if code == 3:
+            # Special case for TotalCoeff=0
+            total_coeff, trailing_ones = 0, 0
+        else:
+            trailing_ones = code >> 4
+            total_coeff = (code & 0xF) + 1
         logger.debug(f"Fixed 6-bit: code={code:06b}, TC={total_coeff}, T1={trailing_ones}")
         return total_coeff, trailing_ones
 

@@ -157,19 +157,18 @@ class TestDecodeCoeffToken:
 
     def test_decode_nc8_fixed_nonzero(self):
         """Decode with nC>=8 (fixed length), non-zero coeffs."""
-        # TotalCoeff=5, TrailingOnes=2
-        # Per H.264 Table 9-5(e): TC=5 starts at code 17, T1=2 offset -> code=19
-        # Formula for code >= 9: TC = (code+3)>>2, T1 = (code+3)&3
+        # TotalCoeff=4, TrailingOnes=1
+        # Per H.264 Table 9-5(d): code = (T1 << 4) | (TC - 1) = (1 << 4) | 3 = 19
         writer = BitWriter()
-        writer.write_bits(0b010011, 6)  # code=19 -> TC=5, T1=2
+        writer.write_bits(0b010011, 6)  # code=19 -> TC=4, T1=1
         writer.write_bits(0, 2)
         data = writer.to_bytes()
 
         reader = BitReader(data)
         tc, t1 = decode_coeff_token(reader, nC=8)
 
-        assert tc == 5
-        assert t1 == 2
+        assert tc == 4
+        assert t1 == 1
 
     def test_decode_chroma_dc(self):
         """Decode chroma DC coeff_token."""
