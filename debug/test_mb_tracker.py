@@ -77,6 +77,17 @@ else:
         print(f"  Start: {mb0_summary['start']}")
         print(f"  End: {mb0_summary['end']}")
         print(f"  Consumed: {mb0_summary['consumed']} bits")
+
+        # Show MB(0,0) Cb and Cr AC blocks for comparison
+        print("\n  MB(0,0) Cb AC blocks:")
+        for cp in mb0_summary['checkpoints']:
+            if cp['label'].startswith('Cb_ac_block_'):
+                print(f"    {cp['label']}: TC={cp.get('total_coeff', '?')}, nA={cp.get('nA')}, nB={cp.get('nB')}, nC={cp.get('nC')}")
+
+        print("\n  MB(0,0) Cr AC blocks:")
+        for cp in mb0_summary['checkpoints']:
+            if cp['label'].startswith('Cr_ac_block_'):
+                print(f"    {cp['label']}: TC={cp.get('total_coeff', '?')}, nA={cp.get('nA')}, nB={cp.get('nB')}, nC={cp.get('nC')}")
     else:
         print("  No data recorded for MB(0,0)")
 
@@ -168,5 +179,17 @@ else:
             print(f"  Cr AC: {cr_ac} bits")
             if cr_ac > cb_ac * 2:
                 print(f"  → Cr AC consumes {cr_ac - cb_ac} more bits than Cb AC (unusual!)")
+
+        # Show detailed Cb and Cr AC block breakdown
+        print("\n=== Chroma AC Block Breakdown ===")
+        print("Cb AC blocks:")
+        for cp in mb1_0_summary['checkpoints']:
+            if cp['label'].startswith('Cb_ac_block_'):
+                print(f"  {cp['label']}: {cp.get('bits', '?')} bits (nA={cp.get('nA')}, nB={cp.get('nB')}, nC={cp.get('nC')}, TC={cp.get('total_coeff')})")
+
+        print("\nCr AC blocks:")
+        for cp in mb1_0_summary['checkpoints']:
+            if cp['label'].startswith('Cr_ac_block_'):
+                print(f"  {cp['label']}: {cp.get('bits', '?')} bits (nA={cp.get('nA')}, nB={cp.get('nB')}, nC={cp.get('nC')}, TC={cp.get('total_coeff')})")
     else:
         print("  No data recorded for MB(1,0)")

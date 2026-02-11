@@ -1442,7 +1442,11 @@ def decode_chroma_ac(
 
     ac_blocks = []
     comp_name = "Cb" if nz_offset == 16 else "Cr"
+
     for block_idx in range(4):
+        # Track position before block decode
+        pos_before = reader.position
+
         ac_nA, ac_nB = get_chroma_neighbor_nz(
             block_idx, nz_offset, mb_x, mb_y, nz_counts,
             frame_nz_counts, frame_width_mbs
@@ -1451,6 +1455,19 @@ def decode_chroma_ac(
         ac_block = decode_residual_block(reader, ac_nC, max_coeffs=15)
         nz_counts[nz_offset + block_idx] = ac_block.total_coeff
         ac_blocks.append(ac_block)
+
+        # Checkpoint tracking for diagnostics
+        if hasattr(reader, '_checkpoint_tracker'):
+            bits_used = reader.position - pos_before
+            reader._checkpoint_tracker.checkpoint(
+                reader, f'{comp_name}_ac_block_{block_idx}',
+                block_idx=block_idx,
+                nA=ac_nA,
+                nB=ac_nB,
+                nC=ac_nC,
+                total_coeff=ac_block.total_coeff,
+                bits=bits_used
+            )
 
     return ac_blocks
 
