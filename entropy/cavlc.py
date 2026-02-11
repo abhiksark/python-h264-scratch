@@ -21,7 +21,7 @@ Decoding order for a block:
 
 import logging
 from dataclasses import dataclass
-from typing import List, Tuple, Optional
+from typing import List, Tuple, Optional, Any
 
 import numpy as np
 
@@ -47,7 +47,7 @@ def validate_vlc_bits_consumed(
     pos_before: int,
     expected_bits: int,
     context: str,
-    code_value: any
+    code_value: Any
 ) -> None:
     """Validate VLC decode consumed expected number of bits.
 
