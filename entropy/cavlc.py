@@ -380,9 +380,20 @@ def decode_levels(
 def _decode_total_zeros_vlc(
     reader: BitReader,
     decode_table: dict,
-    max_bits: int = 9
-) -> int:
-    """Decode total_zeros using VLC table."""
+    max_bits: int = 11
+) -> Tuple[int, int]:
+    """Decode total_zeros using VLC table.
+
+    Args:
+        reader: Bit reader
+        decode_table: VLC decode table
+        max_bits: Maximum code length (default 11 for 4x4 blocks)
+
+    Returns:
+        Tuple of (total_zeros_value, num_bits_consumed)
+
+    Note: Max code length is 11 bits for TC=2 in 4x4 blocks (H.264 Table 9-8)
+    """
     code = 0
     for num_bits in range(1, max_bits + 1):
         code = (code << 1) | reader.read_bit()
@@ -390,7 +401,7 @@ def _decode_total_zeros_vlc(
         if (code, num_bits) in decode_table:
             total_zeros = decode_table[(code, num_bits)]
             logger.debug(f"total_zeros: code={code:0{num_bits}b}, value={total_zeros}")
-            return total_zeros
+            return total_zeros, num_bits
 
     # Debug: show what codes are valid for this table
     valid_codes = sorted(decode_table.keys(), key=lambda x: (x[1], x[0]))
@@ -422,6 +433,7 @@ def decode_total_zeros(
     if total_coeff == max_coeffs:
         return 0  # No room for zeros
 
+    pos_before = reader.position
     max_valid_zeros = max_coeffs - total_coeff
     logger.debug(f"decode_total_zeros: TC={total_coeff}, max={max_coeffs}, max_valid_zeros={max_valid_zeros}")
 
@@ -435,7 +447,14 @@ def decode_total_zeros(
     if decode_table is None:
         raise ValueError(f"No total_zeros table for TotalCoeff={total_coeff}")
 
-    total_zeros = _decode_total_zeros_vlc(reader, decode_table)
+    total_zeros, expected_bits = _decode_total_zeros_vlc(reader, decode_table)
+
+    # Validate bit consumption
+    validate_vlc_bits_consumed(
+        reader, pos_before, expected_bits,
+        context=f"total_zeros TC={total_coeff}",
+        code_value=total_zeros
+    )
 
     # Validate: total_zeros cannot exceed max_valid_zeros
     # Some encoders may produce technically invalid streams that FFmpeg tolerates
