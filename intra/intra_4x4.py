@@ -257,36 +257,28 @@ def intra_4x4_vertical_right(
     Returns:
         4x4 prediction block
     """
-    M = int(top_left)
-    A, B, C, D = int(top[0]), int(top[1]), int(top[2]), int(top[3])
-    I, J, K, L = int(left[0]), int(left[1]), int(left[2]), int(left[3])
+    # p[n, -1] for top: -1=M, 0=A, 1=B, 2=C, 3=D
+    p_top = {-1: int(top_left), 0: int(top[0]), 1: int(top[1]),
+             2: int(top[2]), 3: int(top[3])}
+    # p[-1, n] for left: -1=M, 0=I, 1=J, 2=K, 3=L
+    p_left = {-1: int(top_left), 0: int(left[0]), 1: int(left[1]),
+              2: int(left[2]), 3: int(left[3])}
 
     pred = np.zeros((4, 4), dtype=np.int32)
 
-    # zVR = 2*x - y
     for y in range(4):
         for x in range(4):
             zVR = 2 * x - y
-            if zVR == 0:
-                pred[y, x] = _avg2(M, A)
-            elif zVR == 1:
-                pred[y, x] = _avg2(A, B)
-            elif zVR == 2:
-                pred[y, x] = _avg2(B, C)
-            elif zVR == 3:
-                pred[y, x] = _avg2(C, D)
-            elif zVR == 4:
-                pred[y, x] = _avg2(D, D)  # Beyond edge
-            elif zVR == 5:
-                pred[y, x] = _avg2(D, D)
+            if zVR >= 0 and zVR % 2 == 0:
+                idx = x - (y >> 1)
+                pred[y, x] = (p_top[idx - 1] + p_top[idx] + 1) >> 1
+            elif zVR >= 0 and zVR % 2 == 1:
+                idx = x - (y >> 1)
+                pred[y, x] = (p_top[idx - 2] + 2 * p_top[idx - 1] + p_top[idx] + 2) >> 2
             elif zVR == -1:
-                pred[y, x] = _avg3(I, M, A)
-            elif zVR == -2:
-                pred[y, x] = _avg3(M, I, J)
-            elif zVR == -3:
-                pred[y, x] = _avg3(I, J, K)
-            else:  # zVR < -3
-                pred[y, x] = _avg3(J, K, L)
+                pred[y, x] = (p_left[0] + p_left[-1] + 1) >> 1
+            else:  # zVR in {-2, -3}
+                pred[y, x] = (p_left[y - 1] + 2 * p_left[y - 2] + p_left[y - 3] + 2) >> 2
 
     return np.clip(pred, 0, 255).astype(np.uint8)
 
@@ -309,40 +301,28 @@ def intra_4x4_horizontal_down(
     Returns:
         4x4 prediction block
     """
-    M = int(top_left)
-    A, B, C, D = int(top[0]), int(top[1]), int(top[2]), int(top[3])
-    I, J, K, L = int(left[0]), int(left[1]), int(left[2]), int(left[3])
+    # p[n, -1] for top: -1=M, 0=A, 1=B, 2=C, 3=D
+    p_top = {-1: int(top_left), 0: int(top[0]), 1: int(top[1]),
+             2: int(top[2]), 3: int(top[3])}
+    # p[-1, n] for left: -1=M, 0=I, 1=J, 2=K, 3=L
+    p_left = {-1: int(top_left), 0: int(left[0]), 1: int(left[1]),
+              2: int(left[2]), 3: int(left[3])}
 
     pred = np.zeros((4, 4), dtype=np.int32)
 
-    # zHD = 2*y - x
     for y in range(4):
         for x in range(4):
             zHD = 2 * y - x
-            if zHD == 0:
-                pred[y, x] = _avg2(M, I)
-            elif zHD == 1:
-                pred[y, x] = _avg3(A, M, I)
-            elif zHD == 2:
-                pred[y, x] = _avg2(I, J)
-            elif zHD == 3:
-                pred[y, x] = _avg3(M, I, J)
-            elif zHD == 4:
-                pred[y, x] = _avg2(J, K)
-            elif zHD == 5:
-                pred[y, x] = _avg3(I, J, K)
-            elif zHD == 6:
-                pred[y, x] = _avg2(K, L)
-            elif zHD == 7:
-                pred[y, x] = _avg3(J, K, L)
+            if zHD >= 0 and zHD % 2 == 0:
+                idx = y - (x >> 1)
+                pred[y, x] = (p_left[idx - 1] + p_left[idx] + 1) >> 1
+            elif zHD >= 0 and zHD % 2 == 1:
+                idx = y - (x >> 1)
+                pred[y, x] = (p_left[idx - 2] + 2 * p_left[idx - 1] + p_left[idx] + 2) >> 2
             elif zHD == -1:
-                pred[y, x] = _avg3(M, A, B)
-            elif zHD == -2:
-                pred[y, x] = _avg3(A, B, C)
-            elif zHD == -3:
-                pred[y, x] = _avg3(B, C, D)
-            else:
-                pred[y, x] = _avg3(C, D, D)
+                pred[y, x] = (p_top[0] + p_top[-1] + 1) >> 1
+            else:  # zHD in {-2, -3}
+                pred[y, x] = (p_top[x - 1] + 2 * p_top[x - 2] + p_top[x - 3] + 2) >> 2
 
     return np.clip(pred, 0, 255).astype(np.uint8)
 
