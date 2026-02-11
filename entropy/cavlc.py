@@ -81,7 +81,7 @@ def _compute_level_code(level_prefix: int, suffix_length: int, level_suffix: int
     Returns:
         level_code value
 
-    H.264 Spec Section 9.2.2:
+    H.264 Spec Section 9.2.2 (ITU-T H.264):
         levelCode = (Min(15, level_prefix) << suffixLength) + level_suffix
         if level_prefix >= 15 && suffixLength == 0: levelCode += 15
         if level_prefix >= 16: levelCode += (1 << (level_prefix - 3)) - 4096
@@ -324,7 +324,7 @@ def decode_levels(
         if level_prefix == 14 and suffix_length == 0:
             suffix_bits = 4
         elif level_prefix >= 15:
-            # Escape: ALWAYS use level_prefix - 3, regardless of suffix_length
+            # Escape: level_prefix - 3 bits (per ITU-T H.264 Section 9.2.2)
             suffix_bits = level_prefix - 3
         else:
             suffix_bits = suffix_length

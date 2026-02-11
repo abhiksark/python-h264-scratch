@@ -68,32 +68,32 @@ def test_total_zeros_TC2_code_111():
     assert reader.position == 3
 
 
-def test_total_zeros_TC2_code_001():
-    """total_zeros with TC=2, code '001' -> TZ=6, 3 bits.
+def test_total_zeros_TC2_code_0100():
+    """total_zeros with TC=2, code '0100' -> TZ=6, 4 bits.
 
-    From H.264 Table 9-8: TC=2, TZ=6 -> (0b001, 3)
+    From H.264 Table 9-7: TC=2, TZ=6 -> (0b0100, 4) (verified against JM)
     """
-    data = bytes([0b00100000])
+    data = bytes([0b01000000])
     reader = BitReader(data)
 
     tz = decode_total_zeros(reader, total_coeff=2, max_coeffs=16)
 
     assert tz == 6
-    assert reader.position == 3
+    assert reader.position == 4
 
 
-def test_total_zeros_TC2_code_00000000001():
-    """total_zeros with TC=2, code '00000000001' -> TZ=14, 11 bits.
+def test_total_zeros_TC2_code_000000():
+    """total_zeros with TC=2, code '000000' -> TZ=14, 6 bits.
 
-    From H.264 Table 9-7/9-8: TC=2, TZ=14 -> (0b00000000001, 11)
+    From H.264 Table 9-7: TC=2, TZ=14 -> (0b000000, 6) (verified against JM)
     """
-    data = bytes([0b00000000, 0b00100000])
+    data = bytes([0b00000000])
     reader = BitReader(data)
 
     tz = decode_total_zeros(reader, total_coeff=2, max_coeffs=16)
 
     assert tz == 14
-    assert reader.position == 11
+    assert reader.position == 6
 
 
 def test_total_zeros_TC3_code_0101():
@@ -153,16 +153,16 @@ def test_total_zeros_TC4_code_00011():
 
 
 def test_total_zeros_TC5_code_00000():
-    """total_zeros with TC=5, code '00000' -> TZ=10, 5 bits.
+    """total_zeros with TC=5, code '00000' -> TZ=11, 5 bits.
 
-    From H.264 Table 9-7: TC=5, TZ=10 -> (0b00000, 5)
+    From H.264 Table 9-7: TC=5, TZ=11 -> (0b00000, 5) (verified against JM)
     """
     data = bytes([0b00000000])
     reader = BitReader(data)
 
     tz = decode_total_zeros(reader, total_coeff=5, max_coeffs=16)
 
-    assert tz == 10
+    assert tz == 11
     assert reader.position == 5
 
 
