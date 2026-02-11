@@ -42,6 +42,34 @@ from .tables import (
 logger = logging.getLogger(__name__)
 
 
+def validate_vlc_bits_consumed(
+    reader: BitReader,
+    pos_before: int,
+    expected_bits: int,
+    context: str,
+    code_value: any
+) -> None:
+    """Validate VLC decode consumed expected number of bits.
+
+    Args:
+        reader: Bit reader after VLC decode
+        pos_before: Bit position before VLC decode
+        expected_bits: Expected number of bits consumed
+        context: Description for error message (e.g., "coeff_token nC=2")
+        code_value: The decoded value
+
+    Raises:
+        ValueError: If bit consumption doesn't match expected
+    """
+    actual_bits = reader.position - pos_before
+    if actual_bits != expected_bits:
+        raise ValueError(
+            f"VLC bit consumption mismatch in {context}: "
+            f"expected {expected_bits} bits, consumed {actual_bits} bits "
+            f"(value={code_value}, pos_before={pos_before}, pos_after={reader.position})"
+        )
+
+
 def _compute_level_code(level_prefix: int, suffix_length: int, level_suffix: int) -> int:
     """Compute level_code per H.264 spec Table 9-7.
 
