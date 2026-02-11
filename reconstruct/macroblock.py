@@ -1618,8 +1618,19 @@ def decode_macroblock(
     """
     mb = MacroblockData()
 
+    # Track starting position for checkpoints
+    mb_start_pos = reader.position
+
     # Parse mb_type
     mb.mb_type = reader.read_ue()
+
+    # Checkpoint: mb_type decoded
+    if hasattr(reader, '_checkpoint_tracker'):
+        reader._checkpoint_tracker.checkpoint(
+            reader, 'mb_type',
+            mb_type_ue=mb.mb_type,
+            bits_since_start=reader.position - mb_start_pos
+        )
 
     logger.debug(f"Decoding MB ({mb_x}, {mb_y}): type={mb.mb_type}")
 
@@ -1666,6 +1677,14 @@ def decode_macroblock(
         cbp_luma, cbp_chroma = decode_cbp_intra(cbp_coded)
         mb.cbp = CodedBlockPattern(luma=cbp_luma, chroma=cbp_chroma)
 
+        # Checkpoint: CBP decoded (I_4x4)
+        if hasattr(reader, '_checkpoint_tracker'):
+            reader._checkpoint_tracker.checkpoint(
+                reader, 'cbp',
+                cbp=cbp_luma | (cbp_chroma << 4),
+                bits_since_start=reader.position - mb_start_pos
+            )
+
     else:
         # I_16x16: Extract pred_mode and CBP from mb_type
         pred_mode, cbp_luma, cbp_chroma = decode_i16x16_mb_type(mb.mb_type)
@@ -1675,6 +1694,14 @@ def decode_macroblock(
         # For I_16x16, intra_chroma_pred_mode is still parsed from bitstream
         mb.intra_chroma_pred_mode = reader.read_ue()
 
+        # Checkpoint: CBP extracted (I_16x16)
+        if hasattr(reader, '_checkpoint_tracker'):
+            reader._checkpoint_tracker.checkpoint(
+                reader, 'cbp',
+                cbp=cbp_luma | (cbp_chroma << 4),
+                bits_since_start=reader.position - mb_start_pos
+            )
+
     # Parse mb_qp_delta if any coded coefficients OR if I_16x16
     # Per H.264 spec 7.3.5: mb_qp_delta is present if:
     #   CodedBlockPatternLuma > 0 OR CodedBlockPatternChroma > 0 OR
@@ -1683,6 +1710,14 @@ def decode_macroblock(
     is_i16x16 = 1 <= mb.mb_type <= 24
     if mb.cbp.has_luma_dc or mb.cbp.has_chroma_dc or is_i16x16:
         mb.mb_qp_delta = reader.read_se()
+
+    # Checkpoint: mb_qp_delta parsed
+    if hasattr(reader, '_checkpoint_tracker'):
+        reader._checkpoint_tracker.checkpoint(
+            reader, 'mb_qp_delta',
+            qp_delta=mb.mb_qp_delta,
+            bits_since_start=reader.position - mb_start_pos
+        )
 
     # Calculate QP
     qp = slice_qp + mb.mb_qp_delta
@@ -1726,6 +1761,14 @@ def decode_macroblock(
     neighbor_tl_luma = frame_luma[luma_y - 1, luma_x - 1] if mb_y > 0 and mb_x > 0 else None
     neighbor_tl_cb = frame_cb[chroma_y - 1, chroma_x - 1] if mb_y > 0 and mb_x > 0 else None
     neighbor_tl_cr = frame_cr[chroma_y - 1, chroma_x - 1] if mb_y > 0 and mb_x > 0 else None
+
+    # Checkpoint: Start of residual decode
+    pos_before_residual = reader.position
+    if hasattr(reader, '_checkpoint_tracker'):
+        reader._checkpoint_tracker.checkpoint(
+            reader, 'residual_start',
+            bits_since_start=reader.position - mb_start_pos
+        )
 
     # Decode luma residual with state machine validation
     try:
@@ -1859,6 +1902,15 @@ def decode_macroblock(
         reader, mb.cbp.chroma, mb.nz_counts, 20,  # Cr offset
         mb_x, mb_y, frame_nz_counts, frame_width_mbs or 0
     )
+
+    # Checkpoint: End of residual decode
+    if hasattr(reader, '_checkpoint_tracker'):
+        residual_bits = reader.position - pos_before_residual
+        reader._checkpoint_tracker.checkpoint(
+            reader, 'residual_end',
+            residual_bits=residual_bits,
+            bits_since_start=reader.position - mb_start_pos
+        )
 
     # Step 5: Reconstruct Cb
     mb.cb = reconstruct_chroma_plane(
