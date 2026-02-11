@@ -141,21 +141,13 @@ def test_coeff_token_nC8_fixed_6bits_tc1_t1_0():
 
 
 def test_coeff_token_nC8_fixed_6bits_tc4_t1_1():
-    """coeff_token with nC>=8: code=17 (010001) -> TC=4, T1=1.
+    """coeff_token with nC>=8: code=13 (001101) -> TC=4, T1=1.
 
-    From Table 9-5(d): T1 = code >> 4, TC = (code & 0xF) + 1
-    code=17: T1 = 17>>4 = 1, TC = (17&0xF)+1 = 1+1 = 2
-
-    Wait, let me recalculate based on actual table...
-    Actually from spec Table 9-5(d):
-    - If code=3: TC=0, T1=0
-    - Else: T1 = (code >> 4), TC = (code & 0xF) + 1
-
-    For TC=4, T1=1, we need: T1=1 requires bit4=1, TC=4 requires lower4=3
-    So code = 0b010011 = 19
+    Per JM reference: T1 = code & 3, TC = (code >> 2) + 1
+    TC=4 -> code>>2=3, T1=1 -> code&3=1, code = (3<<2)|1 = 13
     """
-    # Fixed code 010011 = 19: T1=1, TC=4
-    data = bytes([0b01001100])
+    # Fixed code 001101 = 13: TC=4, T1=1
+    data = bytes([0b00110100])
     reader = BitReader(data)
 
     tc, t1 = decode_coeff_token(reader, nC=8)
@@ -180,10 +172,10 @@ def test_coeff_token_chroma_dc_code_1():
     assert reader.position == 1
 
 
-def test_coeff_token_chroma_dc_code_0000001():
-    """coeff_token for chroma DC (nC=-1), code '0000001' -> TC=4, T1=2, 7 bits.
+def test_coeff_token_chroma_dc_code_00000010():
+    """coeff_token for chroma DC (nC=-1), code '00000010' -> TC=4, T1=2, 8 bits.
 
-    From H.264 Table 9-5(e): (4,2) = (0b0000001, 7)
+    From H.264 Table 9-5(e) / JM reference: (4,2) = (0b00000010, 8)
     """
     data = bytes([0b00000010])
     reader = BitReader(data)
@@ -192,7 +184,7 @@ def test_coeff_token_chroma_dc_code_0000001():
 
     assert tc == 4
     assert t1 == 2
-    assert reader.position == 7
+    assert reader.position == 8
 
 
 def test_coeff_token_nC1_code_00011():

@@ -71,7 +71,7 @@ def validate_vlc_bits_consumed(
 
 
 def _compute_level_code(level_prefix: int, suffix_length: int, level_suffix: int) -> int:
-    """Compute level_code per H.264 spec Table 9-7.
+    """Compute level_code per H.264 spec Section 9.2.2.
 
     Args:
         level_prefix: Number of leading zeros in level VLC
@@ -79,26 +79,19 @@ def _compute_level_code(level_prefix: int, suffix_length: int, level_suffix: int
         level_suffix: Decoded suffix bits
 
     Returns:
-        level_code value per H.264 Table 9-7
+        level_code value
 
     H.264 Spec Section 9.2.2:
-        if( level_prefix < 15 )
-            level_code = ( level_prefix << suffixLength ) + level_suffix
-        else
-            if( suffixLength == 0 )
-                level_code = level_prefix + level_suffix
-            else
-                level_code = ( 15 << suffixLength ) + level_suffix
+        levelCode = (Min(15, level_prefix) << suffixLength) + level_suffix
+        if level_prefix >= 15 && suffixLength == 0: levelCode += 15
+        if level_prefix >= 16: levelCode += (1 << (level_prefix - 3)) - 4096
     """
-    if level_prefix < 15:
-        # Standard case: use level_prefix directly
-        return (level_prefix << suffix_length) + level_suffix
-    elif suffix_length == 0:
-        # Extended escape without suffix
-        return level_prefix + level_suffix
-    else:
-        # Extended escape with suffix: CAP level_prefix at 15
-        return (15 << suffix_length) + level_suffix
+    level_code = (min(15, level_prefix) << suffix_length) + level_suffix
+    if level_prefix >= 15 and suffix_length == 0:
+        level_code += 15
+    if level_prefix >= 16:
+        level_code += (1 << (level_prefix - 3)) - 4096
+    return level_code
 
 
 @dataclass
@@ -228,16 +221,17 @@ def decode_coeff_token(reader: BitReader, nC: int) -> Tuple[int, int]:
             reader, COEFF_TOKEN_DECODE_4, 10)
     else:
         # H.264 Table 9-5(d): Fixed 6-bit encoding for nC >= 8
-        # Special case: code=3 means TotalCoeff=0
-        # Otherwise: T1 = code >> 4, TC = (code & 0xF) + 1
+        # Per JM reference: T1 = code & 3 (bottom 2 bits),
+        # TC = (code >> 2) + 1 (top 4 bits + 1)
+        # Special case: code >> 2 == 0 AND code & 3 == 3 → TC=0, T1=0
         code = reader.read_bits(6)
         expected_bits = 6
-        if code == 3:
-            # Special case for TotalCoeff=0
+        trailing_ones = code & 3
+        tc_pre = code >> 2
+        if tc_pre == 0 and trailing_ones == 3:
             total_coeff, trailing_ones = 0, 0
         else:
-            trailing_ones = code >> 4
-            total_coeff = (code & 0xF) + 1
+            total_coeff = tc_pre + 1
         logger.debug(f"Fixed 6-bit: code={code:06b}, TC={total_coeff}, T1={trailing_ones}")
 
     # Validate bit consumption
@@ -327,15 +321,13 @@ def decode_levels(
 
         # Decode level_suffix
         # H.264 Spec 9.2.2: Determine suffix size based on level_prefix
-        # Key: Extended escape (level_prefix - 3) ONLY applies when suffix_length == 0
-        if level_prefix < 14:
+        if level_prefix == 14 and suffix_length == 0:
+            suffix_bits = 4
+        elif level_prefix >= 15:
+            # Escape: ALWAYS use level_prefix - 3, regardless of suffix_length
+            suffix_bits = level_prefix - 3
+        else:
             suffix_bits = suffix_length
-        elif level_prefix == 14:
-            # prefix=14: Use 4 bits if suffix_length=0, else use suffix_length
-            suffix_bits = 4 if suffix_length == 0 else suffix_length
-        else:  # level_prefix >= 15
-            # prefix>=15: Extended escape only when suffix_length=0
-            suffix_bits = (level_prefix - 3) if suffix_length == 0 else suffix_length
 
         if suffix_bits > 0:
             level_suffix = reader.read_bits(suffix_bits)

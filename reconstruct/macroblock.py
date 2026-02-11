@@ -1292,9 +1292,13 @@ def reconstruct_i16x16_luma(
     # AC blocks are only coded when cbp_luma bits are set
 
     # Decode DC coefficients (Hadamard-coded 4x4 block) - ALWAYS for I_16x16
-    # H.264 Spec 9.2.1: For Intra16x16DCLevel, nC is fixed at 0
-    # (DC coefficients use VLC table 0, not derived from AC neighbor context)
-    dc_block = decode_residual_block(reader, nC=0, max_coeffs=16)
+    # H.264 Spec 9.2.1: For Intra16x16DCLevel, nC is derived from neighbors
+    # using the same process as luma blocks, with blkIdx=0
+    dc_nA, dc_nB = get_luma_neighbor_nz(
+        0, mb_x, mb_y, nz_counts, frame_nz_counts, frame_width_mbs
+    )
+    dc_nC = calculate_nC(dc_nA, dc_nB)
+    dc_block = decode_residual_block(reader, nC=dc_nC, max_coeffs=16)
     # Note: DC total_coeff is NOT stored in nz_counts - those are for AC blocks only
 
     # Arrange DC coefficients in 4x4 for inverse Hadamard

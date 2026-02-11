@@ -176,7 +176,7 @@ class TestLevelBitsPrefix14:
         """
         # First level: '1' (1 bit)
         # Second level: 14 zeros + '1' + '0' (16 bits)
-        data = bytes([0b10000000, 0b00000010, 0b00000000])
+        data = bytes([0b10000000, 0b00000001, 0b00000000])
         reader = BitReader(data)
 
         levels = decode_levels(reader, total_coeff=2, trailing_ones=0)
@@ -196,10 +196,7 @@ class TestLevelBitsPrefix14:
         # First: '001' (3 bits)
         # Second: '0001' + '0' (5 bits)
         # Third: 14 zeros + '1' + '00' (17 bits)
-        data = bytes([
-            0b00100010,  # First 8 bits: '001' (3) + '0001' (4) + start of '0'
-            0b00000000, 0b00000100,  # 14 zeros + terminator + 2 suffix bits
-        ])
+        data = bytes([0b00100010, 0b00000000, 0b00000010, 0b00000000])
         reader = BitReader(data)
 
         levels = decode_levels(reader, total_coeff=3, trailing_ones=0)
@@ -248,26 +245,23 @@ class TestLevelBitsExtendedEscape:
         assert reader.position == 30
 
     def test_prefix_15_suffix_length_1(self):
-        """Level_prefix=15 with suffix_length=1 uses 1 suffix bit (NOT extended).
+        """Level_prefix=15 with suffix_length=1: ALWAYS uses level_prefix-3=12 suffix bits.
 
-        Extended escape ONLY applies when suffix_length=0.
+        Per H.264 spec 9.2.2, escape (prefix >= 15) ALWAYS reads
+        level_prefix - 3 suffix bits regardless of suffix_length.
         First level: prefix=0 -> 1 bit, suffix_length becomes 1
-        Second level: prefix=15, suffix_length=1 -> 16+1=17 bits
-        Total: 1 + 17 = 18 bits
+        Second level: prefix=15, suffix_bits=12 -> 16+12=28 bits
+        Total: 1 + 28 = 29 bits
         """
         # First: '1' (1 bit)
-        # Second: 15 zeros + '1' + '0' (17 bits)
-        data = bytes([
-            0b10000000,  # First level + start of second
-            0b00000001,  # Continue second level: 7 more zeros + terminator
-            0b00000000,  # 1 suffix bit + padding
-        ])
+        # Second: 15 zeros + '1' + 12 suffix bits (all zeros)
+        data = bytes([0b10000000, 0b00000000, 0b10000000, 0b00000000])
         reader = BitReader(data)
 
         levels = decode_levels(reader, total_coeff=2, trailing_ones=0)
 
         assert len(levels) == 2
-        assert reader.position == 18
+        assert reader.position == 29
 
     def test_prefix_20_suffix_length_0(self):
         """Level_prefix=20 with suffix_length=0 uses (20-3)=17 suffix bits.
@@ -333,26 +327,24 @@ class TestLevelBitsMultipleLevels:
         """Test reaching suffix_length=3.
 
         Suffix_length increases when abs(level) > threshold.
-        Thresholds: 0 (suffix=0), 3 (suffix=1), 6 (suffix=2), 12 (suffix=3)
+        Note: first level gets magnitude +1 adjustment (trailing_ones=0).
+
+        Level 0: prefix=4, suffix_length=0 -> 5 bits, level=4 (adjusted)
+            suffix_length: 0->1->2 (abs(4) > 3)
+        Level 1: prefix=7, suffix=01, suffix_length=2 -> 10 bits, level=-15
+            suffix_length: 2->3 (abs(15) > 6)
+        Level 2: prefix=5, suffix=000, suffix_length=3 -> 9 bits, level=21
+            suffix_length: 3->4 (abs(21) > 12)
+        Level 3: prefix=0, suffix=0000, suffix_length=4 -> 5 bits, level=1
+        Total: 5 + 10 + 9 + 5 = 29 bits
         """
-        # Start with suffix_length=0
-        # Level 1: prefix=4 -> level=3, suffix_length->1 (abs=3 > 0)
-        # Level 2: prefix=7, suffix=1 -> level=-8, suffix_length->2 (abs=8 > 3)
-        # Level 3: prefix=8, suffix=0b11 -> level magnitude > 6, suffix_length->3
-        # Level 4: prefix=0, suffix=0b101 (3 bits) -> 1+3=4 bits
-        # Simplified: just verify total bits consumed is correct
-        data = bytes([
-            0b00001000,  # Level 1: prefix=4 (4 zeros + terminator) = 5 bits
-            0b00000001,  # Level 2: prefix=7, suffix=1 (7 zeros + term + 1 suffix) = 9 bits
-            0b00000000, 0b10000000,  # Level 3, 4 (varies)
-        ])
+        data = bytes([0b00001000, 0b00001010, 0b00001000, 0b10000000])
         reader = BitReader(data)
 
         levels = decode_levels(reader, total_coeff=4, trailing_ones=0)
 
         assert len(levels) == 4
-        # Don't hardcode exact position, but verify it's reasonable
-        assert reader.position > 20  # At least the first two levels
+        assert reader.position == 29
 
 
 class TestLevelBitsTrailingOnesImpact:
@@ -432,24 +424,23 @@ class TestLevelBitsEdgeCases:
     def test_suffix_length_6_max(self):
         """Test higher suffix_length values work correctly.
 
-        Build up to suffix_length=3 to test suffix_length state transitions.
-        Level 1: prefix=6 (7 bits) -> suffix_length=1
-        Level 2: prefix=8, suffix=1 (10 bits) -> suffix_length=2
-        Level 3: prefix=10, suffix=0b11 (13 bits) -> suffix_length=3
-        Total: 7 + 10 + 13 = 30 bits
+        Build up to suffix_length=3.
+        Note: first level gets magnitude +1 adjustment (trailing_ones=0).
+
+        Level 0: prefix=6, suffix_length=0 -> 7 bits, level=5 (adjusted)
+            suffix_length: 0->1->2 (abs(5) > 3)
+        Level 1: prefix=5, suffix=00, suffix_length=2 -> 8 bits, level=11
+            suffix_length: 2->3 (abs(11) > 6)
+        Level 2: prefix=3, suffix=010, suffix_length=3 -> 7 bits, level=14
+        Total: 7 + 8 + 7 = 22 bits
         """
-        # Level 1: '0000001' (prefix=6, suffix_length=0)
-        # Level 2: '00000001' + '0' (prefix=8, suffix_length=1)
-        # Level 3: '0000000001' + '11' (prefix=10, suffix_length=2)
-        data = bytes([
-            0b00000010, 0b00000010, 0b00000000, 0b01110000
-        ])
+        data = bytes([0b00000010, 0b00001000, 0b00101000])
         reader = BitReader(data)
 
         levels = decode_levels(reader, total_coeff=3, trailing_ones=0)
 
         assert len(levels) == 3
-        assert reader.position == 30
+        assert reader.position == 22
 
     def test_no_levels_when_t1_equals_tc(self):
         """Test when all coefficients are trailing ones.
@@ -504,16 +495,16 @@ class TestLevelBitsRealWorldPatterns:
     def test_mixed_large_and_small_levels(self):
         """Test mix of large and small levels.
 
-        First level large (increases suffix_length), subsequent levels vary.
+        Level 0: prefix=2, suffix_length=0 -> 3 bits, level=3 (adjusted)
+            suffix_length: 0->1, abs(3) <= 3 -> stays 1
+        Level 1: prefix=1, suffix=0, suffix_length=1 -> 3 bits, level=2
+        Level 2: prefix=0, suffix=1, suffix_length=1 -> 2 bits, level=-1
+        Total: 3 + 3 + 2 = 8 bits
         """
-        # Level 1: prefix=5 (6 bits), suffix_length->1
-        # Level 2: prefix=1, suffix=0 (3 bits)
-        # Level 3: prefix=0, suffix=1 (2 bits)
-        # Total: 11 bits
-        data = bytes([0b00000100, 0b11000000])
+        data = bytes([0b00101011])
         reader = BitReader(data)
 
         levels = decode_levels(reader, total_coeff=3, trailing_ones=0)
 
         assert len(levels) == 3
-        assert reader.position == 11
+        assert reader.position == 8

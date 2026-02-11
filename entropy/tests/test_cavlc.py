@@ -158,9 +158,10 @@ class TestDecodeCoeffToken:
     def test_decode_nc8_fixed_nonzero(self):
         """Decode with nC>=8 (fixed length), non-zero coeffs."""
         # TotalCoeff=4, TrailingOnes=1
-        # Per H.264 Table 9-5(d): code = (T1 << 4) | (TC - 1) = (1 << 4) | 3 = 19
+        # Per JM reference: T1 = code & 3, TC = (code >> 2) + 1
+        # TC=4 -> code>>2=3, T1=1 -> code&3=1, code = (3<<2)|1 = 13
         writer = BitWriter()
-        writer.write_bits(0b010011, 6)  # code=19 -> TC=4, T1=1
+        writer.write_bits(0b001101, 6)  # code=13 -> TC=4, T1=1
         writer.write_bits(0, 2)
         data = writer.to_bytes()
 
