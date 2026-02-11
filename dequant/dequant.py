@@ -269,15 +269,14 @@ def dequant_dc_4x4(
     logger.debug(f"Dequantizing DC with QP={qp}, scale={scale}")
 
     if qp_div_6 >= 2:
-        # For qp >= 12: shift left
+        # For qp >= 12: shift left by (qp/6 - 2)
         dequant = (dc_coeffs * scale) << (qp_div_6 - 2)
-    elif qp_div_6 == 1:
-        # For 6 <= qp < 12: just multiply
-        dequant = dc_coeffs * scale
     else:
-        # For qp < 6: shift right with rounding
-        # Use C-style truncation toward zero
-        dequant = _rshift_toward_zero(dc_coeffs * scale + 1, 1)
+        # For qp < 12: shift right by (2 - qp/6) with rounding
+        # The extra /4 vs AC dequant absorbs the Hadamard *16 factor,
+        # since the IDCT >>6 only provides /64 normalization
+        rounding = 1 << (1 - qp_div_6)
+        dequant = (dc_coeffs * scale + rounding) >> (2 - qp_div_6)
 
     return dequant.astype(np.int32)
 
