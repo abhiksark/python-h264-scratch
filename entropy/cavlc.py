@@ -124,7 +124,7 @@ def _decode_coeff_token_vlc(
     reader: BitReader,
     decode_table: dict,
     max_bits: int = 16
-) -> Tuple[int, int]:
+) -> Tuple[int, int, int]:
     """Decode coeff_token using VLC table lookup.
 
     Args:
@@ -133,7 +133,7 @@ def _decode_coeff_token_vlc(
         max_bits: Maximum code length
 
     Returns:
-        Tuple of (TotalCoeff, TrailingOnes)
+        Tuple of (TotalCoeff, TrailingOnes, num_bits_consumed)
     """
     # Try progressively longer codes
     code = 0
@@ -143,7 +143,7 @@ def _decode_coeff_token_vlc(
         if (code, num_bits) in decode_table:
             tc, t1 = decode_table[(code, num_bits)]
             logger.debug(f"coeff_token: code={code:0{num_bits}b}, TC={tc}, T1={t1}")
-            return tc, t1
+            return tc, t1, num_bits
 
     raise ValueError(f"Invalid coeff_token: no match found after {max_bits} bits")
 
@@ -210,21 +210,28 @@ def decode_coeff_token(reader: BitReader, nC: int) -> Tuple[int, int]:
     x264 and other encoders use VLC table 4 for all nC >= 4. We follow this for
     maximum compatibility.
     """
+    pos_before = reader.position
     logger.debug(f"decode_coeff_token: nC={nC}")
+
     if nC == -1:
         # Chroma DC
-        return _decode_coeff_token_vlc(reader, COEFF_TOKEN_DECODE_CHROMA_DC, 8)
+        total_coeff, trailing_ones, expected_bits = _decode_coeff_token_vlc(
+            reader, COEFF_TOKEN_DECODE_CHROMA_DC, 8)
     elif nC < 2:
-        return _decode_coeff_token_vlc(reader, COEFF_TOKEN_DECODE_0, 16)
+        total_coeff, trailing_ones, expected_bits = _decode_coeff_token_vlc(
+            reader, COEFF_TOKEN_DECODE_0, 16)
     elif nC < 4:
-        return _decode_coeff_token_vlc(reader, COEFF_TOKEN_DECODE_2, 14)
+        total_coeff, trailing_ones, expected_bits = _decode_coeff_token_vlc(
+            reader, COEFF_TOKEN_DECODE_2, 14)
     elif nC < 8:
-        return _decode_coeff_token_vlc(reader, COEFF_TOKEN_DECODE_4, 10)
+        total_coeff, trailing_ones, expected_bits = _decode_coeff_token_vlc(
+            reader, COEFF_TOKEN_DECODE_4, 10)
     else:
         # H.264 Table 9-5(d): Fixed 6-bit encoding for nC >= 8
         # Special case: code=3 means TotalCoeff=0
         # Otherwise: T1 = code >> 4, TC = (code & 0xF) + 1
         code = reader.read_bits(6)
+        expected_bits = 6
         if code == 3:
             # Special case for TotalCoeff=0
             total_coeff, trailing_ones = 0, 0
@@ -232,7 +239,15 @@ def decode_coeff_token(reader: BitReader, nC: int) -> Tuple[int, int]:
             trailing_ones = code >> 4
             total_coeff = (code & 0xF) + 1
         logger.debug(f"Fixed 6-bit: code={code:06b}, TC={total_coeff}, T1={trailing_ones}")
-        return total_coeff, trailing_ones
+
+    # Validate bit consumption
+    validate_vlc_bits_consumed(
+        reader, pos_before, expected_bits,
+        context=f"coeff_token nC={nC}",
+        code_value=(total_coeff, trailing_ones)
+    )
+
+    return total_coeff, trailing_ones
 
 
 def decode_trailing_ones_signs(
