@@ -33,6 +33,9 @@ def tracked_decode(reader, sps, pps, slice_qp, mb_x, mb_y, *args, **kwargs):
     Returns:
         Result from original decode_macroblock
     """
+    # Attach tracker to reader for internal checkpoints
+    reader._checkpoint_tracker = tracker
+
     tracker.start_mb(mb_x, mb_y, reader)
     try:
         result = original_decode(reader, sps, pps, slice_qp, mb_x, mb_y, *args, **kwargs)
@@ -126,3 +129,25 @@ else:
     print("\nAverage per MB in first row: {:.1f} bits".format(first_row_consumed / 4 if mb3_0_summary else 0))
     print("Expected average per MB: ~315 bits (1260 / 4)")
     print("Excess per MB: ~{:.1f} bits".format((first_row_consumed / 4 - 315) if mb3_0_summary else 0))
+
+    # Detailed analysis of MB(1,0) - the problem MB
+    print("\n=== MB(1,0) Internal Checkpoints ===")
+    mb1_0_summary = tracker.get_mb_summary(1, 0)
+    if mb1_0_summary:
+        print(f"Total: {mb1_0_summary['consumed']} bits (pos {mb1_0_summary['start']} -> {mb1_0_summary['end']})")
+        print("\nInternal checkpoints:")
+        prev_pos = mb1_0_summary['start']
+        for cp in mb1_0_summary['checkpoints']:
+            label = cp['label']
+            pos = cp['position']
+            bits_used = pos - prev_pos
+            if label not in ['MB_START', 'MB_END']:
+                print(f"  {label:20s}: {bits_used:4d} bits (pos {prev_pos:4d} -> {pos:4d})")
+                if 'bits_since_start' in cp:
+                    print(f"                         cumulative: {cp['bits_since_start']} bits from MB start")
+            prev_pos = pos
+        print(f"\nExpected total: ~330 bits")
+        print(f"Actual total: {mb1_0_summary['consumed']} bits")
+        print(f"Excess: {mb1_0_summary['consumed'] - 330} bits")
+    else:
+        print("  No data recorded for MB(1,0)")
