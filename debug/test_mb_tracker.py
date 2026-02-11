@@ -137,11 +137,13 @@ else:
         print(f"Total: {mb1_0_summary['consumed']} bits (pos {mb1_0_summary['start']} -> {mb1_0_summary['end']})")
         print("\nInternal checkpoints:")
         prev_pos = mb1_0_summary['start']
+        block_bits = {}
         for cp in mb1_0_summary['checkpoints']:
             label = cp['label']
             pos = cp['position']
             bits_used = pos - prev_pos
             if label not in ['MB_START', 'MB_END']:
+                block_bits[label] = bits_used
                 print(f"  {label:20s}: {bits_used:4d} bits (pos {prev_pos:4d} -> {pos:4d})")
                 if 'bits_since_start' in cp:
                     print(f"                         cumulative: {cp['bits_since_start']} bits from MB start")
@@ -149,5 +151,22 @@ else:
         print(f"\nExpected total: ~330 bits")
         print(f"Actual total: {mb1_0_summary['consumed']} bits")
         print(f"Excess: {mb1_0_summary['consumed'] - 330} bits")
+
+        # Highlight excessive blocks
+        print("\n=== Block Analysis ===")
+        print("Blocks consuming >100 bits (unusual):")
+        for label, bits in block_bits.items():
+            if bits > 100:
+                print(f"  {label}: {bits} bits ← EXCESSIVE!")
+
+        # Compare chroma AC
+        if 'chroma_cb_ac' in block_bits and 'chroma_cr_ac' in block_bits:
+            cb_ac = block_bits['chroma_cb_ac']
+            cr_ac = block_bits['chroma_cr_ac']
+            print(f"\nChroma AC comparison:")
+            print(f"  Cb AC: {cb_ac} bits")
+            print(f"  Cr AC: {cr_ac} bits")
+            if cr_ac > cb_ac * 2:
+                print(f"  → Cr AC consumes {cr_ac - cb_ac} more bits than Cb AC (unusual!)")
     else:
         print("  No data recorded for MB(1,0)")

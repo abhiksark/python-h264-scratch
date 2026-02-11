@@ -1834,6 +1834,9 @@ def decode_macroblock(
             # Check if this 8x8 region has coefficients
             block_8x8_idx = block_idx // 4  # 0-3 (which quadrant)
             if mb.cbp.has_luma_8x8(block_8x8_idx):
+                # Track position before block decode
+                pos_before_block = reader.position
+
                 # Decode residual coefficients (all 16, no separate DC Hadamard for I_4x4)
                 nA, nB = get_luma_neighbor_nz(
                     block_idx, mb_x, mb_y, mb.nz_counts,
@@ -1842,6 +1845,16 @@ def decode_macroblock(
                 nC = calculate_nC(nA, nB)
                 block = decode_residual_block(reader, nC, max_coeffs=16)
                 mb.nz_counts[block_idx] = block.total_coeff
+
+                # Checkpoint: block decoded
+                if hasattr(reader, '_checkpoint_tracker'):
+                    bits_consumed = reader.position - pos_before_block
+                    reader._checkpoint_tracker.checkpoint(
+                        reader, f'luma_block_{block_idx}',
+                        block_idx=block_idx,
+                        bits=bits_consumed,
+                        total_coeff=block.total_coeff
+                    )
 
                 # Dequantize and inverse transform
                 if block.total_coeff > 0:
@@ -1879,10 +1892,22 @@ def decode_macroblock(
         raise
 
     # Step 1: Decode Cb DC
+    pos_before_cb_dc = reader.position
     cb_dc_dequant = decode_chroma_dc(reader, mb.cbp.chroma, qp_chroma)
+    if hasattr(reader, '_checkpoint_tracker'):
+        reader._checkpoint_tracker.checkpoint(
+            reader, 'chroma_cb_dc',
+            bits=reader.position - pos_before_cb_dc
+        )
 
     # Step 2: Decode Cr DC
+    pos_before_cr_dc = reader.position
     cr_dc_dequant = decode_chroma_dc(reader, mb.cbp.chroma, qp_chroma)
+    if hasattr(reader, '_checkpoint_tracker'):
+        reader._checkpoint_tracker.checkpoint(
+            reader, 'chroma_cr_dc',
+            bits=reader.position - pos_before_cr_dc
+        )
 
     # Decode chroma AC with state machine validation
     try:
@@ -1892,16 +1917,28 @@ def decode_macroblock(
         raise
 
     # Step 3: Decode Cb AC (4 blocks)
+    pos_before_cb_ac = reader.position
     cb_ac_blocks = decode_chroma_ac(
         reader, mb.cbp.chroma, mb.nz_counts, 16,  # Cb offset
         mb_x, mb_y, frame_nz_counts, frame_width_mbs or 0
     )
+    if hasattr(reader, '_checkpoint_tracker'):
+        reader._checkpoint_tracker.checkpoint(
+            reader, 'chroma_cb_ac',
+            bits=reader.position - pos_before_cb_ac
+        )
 
     # Step 4: Decode Cr AC (4 blocks)
+    pos_before_cr_ac = reader.position
     cr_ac_blocks = decode_chroma_ac(
         reader, mb.cbp.chroma, mb.nz_counts, 20,  # Cr offset
         mb_x, mb_y, frame_nz_counts, frame_width_mbs or 0
     )
+    if hasattr(reader, '_checkpoint_tracker'):
+        reader._checkpoint_tracker.checkpoint(
+            reader, 'chroma_cr_ac',
+            bits=reader.position - pos_before_cr_ac
+        )
 
     # Checkpoint: End of residual decode
     if hasattr(reader, '_checkpoint_tracker'):
