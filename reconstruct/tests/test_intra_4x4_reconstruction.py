@@ -90,7 +90,7 @@ class TestDecodeIntra4x4PredModes:
         reader = BitReader(writer.to_bytes())
 
         # With no prior context, predicted mode is typically DC (mode 2)
-        modes = decode_intra4x4_pred_modes(reader, neighbor_modes=None)
+        modes = decode_intra4x4_pred_modes(reader)
 
         assert len(modes) == 16
         # All modes should be the predicted mode (min of left and top)
@@ -110,7 +110,7 @@ class TestDecodeIntra4x4PredModes:
         writer.write_bits(0, 8)  # Padding
         reader = BitReader(writer.to_bytes())
 
-        modes = decode_intra4x4_pred_modes(reader, neighbor_modes=None)
+        modes = decode_intra4x4_pred_modes(reader)
 
         assert len(modes) == 16
         # First two blocks should have explicit modes
@@ -129,7 +129,7 @@ class TestDecodeIntra4x4PredModes:
         writer.write_bits(0, 8)  # Padding
         reader = BitReader(writer.to_bytes())
 
-        modes = decode_intra4x4_pred_modes(reader, neighbor_modes=None)
+        modes = decode_intra4x4_pred_modes(reader)
 
         assert len(modes) == 16
         # All should be DC mode (2) - predicted mode when neighbors unavailable

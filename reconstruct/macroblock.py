@@ -438,7 +438,10 @@ def get_chroma_neighbor_nz(
 
 def decode_intra4x4_pred_modes(
     reader: BitReader,
-    neighbor_modes: Optional[List[int]] = None,
+    mb_x: int = 0,
+    mb_y: int = 0,
+    frame_intra_modes: Optional[np.ndarray] = None,
+    frame_width_mbs: int = 0,
 ) -> List[int]:
     """Decode 16 Intra_4x4 prediction modes from bitstream.
 
@@ -448,40 +451,61 @@ def decode_intra4x4_pred_modes(
     - rem_intra4x4_pred_mode: if flag=0, provides mode (3 bits)
 
     The predicted mode is min(modeA, modeB) where A and B are
-    left and top neighbor block modes.
+    left and top neighbor block modes. For blocks at MB edges,
+    actual modes from neighboring MBs are used when available.
 
     Args:
         reader: Bit reader positioned at prediction mode data
-        neighbor_modes: Modes from neighboring MBs (for blocks on edge)
+        mb_x: Current MB column index
+        mb_y: Current MB row index
+        frame_intra_modes: Per-MB intra modes array, shape (num_mbs, 16).
+            -1 means non-I4x4 (use DC default).
+        frame_width_mbs: Picture width in macroblocks
 
     Returns:
         List of 16 prediction modes (0-8)
     """
     modes = []
-    # Track modes as we decode for prediction
     decoded_modes = {}  # block_idx -> mode
 
     for block_idx in range(16):
-        # Get predicted mode from neighbors
         row, col = BLOCK_SCAN_ORDER[block_idx]
 
-        # Find left neighbor mode
+        # Find left neighbor mode (H.264 Section 8.3.1.1)
         if col > 0:
             # Left neighbor is within this MB
             left_idx = _find_block_at_position(row, col - 4)
-            mode_a = decoded_modes.get(left_idx, 2)  # Default DC
+            mode_a = decoded_modes.get(left_idx, 2)
+        elif mb_x > 0 and frame_intra_modes is not None:
+            # Left neighbor from adjacent MB: rightmost column (col=12), same row
+            left_mb_idx = mb_y * frame_width_mbs + (mb_x - 1)
+            # Find block at (row, 12) in the left MB
+            left_block_idx = BLOCK_IDX_FROM_POS.get((row // 4, 3))
+            if left_block_idx is not None:
+                stored = int(frame_intra_modes[left_mb_idx, left_block_idx])
+                mode_a = stored if stored >= 0 else 2
+            else:
+                mode_a = 2
         else:
-            # Left neighbor from external MB (or unavailable)
-            mode_a = 2  # DC as default
+            mode_a = 2  # DC for unavailable neighbors
 
-        # Find top neighbor mode
+        # Find top neighbor mode (H.264 Section 8.3.1.1)
         if row > 0:
             # Top neighbor is within this MB
             top_idx = _find_block_at_position(row - 4, col)
-            mode_b = decoded_modes.get(top_idx, 2)  # Default DC
+            mode_b = decoded_modes.get(top_idx, 2)
+        elif mb_y > 0 and frame_intra_modes is not None:
+            # Top neighbor from adjacent MB: bottom row (row=12), same column
+            top_mb_idx = (mb_y - 1) * frame_width_mbs + mb_x
+            # Find block at (12, col) in the top MB
+            top_block_idx = BLOCK_IDX_FROM_POS.get((3, col // 4))
+            if top_block_idx is not None:
+                stored = int(frame_intra_modes[top_mb_idx, top_block_idx])
+                mode_b = stored if stored >= 0 else 2
+            else:
+                mode_b = 2
         else:
-            # Top neighbor from external MB (or unavailable)
-            mode_b = 2  # DC as default
+            mode_b = 2  # DC for unavailable neighbors
 
         predicted_mode = min(mode_a, mode_b)
 
@@ -1476,13 +1500,114 @@ def decode_chroma_ac(
     return ac_blocks
 
 
+def predict_intra_chroma_8x8(
+    pred_mode: int,
+    neighbors_top: Optional[np.ndarray],
+    neighbors_left: Optional[np.ndarray],
+    neighbor_top_left: Optional[int] = None,
+) -> np.ndarray:
+    """Generate 8x8 intra chroma prediction block.
+
+    H.264 Spec Section 8.3.4: Intra prediction for chroma samples.
+    Modes: 0=DC, 1=Horizontal, 2=Vertical, 3=Plane.
+
+    Args:
+        pred_mode: Intra chroma prediction mode (0-3)
+        neighbors_top: Top neighbor pixels (8,) or None
+        neighbors_left: Left neighbor pixels (8,) or None
+        neighbor_top_left: Top-left pixel or None
+
+    Returns:
+        8x8 prediction block (int32)
+    """
+    top_available = neighbors_top is not None
+    left_available = neighbors_left is not None
+
+    if pred_mode == 0:  # DC
+        prediction = np.zeros((8, 8), dtype=np.int32)
+        if top_available and left_available:
+            # H.264 Section 8.3.4.1: Per-sub-block DC prediction
+            # Top-left: avg(top[0:4] + left[0:4])
+            tl_dc = (int(np.sum(neighbors_top[:4])) + int(np.sum(neighbors_left[:4])) + 4) >> 3
+            # Top-right: only top[4:8] (left not adjacent to this sub-block)
+            tr_dc = (int(np.sum(neighbors_top[4:8])) + 2) >> 2
+            # Bottom-left: only left[4:8] (top not adjacent to this sub-block)
+            bl_dc = (int(np.sum(neighbors_left[4:8])) + 2) >> 2
+            # Bottom-right: avg(top[4:8] + left[4:8])
+            br_dc = (int(np.sum(neighbors_top[4:8])) + int(np.sum(neighbors_left[4:8])) + 4) >> 3
+            prediction[0:4, 0:4] = tl_dc
+            prediction[0:4, 4:8] = tr_dc
+            prediction[4:8, 0:4] = bl_dc
+            prediction[4:8, 4:8] = br_dc
+        elif top_available:
+            dc_left = (int(np.sum(neighbors_top[:4])) + 2) >> 2
+            dc_right = (int(np.sum(neighbors_top[4:8])) + 2) >> 2
+            prediction[:, 0:4] = dc_left
+            prediction[:, 4:8] = dc_right
+        elif left_available:
+            dc_top = (int(np.sum(neighbors_left[:4])) + 2) >> 2
+            dc_bottom = (int(np.sum(neighbors_left[4:8])) + 2) >> 2
+            prediction[0:4, :] = dc_top
+            prediction[4:8, :] = dc_bottom
+        else:
+            prediction[:, :] = 128
+        return prediction
+
+    elif pred_mode == 1:  # Horizontal
+        prediction = np.zeros((8, 8), dtype=np.int32)
+        if left_available:
+            for y in range(8):
+                prediction[y, :] = int(neighbors_left[y])
+        else:
+            prediction[:, :] = 128
+        return prediction
+
+    elif pred_mode == 2:  # Vertical
+        prediction = np.zeros((8, 8), dtype=np.int32)
+        if top_available:
+            for x in range(8):
+                prediction[:, x] = int(neighbors_top[x])
+        else:
+            prediction[:, :] = 128
+        return prediction
+
+    elif pred_mode == 3:  # Plane
+        prediction = np.zeros((8, 8), dtype=np.int32)
+        if top_available and left_available:
+            tl = int(neighbor_top_left) if neighbor_top_left is not None else 128
+            # H and V parameters (H.264 Section 8.3.4.4)
+            H = 0
+            for x_prime in range(4):
+                H += (x_prime + 1) * (int(neighbors_top[4 + x_prime]) - int(neighbors_top[2 - x_prime]))
+            V = 0
+            for y_prime in range(4):
+                V += (y_prime + 1) * (int(neighbors_left[4 + y_prime]) - int(neighbors_left[2 - y_prime]))
+
+            a = 16 * (int(neighbors_left[7]) + int(neighbors_top[7]))
+            b = (34 * H + 32) >> 6
+            c = (34 * V + 32) >> 6
+
+            for y in range(8):
+                for x in range(8):
+                    val = (a + b * (x - 3) + c * (y - 3) + 16) >> 5
+                    prediction[y, x] = max(0, min(255, val))
+        else:
+            prediction[:, :] = 128
+        return prediction
+
+    else:
+        raise ValueError(f"Invalid chroma prediction mode: {pred_mode}")
+
+
 def reconstruct_chroma_plane(
     dc_dequant: Optional[np.ndarray],
     ac_blocks: List[CAVLCBlock],
     cbp_chroma: int,
     qp_chroma: int,
+    pred_mode: int,
     neighbors_top: Optional[np.ndarray],
     neighbors_left: Optional[np.ndarray],
+    neighbor_top_left: Optional[int] = None,
 ) -> np.ndarray:
     """Reconstruct 8x8 chroma component from decoded DC and AC.
 
@@ -1491,28 +1616,18 @@ def reconstruct_chroma_plane(
         ac_blocks: List of 4 AC blocks (or empty list)
         cbp_chroma: Chroma CBP
         qp_chroma: Chroma QP
+        pred_mode: Intra chroma prediction mode (0-3)
         neighbors_top: Top neighbor pixels (8,)
         neighbors_left: Left neighbor pixels (8,)
+        neighbor_top_left: Top-left pixel or None
 
     Returns:
         Reconstructed 8x8 chroma block
     """
-    # Generate prediction
-    if neighbors_top is not None and neighbors_left is not None:
-        dc_val = (
-            int(np.sum(neighbors_top, dtype=np.int32))
-            + int(np.sum(neighbors_left, dtype=np.int32))
-            + 8
-        ) >> 4
-        prediction = np.full((8, 8), dc_val, dtype=np.int32)
-    elif neighbors_top is not None:
-        dc_val = (int(np.sum(neighbors_top, dtype=np.int32)) + 4) >> 3
-        prediction = np.full((8, 8), dc_val, dtype=np.int32)
-    elif neighbors_left is not None:
-        dc_val = (int(np.sum(neighbors_left, dtype=np.int32)) + 4) >> 3
-        prediction = np.full((8, 8), dc_val, dtype=np.int32)
-    else:
-        prediction = np.full((8, 8), 128, dtype=np.int32)
+    # Generate prediction using the actual chroma prediction mode
+    prediction = predict_intra_chroma_8x8(
+        pred_mode, neighbors_top, neighbors_left, neighbor_top_left
+    )
 
     residual = np.zeros((8, 8), dtype=np.int32)
 
@@ -1538,12 +1653,16 @@ def reconstruct_chroma_plane(
                 block_residual = idct_4x4(coeffs_dequant)
                 residual[row:row+4, col:col+4] = block_residual
         else:
-            # DC only
+            # DC only - still need IDCT normalization
             for block_idx in range(4):
                 row = (block_idx // 2) * 4
                 col = (block_idx % 2) * 4
                 dc_val = dc_dequant[block_idx // 2, block_idx % 2]
-                residual[row:row+4, col:col+4] = dc_val
+                if dc_val != 0:
+                    coeffs = np.zeros((4, 4), dtype=np.int32)
+                    coeffs[0, 0] = dc_val
+                    block_residual = idct_4x4(coeffs)
+                    residual[row:row+4, col:col+4] = block_residual
 
     reconstructed = prediction + residual
     return _clip_block(reconstructed)
@@ -1600,7 +1719,7 @@ def reconstruct_chroma(
     # Reconstruct
     return reconstruct_chroma_plane(
         dc_dequant, ac_blocks, cbp_chroma, qp_chroma,
-        neighbors_top, neighbors_left
+        pred_mode, neighbors_top, neighbors_left, neighbor_top_left
     )
 
 
@@ -1617,6 +1736,7 @@ def decode_macroblock(
     is_i_slice: bool = True,
     frame_nz_counts: Optional[np.ndarray] = None,
     frame_width_mbs: Optional[int] = None,
+    frame_intra_modes: Optional[np.ndarray] = None,
 ) -> MacroblockData:
     """Decode and reconstruct a complete macroblock.
 
@@ -1687,7 +1807,13 @@ def decode_macroblock(
             #   - prev_intra4x4_pred_mode_flag and rem_intra4x4_pred_mode parsing
             #   - predicted mode calculation from neighbors (min of left and top)
             #   - mode mapping formula: rem < pred ? rem : rem + 1
-            mb.intra_4x4_pred_modes = decode_intra4x4_pred_modes(reader, neighbor_modes=None)
+            mb.intra_4x4_pred_modes = decode_intra4x4_pred_modes(
+                reader,
+                mb_x=mb_x,
+                mb_y=mb_y,
+                frame_intra_modes=frame_intra_modes,
+                frame_width_mbs=frame_width_mbs or 0,
+            )
 
         # H.264 Table 7-3: For I_NxN, intra_chroma_pred_mode is parsed BEFORE coded_block_pattern
         # (intra_chroma_pred_mode is part of mb_pred, coded_block_pattern follows mb_pred)
@@ -1740,10 +1866,12 @@ def decode_macroblock(
             bits_since_start=reader.position - mb_start_pos
         )
 
-    # Calculate QP
-    qp = slice_qp + mb.mb_qp_delta
-    qp = max(0, min(51, qp))
-    qp_chroma = get_chroma_qp(qp)
+    # Calculate QP: delta is applied to the current QP (slice_qp param carries
+    # the running QP from the caller, not just the slice-level QP)
+    qp = (slice_qp + mb.mb_qp_delta + 52) % 52
+    chroma_qp_offset = getattr(pps, 'chroma_qp_index_offset', 0)
+    qpi = max(0, min(51, qp + chroma_qp_offset))
+    qp_chroma = get_chroma_qp(qpi)
 
     logger.debug(f"MB QP: {qp}, chroma QP: {qp_chroma}, CBP: luma={mb.cbp.luma}, chroma={mb.cbp.chroma}")
 
@@ -1973,19 +2101,27 @@ def decode_macroblock(
     # Step 5: Reconstruct Cb
     mb.cb = reconstruct_chroma_plane(
         cb_dc_dequant, cb_ac_blocks, mb.cbp.chroma, qp_chroma,
-        neighbors_top_cb, neighbors_left_cb
+        mb.intra_chroma_pred_mode,
+        neighbors_top_cb, neighbors_left_cb, neighbor_tl_cb
     )
 
     # Step 6: Reconstruct Cr
     mb.cr = reconstruct_chroma_plane(
         cr_dc_dequant, cr_ac_blocks, mb.cbp.chroma, qp_chroma,
-        neighbors_top_cr, neighbors_left_cr
+        mb.intra_chroma_pred_mode,
+        neighbors_top_cr, neighbors_left_cr, neighbor_tl_cr
     )
 
     # Write to frame buffers
     frame_luma[luma_y:luma_y + 16, luma_x:luma_x + 16] = mb.luma
     frame_cb[chroma_y:chroma_y + 8, chroma_x:chroma_x + 8] = mb.cb
     frame_cr[chroma_y:chroma_y + 8, chroma_x:chroma_x + 8] = mb.cr
+
+    # Store intra 4x4 modes for cross-MB MPM computation
+    if frame_intra_modes is not None and frame_width_mbs:
+        mb_idx = mb_y * frame_width_mbs + mb_x
+        if len(mb.intra_4x4_pred_modes) == 16:
+            frame_intra_modes[mb_idx, :] = mb.intra_4x4_pred_modes
 
     logger.debug(f"Reconstructed MB ({mb_x}, {mb_y}): luma mean={np.mean(mb.luma):.1f}")
 

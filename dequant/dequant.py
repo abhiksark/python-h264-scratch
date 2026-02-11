@@ -140,16 +140,12 @@ def dequant_4x4(
     scale_matrix = get_scale_matrix(qp)
 
     # Apply dequantization
-    # For qp >= 6: multiply then shift left
-    # For qp < 6: multiply, add rounding, shift right
-    if qp_div_6 >= 1:
-        # Shift left by (qp_div_6 - 1)
-        # Note: actual scaling depends on normative transform
-        dequant = coeffs * scale_matrix
-        dequant = dequant << (qp_div_6 - 1)
-    else:
-        # For qp < 6, scale is just the level_scale value
-        dequant = coeffs * scale_matrix
+    # H.264 Spec Section 8.5.12.1: For default flat scaling list (qmatrix=16),
+    # the formula simplifies to: d[i][j] = c[i][j] * V[i][j] * 2^(qp/6)
+    # where the >>6 normalization happens in the IDCT step
+    dequant = coeffs * scale_matrix
+    if qp_div_6 > 0:
+        dequant = dequant << qp_div_6
 
     logger.debug(f"Dequantized output:\n{dequant}")
 

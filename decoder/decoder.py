@@ -150,6 +150,10 @@ class DecoderState:
     # Non-zero coefficient counts for CAVLC context
     nz_counts: Optional[np.ndarray] = None
 
+    # Intra 4x4 prediction modes per MB for cross-MB MPM computation
+    # Shape: (num_mbs, 16) - 16 modes per MB, -1 for non-I4x4 MBs
+    intra_modes: Optional[np.ndarray] = None
+
     # Reference frame buffer for inter prediction
     ref_buffer: Optional[ReferenceFrameBuffer] = None
 
@@ -228,6 +232,9 @@ class DecoderState:
         else:  # chroma_format_idc == 3
             blocks_per_mb = 48
         self.nz_counts = np.zeros((mb_count, blocks_per_mb), dtype=np.int32)
+
+        # Intra 4x4 prediction modes: -1 means non-I4x4 (use DC default)
+        self.intra_modes = np.full((mb_count, 16), -1, dtype=np.int32)
 
         # Initialize reference frame buffer
         max_refs = sps.max_num_ref_frames if hasattr(sps, 'max_num_ref_frames') else 4
@@ -602,10 +609,14 @@ class H264Decoder:
                     is_i_slice=True,
                     frame_nz_counts=self.state.nz_counts,
                     frame_width_mbs=mb_width,
+                    frame_intra_modes=self.state.intra_modes,
                 )
 
                 # Store non-zero counts for CAVLC context
                 self.state.nz_counts[mb_idx] = mb_data.nz_counts
+
+                # Update running QP for next MB (H.264: QP is cumulative)
+                current_qp = (current_qp + mb_data.mb_qp_delta + 52) % 52
 
                 logger.debug(f"Decoded MB ({mb_x}, {mb_y}): type={mb_data.mb_type}")
 
@@ -757,9 +768,12 @@ class H264Decoder:
                     is_i_slice=False,
                     frame_nz_counts=self.state.nz_counts,
                     frame_width_mbs=mb_width,
+                    frame_intra_modes=self.state.intra_modes,
                 )
                 # Clear MV cache for intra MB
                 self.state.mv_cache.set_mv_16x16(mb_x, mb_y, 0, 0)
+                # Update running QP for next MB
+                current_qp = (current_qp + mb_data.mb_qp_delta + 52) % 52
 
             else:
                 # P-macroblock
@@ -1507,6 +1521,7 @@ class H264Decoder:
                     is_i_slice=False,
                     frame_nz_counts=self.state.nz_counts,
                     frame_width_mbs=mb_width,
+                    frame_intra_modes=self.state.intra_modes,
                 )
             else:
                 # B-macroblock

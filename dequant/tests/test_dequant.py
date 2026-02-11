@@ -105,7 +105,7 @@ class TestDequant4x4:
 
         # DC should be scaled
         assert result[0, 0] != 0
-        assert result[0, 0] == 10 * get_scale_matrix(26)[0, 0] << (26 // 6 - 1)
+        assert result[0, 0] == 10 * get_scale_matrix(26)[0, 0] << (26 // 6)
 
     def test_output_dtype(self):
         """Output should be int32."""
