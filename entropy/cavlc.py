@@ -316,7 +316,7 @@ def decode_levels(
         suffix_length = 0
 
     for i in range(num_levels):
-        pos_before = reader.position if hasattr(reader, 'position') else -1
+        pos_before = reader.position
 
         # Decode level_prefix (number of leading zeros)
         level_prefix = 0
@@ -341,6 +341,16 @@ def decode_levels(
             level_suffix = reader.read_bits(suffix_bits)
         else:
             level_suffix = 0
+
+        # Validate bit consumption: level_prefix zeros + 1 terminator + suffix_bits
+        expected_bits = level_prefix + 1 + suffix_bits
+        actual_bits = reader.position - pos_before
+        if actual_bits != expected_bits:
+            raise ValueError(
+                f"Level decode bit mismatch: expected {expected_bits} bits "
+                f"(prefix={level_prefix}, suffix_bits={suffix_bits}), "
+                f"but consumed {actual_bits} bits (pos_before={pos_before}, pos_after={reader.position})"
+            )
 
         # H.264 Spec 9.2.2: Compute level_code (see Table 9-7)
         level_code = _compute_level_code(level_prefix, suffix_length, level_suffix)
@@ -369,10 +379,8 @@ def decode_levels(
             if abs(levels[-1]) > threshold:
                 suffix_length += 1
 
-        pos_after = reader.position if hasattr(reader, 'position') else -1
-        bits_consumed = pos_after - pos_before if pos_before >= 0 else -1
         logger.debug(f"Level {i}: prefix={level_prefix}, suffix_bits={suffix_bits}, suffix={level_suffix}, "
-                    f"code={level_code}, level={level}, consumed={bits_consumed} bits, bit_pos={pos_after}")
+                    f"code={level_code}, level={level}, consumed={expected_bits} bits, bit_pos={reader.position}")
 
     return levels
 
