@@ -471,8 +471,17 @@ def _decode_run_before_vlc(
     reader: BitReader,
     decode_table: dict,
     max_bits: int = 11
-) -> int:
-    """Decode run_before using VLC table."""
+) -> Tuple[int, int]:
+    """Decode run_before using VLC table.
+
+    Args:
+        reader: Bit reader
+        decode_table: VLC decode table
+        max_bits: Maximum code length (default 11)
+
+    Returns:
+        Tuple of (run_value, num_bits_consumed)
+    """
     code = 0
     for num_bits in range(1, max_bits + 1):
         code = (code << 1) | reader.read_bit()
@@ -480,7 +489,7 @@ def _decode_run_before_vlc(
         if (code, num_bits) in decode_table:
             run = decode_table[(code, num_bits)]
             logger.debug(f"run_before: code={code:0{num_bits}b}, value={run}")
-            return run
+            return run, num_bits
 
     raise ValueError(f"Invalid run_before: no match found")
 
@@ -505,6 +514,8 @@ def decode_run_before(
     if zeros_left == 0:
         return 0
 
+    pos_before = reader.position
+
     # Use table for zerosLeft, capped at 7
     table_idx = min(zeros_left, 7)
     decode_table = RUN_BEFORE_DECODE.get(table_idx)
@@ -512,7 +523,16 @@ def decode_run_before(
     if decode_table is None:
         raise ValueError(f"No run_before table for zerosLeft={zeros_left}")
 
-    return _decode_run_before_vlc(reader, decode_table)
+    run, expected_bits = _decode_run_before_vlc(reader, decode_table)
+
+    # Validate bit consumption
+    validate_vlc_bits_consumed(
+        reader, pos_before, expected_bits,
+        context=f"run_before zeros_left={zeros_left}",
+        code_value=run
+    )
+
+    return run
 
 
 def decode_residual_block(
