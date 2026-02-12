@@ -276,7 +276,7 @@ def intra_4x4_vertical_right(
                 idx = x - (y >> 1)
                 pred[y, x] = (p_top[idx - 2] + 2 * p_top[idx - 1] + p_top[idx] + 2) >> 2
             elif zVR == -1:
-                pred[y, x] = (p_left[0] + p_left[-1] + 1) >> 1
+                pred[y, x] = (p_left[0] + 2 * p_left[-1] + p_top[0] + 2) >> 2
             else:  # zVR in {-2, -3}
                 pred[y, x] = (p_left[y - 1] + 2 * p_left[y - 2] + p_left[y - 3] + 2) >> 2
 
@@ -320,7 +320,7 @@ def intra_4x4_horizontal_down(
                 idx = y - (x >> 1)
                 pred[y, x] = (p_left[idx - 2] + 2 * p_left[idx - 1] + p_left[idx] + 2) >> 2
             elif zHD == -1:
-                pred[y, x] = (p_top[0] + p_top[-1] + 1) >> 1
+                pred[y, x] = (p_left[0] + 2 * p_left[-1] + p_top[0] + 2) >> 2
             else:  # zHD in {-2, -3}
                 pred[y, x] = (p_top[x - 1] + 2 * p_top[x - 2] + p_top[x - 3] + 2) >> 2
 

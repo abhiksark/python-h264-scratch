@@ -233,8 +233,10 @@ class DecoderState:
             blocks_per_mb = 48
         self.nz_counts = np.zeros((mb_count, blocks_per_mb), dtype=np.int32)
 
-        # Intra 4x4 prediction modes: -1 means non-I4x4 (use DC default)
-        self.intra_modes = np.full((mb_count, 16), -1, dtype=np.int32)
+        # Intra 4x4 prediction modes: initialized to DC (2) like JM reference.
+        # I_16x16 and non-intra MBs keep this default value.
+        # Only genuinely unavailable neighbors (outside picture) use -1.
+        self.intra_modes = np.full((mb_count, 16), 2, dtype=np.int32)
 
         # Initialize reference frame buffer
         max_refs = sps.max_num_ref_frames if hasattr(sps, 'max_num_ref_frames') else 4
@@ -614,6 +616,10 @@ class H264Decoder:
 
                 # Store non-zero counts for CAVLC context
                 self.state.nz_counts[mb_idx] = mb_data.nz_counts
+
+                # Store MB type for neighbor reference and diagnostics
+                if self.state.mb_types is not None:
+                    self.state.mb_types[mb_idx] = mb_data.mb_type
 
                 # Update running QP for next MB (H.264: QP is cumulative)
                 current_qp = (current_qp + mb_data.mb_qp_delta + 52) % 52

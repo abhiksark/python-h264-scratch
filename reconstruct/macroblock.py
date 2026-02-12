@@ -472,42 +472,44 @@ def decode_intra4x4_pred_modes(
         row, col = BLOCK_SCAN_ORDER[block_idx]
 
         # Find left neighbor mode (H.264 Section 8.3.1.1)
+        # Use -1 sentinel for unavailable/non-I_NxN neighbors.
+        # JM/ffmpeg rule: if either neighbor is -1, MPM = DC (mode 2).
         if col > 0:
-            # Left neighbor is within this MB
+            # Left neighbor is within this MB - always available
             left_idx = _find_block_at_position(row, col - 4)
-            mode_a = decoded_modes.get(left_idx, 2)
+            mode_a = decoded_modes.get(left_idx, -1)
         elif mb_x > 0 and frame_intra_modes is not None:
             # Left neighbor from adjacent MB: rightmost column (col=12), same row
             left_mb_idx = mb_y * frame_width_mbs + (mb_x - 1)
-            # Find block at (row, 12) in the left MB
             left_block_idx = BLOCK_IDX_FROM_POS.get((row // 4, 3))
             if left_block_idx is not None:
-                stored = int(frame_intra_modes[left_mb_idx, left_block_idx])
-                mode_a = stored if stored >= 0 else 2
+                mode_a = int(frame_intra_modes[left_mb_idx, left_block_idx])
             else:
-                mode_a = 2
+                mode_a = -1
         else:
-            mode_a = 2  # DC for unavailable neighbors
+            mode_a = -1  # Unavailable neighbor
 
         # Find top neighbor mode (H.264 Section 8.3.1.1)
         if row > 0:
-            # Top neighbor is within this MB
+            # Top neighbor is within this MB - always available
             top_idx = _find_block_at_position(row - 4, col)
-            mode_b = decoded_modes.get(top_idx, 2)
+            mode_b = decoded_modes.get(top_idx, -1)
         elif mb_y > 0 and frame_intra_modes is not None:
             # Top neighbor from adjacent MB: bottom row (row=12), same column
             top_mb_idx = (mb_y - 1) * frame_width_mbs + mb_x
-            # Find block at (12, col) in the top MB
             top_block_idx = BLOCK_IDX_FROM_POS.get((3, col // 4))
             if top_block_idx is not None:
-                stored = int(frame_intra_modes[top_mb_idx, top_block_idx])
-                mode_b = stored if stored >= 0 else 2
+                mode_b = int(frame_intra_modes[top_mb_idx, top_block_idx])
             else:
-                mode_b = 2
+                mode_b = -1
         else:
-            mode_b = 2  # DC for unavailable neighbors
+            mode_b = -1  # Unavailable neighbor
 
-        predicted_mode = min(mode_a, mode_b)
+        # If either neighbor is unavailable (-1), MPM defaults to DC
+        if mode_a < 0 or mode_b < 0:
+            predicted_mode = 2  # DC
+        else:
+            predicted_mode = min(mode_a, mode_b)
 
         # Read flag
         prev_flag = reader.read_bits(1)
@@ -1578,10 +1580,16 @@ def predict_intra_chroma_8x8(
             # H and V parameters (H.264 Section 8.3.4.4)
             H = 0
             for x_prime in range(4):
-                H += (x_prime + 1) * (int(neighbors_top[4 + x_prime]) - int(neighbors_top[2 - x_prime]))
+                if x_prime < 3:
+                    H += (x_prime + 1) * (int(neighbors_top[4 + x_prime]) - int(neighbors_top[2 - x_prime]))
+                else:  # x_prime == 3: index 2-3 = -1 means top-left pixel
+                    H += 4 * (int(neighbors_top[7]) - tl)
             V = 0
             for y_prime in range(4):
-                V += (y_prime + 1) * (int(neighbors_left[4 + y_prime]) - int(neighbors_left[2 - y_prime]))
+                if y_prime < 3:
+                    V += (y_prime + 1) * (int(neighbors_left[4 + y_prime]) - int(neighbors_left[2 - y_prime]))
+                else:  # y_prime == 3: index 2-3 = -1 means top-left pixel
+                    V += 4 * (int(neighbors_left[7]) - tl)
 
             a = 16 * (int(neighbors_left[7]) + int(neighbors_top[7]))
             b = (34 * H + 32) >> 6
@@ -1823,6 +1831,7 @@ def decode_macroblock(
         cbp_coded = reader.read_ue()
         cbp_luma, cbp_chroma = decode_cbp_intra(cbp_coded)
         mb.cbp = CodedBlockPattern(luma=cbp_luma, chroma=cbp_chroma)
+
 
         # Checkpoint: CBP decoded (I_4x4)
         if hasattr(reader, '_checkpoint_tracker'):
