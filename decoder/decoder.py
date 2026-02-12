@@ -167,6 +167,7 @@ class DecoderState:
     mb_types: Optional[np.ndarray] = None  # MB type per MB
     mb_coeffs: Optional[np.ndarray] = None  # Has non-zero coeffs per 4x4 block
     mb_cbps: Optional[np.ndarray] = None  # CBP per MB for CABAC context
+    mb_qps: Optional[np.ndarray] = None  # Per-MB QP values
 
     # Slice tracking for multiple slice support
     mb_slice_ids: Optional[np.ndarray] = None  # Which slice each MB belongs to
@@ -245,6 +246,7 @@ class DecoderState:
         # Per-MB info for deblocking
         self.mb_types = np.zeros(mb_count, dtype=np.int32)
         self.mb_coeffs = np.zeros((mb_count, blocks_per_mb), dtype=bool)
+        self.mb_qps = np.zeros(mb_count, dtype=np.int32)
         # CBP per MB for CABAC neighbor context
         self.mb_cbps = np.zeros(mb_count, dtype=np.int32)
 
@@ -529,6 +531,10 @@ class H264Decoder:
         else:  # B-slice
             self._decode_b_slice_data(reader, slice_header, sps, pps, slice_qp)
 
+        # Apply deblocking filter (in-place on frame buffers)
+        if self.deblocking_enabled and slice_header.deblocking_enabled:
+            self._deblock_frame(slice_header, sps, pps)
+
         # Return completed frame
         # For simplicity, assume each slice is a complete frame
         frame = DecodedFrame(
@@ -623,6 +629,16 @@ class H264Decoder:
 
                 # Update running QP for next MB (H.264: QP is cumulative)
                 current_qp = (current_qp + mb_data.mb_qp_delta + 52) % 52
+
+                # Store per-MB QP for deblocking filter
+                if self.state.mb_qps is not None:
+                    self.state.mb_qps[mb_idx] = current_qp
+
+                # Store per-block coefficient flags for deblocking
+                if self.state.mb_coeffs is not None:
+                    self.state.mb_coeffs[mb_idx, :16] = (
+                        mb_data.nz_counts[:16] > 0
+                    )
 
                 logger.debug(f"Decoded MB ({mb_x}, {mb_y}): type={mb_data.mb_type}")
 
@@ -1144,19 +1160,33 @@ class H264Decoder:
 
         return cb_residual, cr_residual
 
-    def _deblock_frame(self) -> None:
-        """Apply deblocking filter to the entire frame."""
-        if not self.deblocking_enabled:
-            return
+    def _deblock_frame(self, slice_header: 'SliceHeader', sps: 'SPS',
+                       pps: 'PPS' = None) -> None:
+        """Apply deblocking filter to the entire frame in-place.
 
-        from deblock.deblock import deblock_frame
+        Section 8.7: Deblocking filter modifies frame buffers in-place
+        before they are copied to the reference buffer.
+        """
+        from deblock.deblock import deblock_frame_inplace
 
-        self.state.frame_luma, self.state.frame_cb, self.state.frame_cr = deblock_frame(
-            luma=self.state.frame_luma,
-            cb=self.state.frame_cb,
-            cr=self.state.frame_cr,
-            mb_info=None,  # TODO: Pass per-MB info
-            qp=self.state.current_mb_qp,
+        mb_width = sps.pic_width_in_mbs
+        mb_height = sps.frame_height_in_mbs
+        chroma_qp_offset = pps.chroma_qp_index_offset if pps else 0
+
+        deblock_frame_inplace(
+            frame_luma=self.state.frame_luma,
+            frame_cb=self.state.frame_cb,
+            frame_cr=self.state.frame_cr,
+            mb_width=mb_width,
+            mb_height=mb_height,
+            mb_qps=self.state.mb_qps,
+            mb_types=self.state.mb_types,
+            mb_coeffs=self.state.mb_coeffs,
+            alpha_offset=slice_header.alpha_offset,
+            beta_offset=slice_header.beta_offset,
+            disable_deblocking_filter_idc=slice_header.disable_deblocking_filter_idc,
+            mb_slice_ids=self.state.mb_slice_ids,
+            chroma_qp_index_offset=chroma_qp_offset,
         )
 
     def _get_deblock_params(self, slice_header: 'SliceHeader') -> dict:

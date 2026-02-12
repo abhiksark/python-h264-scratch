@@ -1158,3 +1158,447 @@ def get_filter_edges_for_mb_pair(
             edges.append((x, 0))
 
     return edges
+
+
+# ============================================================================
+# Spec-correct in-place frame deblocking (Section 8.7)
+# ============================================================================
+
+# Spatial (row, col) -> coding scan index for 4x4 blocks
+_SPATIAL_TO_CODING = [
+    [0, 1, 4, 5],
+    [2, 3, 6, 7],
+    [8, 9, 12, 13],
+    [10, 11, 14, 15],
+]
+
+
+def _get_bs_for_edge(
+    is_mb_edge: bool,
+    is_intra_p: bool,
+    is_intra_q: bool,
+    has_coeff_p: bool,
+    has_coeff_q: bool,
+) -> int:
+    """Compute boundary strength for one 4x4 block pair.
+
+    Simplified for I-slices and the general case. For inter blocks with
+    MV/ref checking, extend this function.
+
+    Section 8.7.2.1.
+    """
+    if is_intra_p or is_intra_q:
+        return 4 if is_mb_edge else 3
+    if has_coeff_p or has_coeff_q:
+        return 2
+    # TODO: MV/ref checks for P/B slices (bS=1 or 0)
+    return 0
+
+
+def deblock_frame_inplace(
+    frame_luma: np.ndarray,
+    frame_cb: np.ndarray,
+    frame_cr: np.ndarray,
+    mb_width: int,
+    mb_height: int,
+    mb_qps: np.ndarray,
+    mb_types: np.ndarray,
+    mb_coeffs: np.ndarray,
+    alpha_offset: int = 0,
+    beta_offset: int = 0,
+    disable_deblocking_filter_idc: int = 0,
+    mb_slice_ids: Optional[np.ndarray] = None,
+    chroma_qp_index_offset: int = 0,
+) -> None:
+    """Apply H.264 deblocking filter to entire frame in-place.
+
+    Section 8.7: For each MB in raster order, filter 4 vertical edges
+    (x=0,4,8,12) then 4 horizontal edges (y=0,4,8,12). Edge at position
+    0 is the MB boundary.
+
+    The frame buffers are modified in-place. This is "in-loop" because
+    the deblocked pixels become reference data for subsequent frames.
+
+    Args:
+        frame_luma: Full luma plane (H x W), modified in-place
+        frame_cb: Full Cb plane (H/2 x W/2), modified in-place
+        frame_cr: Full Cr plane (H/2 x W/2), modified in-place
+        mb_width: Frame width in macroblocks
+        mb_height: Frame height in macroblocks
+        mb_qps: Per-MB QP values, shape (mb_count,)
+        mb_types: Per-MB type values, shape (mb_count,)
+        mb_coeffs: Per-4x4-block non-zero coeff flags, shape (mb_count, 16+)
+            Uses coding scan order indices.
+        alpha_offset: Slice alpha_c0_offset (already multiplied by 2)
+        beta_offset: Slice beta_offset (already multiplied by 2)
+        disable_deblocking_filter_idc: 0=filter all, 1=disabled, 2=no slice boundary
+        mb_slice_ids: Per-MB slice IDs for idc=2 boundary check
+        chroma_qp_index_offset: PPS chroma_qp_index_offset (-12 to +12)
+    """
+    from deblock.filter import (
+        should_filter_edge,
+        filter_luma_strong_sample,
+        filter_luma_normal_sample,
+        filter_chroma_sample,
+        filter_chroma_strong_sample,
+    )
+    from deblock.thresholds import (
+        ALPHA_TABLE, BETA_TABLE, TC0_TABLE, QPC_TABLE,
+    )
+
+    if disable_deblocking_filter_idc == 1:
+        return
+
+    def _clip51(v):
+        return max(0, min(51, v))
+
+    def _is_intra(mb_type):
+        # I_NxN (0), I_16x16 (1-24), I_PCM (25)
+        return 0 <= mb_type <= 25
+
+    def _has_coeff(mb_idx, block_row, block_col):
+        """Check if 4x4 block at spatial (row, col) has non-zero coefficients."""
+        coding_idx = _SPATIAL_TO_CODING[block_row][block_col]
+        if mb_idx < 0 or mb_idx >= len(mb_coeffs):
+            return False
+        if coding_idx < mb_coeffs.shape[1]:
+            return bool(mb_coeffs[mb_idx, coding_idx])
+        return False
+
+    for mb_y in range(mb_height):
+        for mb_x in range(mb_width):
+            mb_idx = mb_y * mb_width + mb_x
+            qp_q = int(mb_qps[mb_idx])
+            intra_q = _is_intra(int(mb_types[mb_idx]))
+
+            # --- VERTICAL EDGES (x=0,4,8,12) ---
+            for edge_i in range(4):
+                edge_x = edge_i * 4  # pixel x within MB
+                is_mb_edge = (edge_i == 0)
+                frame_x = mb_x * 16 + edge_x  # absolute pixel x in frame
+
+                # Skip MB boundary edge if no left neighbor
+                if is_mb_edge and mb_x == 0:
+                    continue
+
+                # idc=2: skip slice boundary edges
+                if is_mb_edge and disable_deblocking_filter_idc == 2:
+                    left_mb_idx = mb_y * mb_width + (mb_x - 1)
+                    if (mb_slice_ids is not None and
+                            mb_slice_ids[mb_idx] != mb_slice_ids[left_mb_idx]):
+                        continue
+
+                # Get neighbor MB info for MB boundary
+                if is_mb_edge:
+                    left_mb_idx = mb_y * mb_width + (mb_x - 1)
+                    qp_p = int(mb_qps[left_mb_idx])
+                    intra_p = _is_intra(int(mb_types[left_mb_idx]))
+                else:
+                    qp_p = qp_q
+                    intra_p = intra_q
+
+                # QP average for thresholds
+                qp_avg = (qp_p + qp_q + 1) >> 1
+                index_a = _clip51(qp_avg + alpha_offset)
+                index_b = _clip51(qp_avg + beta_offset)
+                alpha = ALPHA_TABLE[index_a]
+                beta = BETA_TABLE[index_b]
+
+                # 4 segments (groups of 4 rows)
+                for seg in range(4):
+                    # Determine bS for this segment
+                    block_row = seg  # row of 4x4 block grid
+                    q_col = edge_i  # column of q block in 4x4 grid
+
+                    if is_mb_edge:
+                        p_col = 3  # rightmost column of left MB
+                        bs = _get_bs_for_edge(
+                            True, intra_p, intra_q,
+                            _has_coeff(left_mb_idx, block_row, p_col),
+                            _has_coeff(mb_idx, block_row, q_col),
+                        )
+                    else:
+                        p_col = edge_i - 1
+                        bs = _get_bs_for_edge(
+                            False, intra_p, intra_q,
+                            _has_coeff(mb_idx, block_row, p_col),
+                            _has_coeff(mb_idx, block_row, q_col),
+                        )
+
+                    if bs == 0:
+                        continue
+
+                    # tc0 for normal filter
+                    tc0 = TC0_TABLE[index_a][min(bs, 3) - 1] if bs <= 3 else 0
+
+                    # Filter 4 rows in this segment
+                    for row_in_seg in range(4):
+                        y = mb_y * 16 + seg * 4 + row_in_seg
+                        x = frame_x
+
+                        p0 = int(frame_luma[y, x - 1])
+                        p1 = int(frame_luma[y, x - 2])
+                        q0 = int(frame_luma[y, x])
+                        q1 = int(frame_luma[y, x + 1])
+
+                        if not should_filter_edge(bs, alpha, beta, p0, p1, q0, q1):
+                            continue
+
+                        if bs == 4:
+                            p2 = int(frame_luma[y, x - 3])
+                            p3 = int(frame_luma[y, x - 4]) if x >= 4 else p2
+                            q2 = int(frame_luma[y, x + 2])
+                            q3 = int(frame_luma[y, x + 3]) if x + 3 < frame_luma.shape[1] else q2
+                            p0n, p1n, p2n, q0n, q1n, q2n = filter_luma_strong_sample(
+                                p0, p1, p2, p3, q0, q1, q2, q3, alpha, beta,
+                            )
+                            frame_luma[y, x - 1] = p0n
+                            frame_luma[y, x - 2] = p1n
+                            frame_luma[y, x - 3] = p2n
+                            frame_luma[y, x] = q0n
+                            frame_luma[y, x + 1] = q1n
+                            frame_luma[y, x + 2] = q2n
+                        else:
+                            p2 = int(frame_luma[y, x - 3])
+                            q2 = int(frame_luma[y, x + 2])
+                            p0n, p1n, q0n, q1n = filter_luma_normal_sample(
+                                p0, p1, p2, q0, q1, q2, tc0, beta,
+                            )
+                            frame_luma[y, x - 1] = p0n
+                            frame_luma[y, x - 2] = p1n
+                            frame_luma[y, x] = q0n
+                            frame_luma[y, x + 1] = q1n
+
+            # --- HORIZONTAL EDGES (y=0,4,8,12) ---
+            for edge_i in range(4):
+                edge_y = edge_i * 4
+                is_mb_edge = (edge_i == 0)
+                frame_y = mb_y * 16 + edge_y
+
+                if is_mb_edge and mb_y == 0:
+                    continue
+
+                if is_mb_edge and disable_deblocking_filter_idc == 2:
+                    top_mb_idx = (mb_y - 1) * mb_width + mb_x
+                    if (mb_slice_ids is not None and
+                            mb_slice_ids[mb_idx] != mb_slice_ids[top_mb_idx]):
+                        continue
+
+                if is_mb_edge:
+                    top_mb_idx = (mb_y - 1) * mb_width + mb_x
+                    qp_p = int(mb_qps[top_mb_idx])
+                    intra_p = _is_intra(int(mb_types[top_mb_idx]))
+                else:
+                    qp_p = qp_q
+                    intra_p = intra_q
+
+                qp_avg = (qp_p + qp_q + 1) >> 1
+                index_a = _clip51(qp_avg + alpha_offset)
+                index_b = _clip51(qp_avg + beta_offset)
+                alpha = ALPHA_TABLE[index_a]
+                beta = BETA_TABLE[index_b]
+
+                for seg in range(4):
+                    block_col = seg
+                    q_row = edge_i
+
+                    if is_mb_edge:
+                        p_row = 3
+                        bs = _get_bs_for_edge(
+                            True, intra_p, intra_q,
+                            _has_coeff(top_mb_idx, p_row, block_col),
+                            _has_coeff(mb_idx, q_row, block_col),
+                        )
+                    else:
+                        p_row = edge_i - 1
+                        bs = _get_bs_for_edge(
+                            False, intra_p, intra_q,
+                            _has_coeff(mb_idx, p_row, block_col),
+                            _has_coeff(mb_idx, q_row, block_col),
+                        )
+
+                    if bs == 0:
+                        continue
+
+                    tc0 = TC0_TABLE[index_a][min(bs, 3) - 1] if bs <= 3 else 0
+
+                    for col_in_seg in range(4):
+                        x = mb_x * 16 + seg * 4 + col_in_seg
+                        y = frame_y
+
+                        p0 = int(frame_luma[y - 1, x])
+                        p1 = int(frame_luma[y - 2, x])
+                        q0 = int(frame_luma[y, x])
+                        q1 = int(frame_luma[y + 1, x])
+
+                        if not should_filter_edge(bs, alpha, beta, p0, p1, q0, q1):
+                            continue
+
+                        if bs == 4:
+                            p2 = int(frame_luma[y - 3, x])
+                            p3 = int(frame_luma[y - 4, x]) if y >= 4 else p2
+                            q2 = int(frame_luma[y + 2, x])
+                            q3 = int(frame_luma[y + 3, x]) if y + 3 < frame_luma.shape[0] else q2
+                            p0n, p1n, p2n, q0n, q1n, q2n = filter_luma_strong_sample(
+                                p0, p1, p2, p3, q0, q1, q2, q3, alpha, beta,
+                            )
+                            frame_luma[y - 1, x] = p0n
+                            frame_luma[y - 2, x] = p1n
+                            frame_luma[y - 3, x] = p2n
+                            frame_luma[y, x] = q0n
+                            frame_luma[y + 1, x] = q1n
+                            frame_luma[y + 2, x] = q2n
+                        else:
+                            p2 = int(frame_luma[y - 3, x])
+                            q2 = int(frame_luma[y + 2, x])
+                            p0n, p1n, q0n, q1n = filter_luma_normal_sample(
+                                p0, p1, p2, q0, q1, q2, tc0, beta,
+                            )
+                            frame_luma[y - 1, x] = p0n
+                            frame_luma[y - 2, x] = p1n
+                            frame_luma[y, x] = q0n
+                            frame_luma[y + 1, x] = q1n
+
+            # --- CHROMA EDGES ---
+            # 4:2:0: 8x8 chroma per MB, 2 edges per direction
+            for plane in (frame_cb, frame_cr):
+                for edge_i in range(2):
+                    chroma_edge_x = edge_i * 4
+                    is_mb_edge = (edge_i == 0)
+                    cx = mb_x * 8 + chroma_edge_x
+
+                    if is_mb_edge and mb_x == 0:
+                        continue
+                    if is_mb_edge and disable_deblocking_filter_idc == 2:
+                        left_mb_idx = mb_y * mb_width + (mb_x - 1)
+                        if (mb_slice_ids is not None and
+                                mb_slice_ids[mb_idx] != mb_slice_ids[left_mb_idx]):
+                            continue
+
+                    if is_mb_edge:
+                        left_mb_idx = mb_y * mb_width + (mb_x - 1)
+                        qp_p_c = int(mb_qps[left_mb_idx])
+                        intra_p_c = _is_intra(int(mb_types[left_mb_idx]))
+                    else:
+                        qp_p_c = qp_q
+                        intra_p_c = intra_q
+
+                    # Chroma uses QPC for thresholds (Section 8.5.8)
+                    # Apply chroma_qp_index_offset before QPC table lookup
+                    qpc_p = QPC_TABLE[_clip51(qp_p_c + chroma_qp_index_offset)]
+                    qpc_q = QPC_TABLE[_clip51(qp_q + chroma_qp_index_offset)]
+                    qpc_avg = (qpc_p + qpc_q + 1) >> 1
+                    c_index_a = _clip51(qpc_avg + alpha_offset)
+                    c_alpha = ALPHA_TABLE[c_index_a]
+                    c_beta = BETA_TABLE[_clip51(qpc_avg + beta_offset)]
+
+                    # 4 segments of 2 rows each (8 rows total)
+                    # Each segment maps to one luma block row
+                    for seg in range(4):
+                        luma_row = seg
+                        luma_q_col = edge_i * 2
+
+                        if is_mb_edge:
+                            luma_p_col = 3
+                            bs = _get_bs_for_edge(True, intra_p_c, intra_q,
+                                _has_coeff(left_mb_idx, luma_row, luma_p_col),
+                                _has_coeff(mb_idx, luma_row, luma_q_col))
+                        else:
+                            luma_p_col = edge_i * 2 - 1
+                            bs = _get_bs_for_edge(False, intra_p_c, intra_q,
+                                _has_coeff(mb_idx, luma_row, luma_p_col),
+                                _has_coeff(mb_idx, luma_row, luma_q_col))
+
+                        if bs == 0:
+                            continue
+
+                        c_tc0 = TC0_TABLE[c_index_a][min(bs, 3) - 1] if bs <= 3 else 0
+
+                        for row_in_seg in range(2):
+                            cy = mb_y * 8 + seg * 2 + row_in_seg
+                            p0 = int(plane[cy, cx - 1])
+                            p1 = int(plane[cy, cx - 2]) if cx >= 2 else p0
+                            q0 = int(plane[cy, cx])
+                            q1 = int(plane[cy, cx + 1]) if cx + 1 < plane.shape[1] else q0
+
+                            if not should_filter_edge(bs, c_alpha, c_beta, p0, p1, q0, q1):
+                                continue
+
+                            if bs < 4:
+                                p0n, q0n = filter_chroma_sample(p0, p1, q0, q1, c_tc0)
+                            else:
+                                p0n, q0n = filter_chroma_strong_sample(p0, p1, q0, q1)
+
+                            plane[cy, cx - 1] = p0n
+                            plane[cy, cx] = q0n
+
+                # Horizontal chroma edges
+                for edge_i in range(2):
+                    chroma_edge_y = edge_i * 4
+                    is_mb_edge = (edge_i == 0)
+                    cy = mb_y * 8 + chroma_edge_y
+
+                    if is_mb_edge and mb_y == 0:
+                        continue
+                    if is_mb_edge and disable_deblocking_filter_idc == 2:
+                        top_mb_idx = (mb_y - 1) * mb_width + mb_x
+                        if (mb_slice_ids is not None and
+                                mb_slice_ids[mb_idx] != mb_slice_ids[top_mb_idx]):
+                            continue
+
+                    if is_mb_edge:
+                        top_mb_idx = (mb_y - 1) * mb_width + mb_x
+                        qp_p_c = int(mb_qps[top_mb_idx])
+                        intra_p_c = _is_intra(int(mb_types[top_mb_idx]))
+                    else:
+                        qp_p_c = qp_q
+                        intra_p_c = intra_q
+
+                    # Chroma uses QPC for thresholds (Section 8.5.8)
+                    # Apply chroma_qp_index_offset before QPC table lookup
+                    qpc_p = QPC_TABLE[_clip51(qp_p_c + chroma_qp_index_offset)]
+                    qpc_q = QPC_TABLE[_clip51(qp_q + chroma_qp_index_offset)]
+                    qpc_avg = (qpc_p + qpc_q + 1) >> 1
+                    c_index_a = _clip51(qpc_avg + alpha_offset)
+                    c_alpha = ALPHA_TABLE[c_index_a]
+                    c_beta = BETA_TABLE[_clip51(qpc_avg + beta_offset)]
+
+                    # 4 segments of 2 cols each (8 cols total)
+                    # Each segment maps to one luma block column
+                    for seg in range(4):
+                        luma_col = seg
+                        luma_q_row = edge_i * 2
+
+                        if is_mb_edge:
+                            luma_p_row = 3
+                            bs = _get_bs_for_edge(True, intra_p_c, intra_q,
+                                _has_coeff(top_mb_idx, luma_p_row, luma_col),
+                                _has_coeff(mb_idx, luma_q_row, luma_col))
+                        else:
+                            luma_p_row = edge_i * 2 - 1
+                            bs = _get_bs_for_edge(False, intra_p_c, intra_q,
+                                _has_coeff(mb_idx, luma_p_row, luma_col),
+                                _has_coeff(mb_idx, luma_q_row, luma_col))
+
+                        if bs == 0:
+                            continue
+
+                        c_tc0 = TC0_TABLE[c_index_a][min(bs, 3) - 1] if bs <= 3 else 0
+
+                        for col_in_seg in range(2):
+                            cx = mb_x * 8 + seg * 2 + col_in_seg
+                            p0 = int(plane[cy - 1, cx])
+                            p1 = int(plane[cy - 2, cx]) if cy >= 2 else p0
+                            q0 = int(plane[cy, cx])
+                            q1 = int(plane[cy + 1, cx]) if cy + 1 < plane.shape[0] else q0
+
+                            if not should_filter_edge(bs, c_alpha, c_beta, p0, p1, q0, q1):
+                                continue
+
+                            if bs < 4:
+                                p0n, q0n = filter_chroma_sample(p0, p1, q0, q1, c_tc0)
+                            else:
+                                p0n, q0n = filter_chroma_strong_sample(p0, p1, q0, q1)
+
+                            plane[cy - 1, cx] = p0n
+                            plane[cy, cx] = q0n
