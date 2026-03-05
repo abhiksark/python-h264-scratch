@@ -72,13 +72,21 @@ from inter.p_reconstruct import (
     reconstruct_p_8x8,
     reconstruct_p_8x8_weighted,
 )
-from inter.b_macroblock import parse_b_mb_type, get_b_skip_info
+from inter.b_macroblock import (
+    parse_b_mb_type,
+    get_b_skip_info,
+    get_partition_pred_modes,
+    parse_b_sub_mb_type,
+)
 from inter.b_reconstruct import (
     reconstruct_b_skip,
     reconstruct_b_l0_16x16,
     reconstruct_b_l1_16x16,
     reconstruct_b_bi_16x16,
     reconstruct_b_direct_16x16,
+    reconstruct_b_16x8,
+    reconstruct_b_8x16,
+    reconstruct_b_8x8,
 )
 from entropy.cabac_arith import CABACDecoder
 from entropy.cabac_context import init_context_models
@@ -1054,6 +1062,10 @@ class H264Decoder:
                     frame_num=slice_header.frame_num,
                     use_weighted_pred=use_weighted_pred,
                     weight_table=weight_table,
+                    num_ref_idx_active=getattr(
+                        slice_header,
+                        'num_ref_idx_l0_active_minus1', 0
+                    ) + 1,
                 )
 
             mb_idx += 1
@@ -1070,6 +1082,7 @@ class H264Decoder:
         frame_num: Optional[int] = None,
         use_weighted_pred: bool = False,
         weight_table: Optional['WeightTable'] = None,
+        num_ref_idx_active: Optional[int] = None,
     ) -> int:
         """Decode a single P-macroblock.
 
@@ -1115,10 +1128,16 @@ class H264Decoder:
 
         # ── Step 1: Parse MVs and do motion compensation (partition-specific) ──
 
+        # Number of active L0 references for syntax parsing
+        if num_ref_idx_active is None:
+            num_refs = len(self.state.ref_buffer) if self.state.ref_buffer else 1
+        else:
+            num_refs = num_ref_idx_active
+
         if mb_type.name == "P_L0_16x16":
             ref_idx = 0
-            if self.state.ref_buffer is not None and len(self.state.ref_buffer) > 1:
-                ref_idx = reader.read_te(len(self.state.ref_buffer) - 1)
+            if num_refs > 1:
+                ref_idx = reader.read_te(num_refs - 1)
 
             mvd_x = reader.read_se()
             mvd_y = reader.read_se()
@@ -1181,7 +1200,6 @@ class H264Decoder:
             ref_idx = [0, 0]
             mvx = [0, 0]
             mvy = [0, 0]
-            num_refs = len(self.state.ref_buffer) if self.state.ref_buffer else 1
             if num_refs > 1:
                 ref_idx[0] = reader.read_te(num_refs - 1)
                 ref_idx[1] = reader.read_te(num_refs - 1)
@@ -1262,7 +1280,6 @@ class H264Decoder:
             ref_idx = [0, 0]
             mvx = [0, 0]
             mvy = [0, 0]
-            num_refs = len(self.state.ref_buffer) if self.state.ref_buffer else 1
             if num_refs > 1:
                 ref_idx[0] = reader.read_te(num_refs - 1)
                 ref_idx[1] = reader.read_te(num_refs - 1)
@@ -1346,7 +1363,6 @@ class H264Decoder:
             mvy = [0, 0, 0, 0]
             for i in range(4):
                 sub_mb_types.append(reader.read_ue())
-            num_refs = len(self.state.ref_buffer) if self.state.ref_buffer else 1
             if mb_type.name == "P_8x8" and num_refs > 1:
                 for i in range(4):
                     ref_idx[i] = reader.read_te(num_refs - 1)
@@ -1931,6 +1947,17 @@ class H264Decoder:
         self._build_b_slice_ref_lists(slice_header)
 
         while mb_idx < total_mbs:
+            # Check for end of data before reading mb_skip_run
+            if not reader.more_rbsp_data():
+                while mb_idx < total_mbs:
+                    mb_x = mb_idx % mb_width
+                    mb_y = mb_idx // mb_width
+                    self._process_b_skip_run(
+                        mb_x, mb_y, use_spatial, current_poc
+                    )
+                    mb_idx += 1
+                break
+
             mb_x = mb_idx % mb_width
             mb_y = mb_idx // mb_width
 
@@ -1951,8 +1978,17 @@ class H264Decoder:
                 )
                 mb_idx += 1
 
-            # After skip run, decode regular macroblock
+            # After skip run, check for end of slice (H.264 7.3.4)
             if mb_idx >= total_mbs:
+                break
+            if not reader.more_rbsp_data():
+                while mb_idx < total_mbs:
+                    mb_x = mb_idx % mb_width
+                    mb_y = mb_idx // mb_width
+                    self._process_b_skip_run(
+                        mb_x, mb_y, use_spatial, current_poc
+                    )
+                    mb_idx += 1
                 break
 
             mb_x = mb_idx % mb_width
@@ -1983,11 +2019,32 @@ class H264Decoder:
                     frame_intra_modes=self.state.intra_modes,
                     pre_parsed_mb_type=mb_type_code - 23,
                 )
+                # Update running QP for next MB
+                current_qp = (current_qp + mb_data.mb_qp_delta + 52) % 52
+
+                # Store nz_counts for CAVLC context of neighboring MBs
+                mb_idx_b = mb_y * mb_width + mb_x
+                self.state.nz_counts[mb_idx_b] = mb_data.nz_counts
+
+                # Mark intra MB in MV cache
+                if self.state.mv_cache is not None:
+                    self.state.mv_cache.mark_intra(mb_x, mb_y)
+
+                # Store deblocking metadata
+                if self.state.mb_types is not None:
+                    self.state.mb_types[mb_idx_b] = mb_data.mb_type
+                if self.state.mb_qps is not None:
+                    self.state.mb_qps[mb_idx_b] = current_qp
+                if self.state.mb_coeffs is not None:
+                    self.state.mb_coeffs[mb_idx_b, :16] = (
+                        mb_data.nz_counts[:16] > 0
+                    )
             else:
                 # B-macroblock
-                self._decode_b_macroblock(
+                current_qp = self._decode_b_macroblock(
                     reader, mb_info, mb_x, mb_y, current_qp,
-                    sps, pps, use_spatial, current_poc
+                    sps, pps, use_spatial, current_poc,
+                    slice_header,
                 )
 
             mb_idx += 1
@@ -2667,8 +2724,15 @@ class H264Decoder:
         pps: 'PPS',
         use_spatial: bool,
         current_poc: int,
-    ) -> None:
+        slice_header: 'SliceHeader' = None,
+    ) -> int:
         """Decode a single B-macroblock.
+
+        Handles all B-MB types from H.264 Table 7-14:
+        - Direct (type 0)
+        - L0/L1/Bi 16x16 (types 1-3)
+        - Partitioned 16x8/8x16 (types 4-21)
+        - Sub-partitioned 8x8 (type 22)
 
         Args:
             reader: BitReader
@@ -2678,13 +2742,31 @@ class H264Decoder:
             sps, pps: Parameter sets
             use_spatial: True for spatial direct mode
             current_poc: Picture order count
+            slice_header: Slice header (for num_ref_idx_active)
+
+        Returns:
+            Updated QP after mb_qp_delta
         """
+        mb_width = sps.pic_width_in_mbs
+        mb_idx = mb_y * mb_width + mb_x
         ly, lx = mb_y * 16, mb_x * 16
         cy, cx = mb_y * 8, mb_x * 8
 
+        # Use num_ref_idx_active from slice header (H.264 7.3.3)
+        if slice_header is not None:
+            num_l0 = getattr(slice_header, 'num_ref_idx_l0_active_minus1', 0) + 1
+            num_l1 = getattr(slice_header, 'num_ref_idx_l1_active_minus1', 0) + 1
+        else:
+            num_l0 = len(self.state.l0_list) if self.state.l0_list else 1
+            num_l1 = len(self.state.l1_list) if self.state.l1_list else 1
+
+        part_modes = get_partition_pred_modes(mb_info)
+        num_parts = mb_info.num_partitions
+        part_size = mb_info.partition_size  # (w, h)
+
         if mb_info.is_direct:
-            # B_Direct_16x16
-            luma, cb, cr = reconstruct_b_direct_16x16(
+            # B_Direct_16x16 — no ref_idx or MVD in bitstream
+            luma_pred, cb_pred, cr_pred = reconstruct_b_direct_16x16(
                 ref_buffer=self.state.ref_buffer,
                 mv_cache=self.state.mv_cache,
                 residual_luma=None,
@@ -2695,85 +2777,75 @@ class H264Decoder:
                 use_spatial=use_spatial,
                 current_poc=current_poc,
             )
-        elif mb_info.pred_mode == "L0":
-            # B_L0_16x16
-            ref_idx = 0
-            if len(self.state.l0_list) > 1:
-                ref_idx = reader.read_te(len(self.state.l0_list) - 1)
 
-            mvd_x = reader.read_se()
-            mvd_y = reader.read_se()
+        if mb_info.name == "B_8x8":
+            # ── B_8x8: sub-macroblock partition types ──
+            sub_mb_infos = []
+            for i in range(4):
+                sub_mb_infos.append(parse_b_sub_mb_type(reader.read_ue()))
 
-            mvp_x, mvp_y = predict_mv_16x16(self.state.mv_cache, mb_x, mb_y)
-            mvx = mvp_x + mvd_x
-            mvy = mvp_y + mvd_y
+            sub_pred_modes = [s.pred_mode for s in sub_mb_infos]
 
-            self.state.mv_cache.set_mv_16x16(mb_x, mb_y, mvx, mvy)
+            # ref_idx_l0 for each sub-MB
+            ref_idx_l0 = []
+            for i in range(4):
+                if not sub_mb_infos[i].is_direct and sub_pred_modes[i] in ("L0", "Bi"):
+                    ref_idx_l0.append(reader.read_te(num_l0 - 1) if num_l0 > 1 else 0)
+                else:
+                    ref_idx_l0.append(0)
 
-            luma, cb, cr = reconstruct_b_l0_16x16(
+            # ref_idx_l1 for each sub-MB
+            ref_idx_l1 = []
+            for i in range(4):
+                if not sub_mb_infos[i].is_direct and sub_pred_modes[i] in ("L1", "Bi"):
+                    ref_idx_l1.append(reader.read_te(num_l1 - 1) if num_l1 > 1 else 0)
+                else:
+                    ref_idx_l1.append(0)
+
+            # mvd_l0 for each sub-MB
+            # Must read all sub-partition MVDs for correct bit consumption
+            mvx_l0, mvy_l0 = [0] * 4, [0] * 4
+            for i in range(4):
+                if not sub_mb_infos[i].is_direct and sub_pred_modes[i] in ("L0", "Bi"):
+                    num_sub_parts = sub_mb_infos[i].num_partitions
+                    for j in range(num_sub_parts):
+                        mvd_x = reader.read_se()
+                        mvd_y = reader.read_se()
+                        if j == 0:
+                            mvp_x, mvp_y = predict_mv_8x8(
+                                self.state.mv_cache, mb_x, mb_y, i
+                            )
+                            mvx_l0[i] = mvp_x + mvd_x
+                            mvy_l0[i] = mvp_y + mvd_y
+
+            # mvd_l1 for each sub-MB
+            mvx_l1, mvy_l1 = [0] * 4, [0] * 4
+            for i in range(4):
+                if not sub_mb_infos[i].is_direct and sub_pred_modes[i] in ("L1", "Bi"):
+                    num_sub_parts = sub_mb_infos[i].num_partitions
+                    for j in range(num_sub_parts):
+                        mvd_x = reader.read_se()
+                        mvd_y = reader.read_se()
+                        if j == 0:
+                            mvx_l1[i] = mvd_x
+                            mvy_l1[i] = mvd_y
+
+            # Update MV cache with L0 MVs
+            for i in range(4):
+                if not sub_mb_infos[i].is_direct:
+                    self.state.mv_cache.set_mv_8x8(
+                        mb_x, mb_y, i, mvx_l0[i], mvy_l0[i]
+                    )
+
+            luma_pred, cb_pred, cr_pred = reconstruct_b_8x8(
                 ref_buffer=self.state.ref_buffer,
-                ref_idx=ref_idx,
-                mvx=mvx,
-                mvy=mvy,
-                residual_luma=None,
-                residual_cb=None,
-                residual_cr=None,
-                mb_x=mb_x,
-                mb_y=mb_y,
-            )
-        elif mb_info.pred_mode == "L1":
-            # B_L1_16x16
-            ref_idx = 0
-            if len(self.state.l1_list) > 1:
-                ref_idx = reader.read_te(len(self.state.l1_list) - 1)
-
-            mvd_x = reader.read_se()
-            mvd_y = reader.read_se()
-
-            # Use L1 MV prediction (simplified: same as L0 for now)
-            mvp_x, mvp_y = predict_mv_16x16(self.state.mv_cache, mb_x, mb_y)
-            mvx = mvp_x + mvd_x
-            mvy = mvp_y + mvd_y
-
-            luma, cb, cr = reconstruct_b_l1_16x16(
-                ref_buffer=self.state.ref_buffer,
-                ref_idx=ref_idx,
-                mvx=mvx,
-                mvy=mvy,
-                residual_luma=None,
-                residual_cb=None,
-                residual_cr=None,
-                mb_x=mb_x,
-                mb_y=mb_y,
-            )
-        elif mb_info.pred_mode == "Bi":
-            # B_Bi_16x16
-            ref_idx_l0 = 0
-            ref_idx_l1 = 0
-            if len(self.state.l0_list) > 1:
-                ref_idx_l0 = reader.read_te(len(self.state.l0_list) - 1)
-            if len(self.state.l1_list) > 1:
-                ref_idx_l1 = reader.read_te(len(self.state.l1_list) - 1)
-
-            # L0 MVD
-            mvd_x_l0 = reader.read_se()
-            mvd_y_l0 = reader.read_se()
-            # L1 MVD
-            mvd_x_l1 = reader.read_se()
-            mvd_y_l1 = reader.read_se()
-
-            mvp_x, mvp_y = predict_mv_16x16(self.state.mv_cache, mb_x, mb_y)
-            mvx_l0 = mvp_x + mvd_x_l0
-            mvy_l0 = mvp_y + mvd_y_l0
-            mvx_l1 = mvp_x + mvd_x_l1
-            mvy_l1 = mvp_y + mvd_y_l1
-
-            luma, cb, cr = reconstruct_b_bi_16x16(
-                ref_buffer=self.state.ref_buffer,
+                mv_cache=self.state.mv_cache,
+                sub_mb_types=[s.sub_mb_type for s in sub_mb_infos],
+                pred_modes=sub_pred_modes,
                 ref_idx_l0=ref_idx_l0,
+                ref_idx_l1=ref_idx_l1,
                 mvx_l0=mvx_l0,
                 mvy_l0=mvy_l0,
-                ref_idx_l1=ref_idx_l1,
                 mvx_l1=mvx_l1,
                 mvy_l1=mvy_l1,
                 residual_luma=None,
@@ -2782,21 +2854,234 @@ class H264Decoder:
                 mb_x=mb_x,
                 mb_y=mb_y,
             )
+
+        elif num_parts == 1:
+            # ── 16x16 modes (L0, L1, Bi) ──
+            ref_idx_l0 = [0]
+            ref_idx_l1 = [0]
+
+            if part_modes[0] in ("L0", "Bi"):
+                if num_l0 > 1:
+                    ref_idx_l0[0] = reader.read_te(num_l0 - 1)
+            if part_modes[0] in ("L1", "Bi"):
+                if num_l1 > 1:
+                    ref_idx_l1[0] = reader.read_te(num_l1 - 1)
+
+            mvx_l0, mvy_l0 = [0], [0]
+            mvx_l1, mvy_l1 = [0], [0]
+
+            if part_modes[0] in ("L0", "Bi"):
+                mvd_x = reader.read_se()
+                mvd_y = reader.read_se()
+                mvp_x, mvp_y = predict_mv_16x16(
+                    self.state.mv_cache, mb_x, mb_y
+                )
+                mvx_l0[0] = mvp_x + mvd_x
+                mvy_l0[0] = mvp_y + mvd_y
+
+            if part_modes[0] in ("L1", "Bi"):
+                mvd_x = reader.read_se()
+                mvd_y = reader.read_se()
+                # Simplified L1 prediction
+                mvx_l1[0] = mvd_x
+                mvy_l1[0] = mvd_y
+
+            # Store L0 MV in cache
+            if part_modes[0] in ("L0", "Bi"):
+                self.state.mv_cache.set_mv_16x16(
+                    mb_x, mb_y, mvx_l0[0], mvy_l0[0]
+                )
+
+            if part_modes[0] == "L0":
+                luma_pred, cb_pred, cr_pred = reconstruct_b_l0_16x16(
+                    ref_buffer=self.state.ref_buffer,
+                    ref_idx=ref_idx_l0[0],
+                    mvx=mvx_l0[0], mvy=mvy_l0[0],
+                    residual_luma=None, residual_cb=None, residual_cr=None,
+                    mb_x=mb_x, mb_y=mb_y,
+                )
+            elif part_modes[0] == "L1":
+                luma_pred, cb_pred, cr_pred = reconstruct_b_l1_16x16(
+                    ref_buffer=self.state.ref_buffer,
+                    ref_idx=ref_idx_l1[0],
+                    mvx=mvx_l1[0], mvy=mvy_l1[0],
+                    residual_luma=None, residual_cb=None, residual_cr=None,
+                    mb_x=mb_x, mb_y=mb_y,
+                )
+            else:  # Bi
+                luma_pred, cb_pred, cr_pred = reconstruct_b_bi_16x16(
+                    ref_buffer=self.state.ref_buffer,
+                    ref_idx_l0=ref_idx_l0[0],
+                    mvx_l0=mvx_l0[0], mvy_l0=mvy_l0[0],
+                    ref_idx_l1=ref_idx_l1[0],
+                    mvx_l1=mvx_l1[0], mvy_l1=mvy_l1[0],
+                    residual_luma=None, residual_cb=None, residual_cr=None,
+                    mb_x=mb_x, mb_y=mb_y,
+                )
+
         else:
-            # Fallback to direct mode
-            logger.warning(f"Unsupported B-MB pred_mode: {mb_info.pred_mode}")
-            luma, cb, cr = reconstruct_b_skip(
-                ref_buffer=self.state.ref_buffer,
-                mv_cache=self.state.mv_cache,
-                mb_x=mb_x,
-                mb_y=mb_y,
-                use_spatial=use_spatial,
-                current_poc=current_poc,
+            # ── Partitioned modes: 16x8 or 8x16 (types 4-21) ──
+            ref_idx_l0 = [0, 0]
+            ref_idx_l1 = [0, 0]
+
+            # Parse ref_idx — all L0 first, then all L1 (H.264 7.3.5)
+            for part in range(2):
+                if part_modes[part] in ("L0", "Bi"):
+                    if num_l0 > 1:
+                        ref_idx_l0[part] = reader.read_te(num_l0 - 1)
+            for part in range(2):
+                if part_modes[part] in ("L1", "Bi"):
+                    if num_l1 > 1:
+                        ref_idx_l1[part] = reader.read_te(num_l1 - 1)
+
+            # Parse MVDs — all L0 first, then all L1
+            mvx_l0, mvy_l0 = [0, 0], [0, 0]
+            mvx_l1, mvy_l1 = [0, 0], [0, 0]
+
+            for part in range(2):
+                if part_modes[part] in ("L0", "Bi"):
+                    mvd_x = reader.read_se()
+                    mvd_y = reader.read_se()
+                    if part_size == (16, 8):
+                        mvp_x, mvp_y = predict_mv_16x8(
+                            self.state.mv_cache, mb_x, mb_y, part
+                        )
+                    else:
+                        mvp_x, mvp_y = predict_mv_8x16(
+                            self.state.mv_cache, mb_x, mb_y, part
+                        )
+                    mvx_l0[part] = mvp_x + mvd_x
+                    mvy_l0[part] = mvp_y + mvd_y
+
+                    # Store L0 MV immediately for next partition
+                    if part_size == (16, 8):
+                        self.state.mv_cache.set_mv_16x8(
+                            mb_x, mb_y, part, mvx_l0[part], mvy_l0[part]
+                        )
+                    else:
+                        self.state.mv_cache.set_mv_8x16(
+                            mb_x, mb_y, part, mvx_l0[part], mvy_l0[part]
+                        )
+
+            for part in range(2):
+                if part_modes[part] in ("L1", "Bi"):
+                    mvd_x = reader.read_se()
+                    mvd_y = reader.read_se()
+                    # Simplified L1 prediction
+                    mvx_l1[part] = mvd_x
+                    mvy_l1[part] = mvd_y
+
+            if part_size == (16, 8):
+                luma_pred, cb_pred, cr_pred = reconstruct_b_16x8(
+                    ref_buffer=self.state.ref_buffer,
+                    pred_modes=part_modes,
+                    ref_idx_l0=ref_idx_l0, ref_idx_l1=ref_idx_l1,
+                    mvx_l0=mvx_l0, mvy_l0=mvy_l0,
+                    mvx_l1=mvx_l1, mvy_l1=mvy_l1,
+                    residual_luma=None, residual_cb=None, residual_cr=None,
+                    mb_x=mb_x, mb_y=mb_y,
+                )
+            else:
+                luma_pred, cb_pred, cr_pred = reconstruct_b_8x16(
+                    ref_buffer=self.state.ref_buffer,
+                    pred_modes=part_modes,
+                    ref_idx_l0=ref_idx_l0, ref_idx_l1=ref_idx_l1,
+                    mvx_l0=mvx_l0, mvy_l0=mvy_l0,
+                    mvx_l1=mvx_l1, mvy_l1=mvy_l1,
+                    residual_luma=None, residual_cb=None, residual_cr=None,
+                    mb_x=mb_x, mb_y=mb_y,
+                )
+
+        # ── Parse coded_block_pattern (H.264 Table 9-4, inter column) ──
+        cbp_coded = reader.read_ue()
+        cbp_luma, cbp_chroma = decode_cbp_inter(cbp_coded)
+
+        mb_qp_delta = 0
+        if cbp_luma > 0 or cbp_chroma > 0:
+            mb_qp_delta = reader.read_se()
+        current_qp = (qp + mb_qp_delta + 52) % 52
+
+        logger.debug(
+            f"  B-MB CBP: luma={cbp_luma:#06b}, chroma={cbp_chroma}, "
+            f"qp_delta={mb_qp_delta}, qp={current_qp}"
+        )
+
+        # ── Parse luma residual (16 4x4 blocks via CAVLC) ──
+        nz_counts = np.zeros(24, dtype=np.int32)
+        luma_residual = np.zeros((16, 16), dtype=np.int32)
+
+        for block_idx in range(16):
+            block_8x8_idx = block_idx // 4
+            if not (cbp_luma & (1 << block_8x8_idx)):
+                nz_counts[block_idx] = 0
+                continue
+
+            nA, nB = get_luma_neighbor_nz(
+                block_idx, mb_x, mb_y, nz_counts,
+                self.state.nz_counts, mb_width
             )
+            nC = calculate_nC(nA, nB)
+            block = decode_residual_block(reader, nC, max_coeffs=16)
+            nz_counts[block_idx] = block.total_coeff
+
+            if block.total_coeff > 0:
+                coeffs_2d = np.zeros((4, 4), dtype=np.int32)
+                for scan_idx in range(16):
+                    raster_pos = ZIGZAG_4x4[scan_idx]
+                    r, c = raster_pos // 4, raster_pos % 4
+                    coeffs_2d[r, c] = block.coefficients[scan_idx]
+                dequant = dequant_4x4(coeffs_2d, current_qp)
+                residual_block = idct_4x4(dequant)
+                row, col = BLOCK_SCAN_ORDER[block_idx]
+                luma_residual[row:row+4, col:col+4] = residual_block
+
+        # ── Parse chroma residual ──
+        chroma_qp_offset = getattr(pps, 'chroma_qp_index_offset', 0)
+        qpi = max(0, min(51, current_qp + chroma_qp_offset))
+        qp_chroma = get_chroma_qp(qpi)
+
+        cb_dc = decode_chroma_dc(reader, cbp_chroma, qp_chroma)
+        cr_dc = decode_chroma_dc(reader, cbp_chroma, qp_chroma)
+
+        cb_ac = decode_chroma_ac(
+            reader, cbp_chroma, nz_counts, 16,
+            mb_x, mb_y, self.state.nz_counts, mb_width
+        )
+        cr_ac = decode_chroma_ac(
+            reader, cbp_chroma, nz_counts, 20,
+            mb_x, mb_y, self.state.nz_counts, mb_width
+        )
+
+        cb_residual = build_chroma_residual(cb_dc, cb_ac, cbp_chroma, qp_chroma)
+        cr_residual = build_chroma_residual(cr_dc, cr_ac, cbp_chroma, qp_chroma)
+
+        # ── Combine prediction + residual, write to frame ──
+        luma = np.clip(
+            luma_pred.astype(np.int32) + luma_residual, 0, 255
+        ).astype(np.uint8)
+        cb = np.clip(
+            cb_pred.astype(np.int32) + cb_residual, 0, 255
+        ).astype(np.uint8)
+        cr = np.clip(
+            cr_pred.astype(np.int32) + cr_residual, 0, 255
+        ).astype(np.uint8)
 
         self.state.frame_luma[ly:ly + 16, lx:lx + 16] = luma
         self.state.frame_cb[cy:cy + 8, cx:cx + 8] = cb
         self.state.frame_cr[cy:cy + 8, cx:cx + 8] = cr
+
+        # Store nz_counts for CAVLC context of neighboring MBs
+        self.state.nz_counts[mb_idx] = nz_counts
+
+        # ── Store deblocking metadata ──
+        if self.state.mb_types is not None:
+            self.state.mb_types[mb_idx] = 99  # inter sentinel
+        if self.state.mb_qps is not None:
+            self.state.mb_qps[mb_idx] = current_qp
+        if self.state.mb_coeffs is not None:
+            self.state.mb_coeffs[mb_idx, :16] = (nz_counts[:16] > 0)
+
+        return current_qp
 
     def _process_b_skip_run(
         self,
