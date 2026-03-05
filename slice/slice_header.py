@@ -25,7 +25,10 @@ from enum import IntEnum
 from typing import Optional, List, Tuple
 
 from bitstream import BitReader
+from inter.weighted_pred import WeightTableBSlice, parse_pred_weight_table_b_slice
 from parameters import SPS, PPS
+
+from .pred_weight_table import parse_pred_weight_table as parse_pred_weight_table_p
 
 logger = logging.getLogger(__name__)
 
@@ -165,6 +168,7 @@ class SliceHeader:
     # Prediction weights (for weighted prediction)
     weighted_pred_table: Optional['WeightTable'] = None
     weighted_pred_table_l1: Optional['WeightTable'] = None  # For B-slices
+    pred_weight_table_b: Optional['WeightTableBSlice'] = None
 
     # Decoded reference picture marking
     dec_ref_pic_marking: Optional[DecRefPicMarking] = None
@@ -309,46 +313,49 @@ def _parse_ref_pic_list_modification(
 
 def _parse_pred_weight_table(
     reader: BitReader,
-    slice_type: int,
-    num_ref_idx_l0_active: int,
-    num_ref_idx_l1_active: int,
-    chroma_format_idc: int
+    header: SliceHeader,
+    chroma_format_idc: int,
 ) -> None:
     """Parse prediction weight table (skip for baseline).
 
     H.264 Spec: Section 7.3.3.2
     """
-    luma_log2_weight_denom = reader.read_ue()
+    normalized_type = SliceType.normalize(header.slice_type)
 
-    if chroma_format_idc != 0:
-        chroma_log2_weight_denom = reader.read_ue()
+    if normalized_type == SliceType.B:
+        table_l0, table_l1 = parse_pred_weight_table_b_slice(
+            reader,
+            num_ref_idx_l0=header.num_ref_idx_l0_active,
+            num_ref_idx_l1=header.num_ref_idx_l1_active,
+            chroma_array_type=chroma_format_idc,
+        )
 
-    # L0 weights
-    for _ in range(num_ref_idx_l0_active):
-        luma_weight_l0_flag = reader.read_flag()
-        if luma_weight_l0_flag:
-            reader.read_se()  # luma_weight_l0
-            reader.read_se()  # luma_offset_l0
-        if chroma_format_idc != 0:
-            chroma_weight_l0_flag = reader.read_flag()
-            if chroma_weight_l0_flag:
-                for _ in range(2):  # Cb, Cr
-                    reader.read_se()  # chroma_weight_l0
-                    reader.read_se()  # chroma_offset_l0
+        header.weighted_pred_table = table_l0
+        header.weighted_pred_table_l1 = table_l1
 
-    # L1 weights (B slices only)
-    if SliceType.normalize(slice_type) == SliceType.B:
-        for _ in range(num_ref_idx_l1_active):
-            luma_weight_l1_flag = reader.read_flag()
-            if luma_weight_l1_flag:
-                reader.read_se()
-                reader.read_se()
-            if chroma_format_idc != 0:
-                chroma_weight_l1_flag = reader.read_flag()
-                if chroma_weight_l1_flag:
-                    for _ in range(2):
-                        reader.read_se()
-                        reader.read_se()
+        table_b = WeightTableBSlice(
+            luma_log2_weight_denom=table_l0.luma_log2_weight_denom,
+            chroma_log2_weight_denom=table_l0.chroma_log2_weight_denom,
+        )
+
+        for i in range(header.num_ref_idx_l0_active):
+            w, o = table_l0.get_luma_weight(i)
+            table_b.set_l0_luma_weight(i, w, o)
+
+        for i in range(header.num_ref_idx_l1_active):
+            w, o = table_l1.get_luma_weight(i)
+            table_b.set_l1_luma_weight(i, w, o)
+
+        header.pred_weight_table_b = table_b
+        return
+
+    header.weighted_pred_table = parse_pred_weight_table_p(
+        reader,
+        num_ref_idx_l0=header.num_ref_idx_l0_active,
+        chroma_format_idc=chroma_format_idc,
+    )
+    header.weighted_pred_table_l1 = None
+    header.pred_weight_table_b = None
 
 
 def _parse_dec_ref_pic_marking(
@@ -492,10 +499,9 @@ def parse_slice_header(
     if ((pps.weighted_pred_flag and normalized_type in (SliceType.P, SliceType.SP)) or
         (pps.weighted_bipred_idc == 1 and normalized_type == SliceType.B)):
         _parse_pred_weight_table(
-            reader, header.slice_type,
-            header.num_ref_idx_l0_active,
-            header.num_ref_idx_l1_active,
-            sps.chroma_format_idc
+            reader,
+            header,
+            sps.chroma_format_idc,
         )
 
     # Decoded reference picture marking
@@ -539,6 +545,16 @@ def parse_slice_header(
 
     logger.info(f"Parsed {header}")
     return header
+
+
+def parse_slice_header_with_weights(
+    rbsp: bytes,
+    sps: SPS,
+    pps: PPS,
+    nal_unit_type: int,
+    nal_ref_idc: int,
+) -> SliceHeader:
+    return parse_slice_header_weighted(rbsp, sps, pps, nal_unit_type, nal_ref_idc)
 
 
 def parse_slice_header_weighted(

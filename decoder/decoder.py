@@ -20,6 +20,7 @@ This decoder supports:
 """
 
 import logging
+import os
 from dataclasses import dataclass, field
 from typing import Optional, Tuple
 
@@ -35,6 +36,17 @@ from bitstream import (
 from parameters import SPS, PPS, parse_sps, parse_pps
 from slice import SliceHeader, SliceType, parse_slice_header
 from reconstruct import decode_macroblock, MacroblockData
+from reconstruct.macroblock import (
+    decode_cbp_inter,
+    decode_chroma_dc,
+    decode_chroma_ac,
+    build_chroma_residual,
+    get_luma_neighbor_nz,
+    BLOCK_SCAN_ORDER,
+)
+from entropy import decode_residual_block, calculate_nC, ZIGZAG_4x4
+from dequant import dequant_4x4, get_chroma_qp
+from transform import idct_4x4
 from color import ycbcr_to_rgb, ColorMatrix
 from color.chroma_format import monochrome_to_rgb, ycbcr_422_to_rgb, ycbcr_444_to_rgb
 from inter.reference import ReferenceFrame, ReferenceFrameBuffer
@@ -50,10 +62,15 @@ from inter.mv_prediction import (
 from inter.p_macroblock import parse_p_mb_type, parse_sub_mb_type, PMacroblockInfo
 from inter.p_reconstruct import (
     reconstruct_p_skip,
+    reconstruct_p_skip_weighted,
     reconstruct_p_16x16,
+    reconstruct_p_16x16_weighted,
     reconstruct_p_16x8,
+    reconstruct_p_16x8_weighted,
     reconstruct_p_8x16,
+    reconstruct_p_8x16_weighted,
     reconstruct_p_8x8,
+    reconstruct_p_8x8_weighted,
 )
 from inter.b_macroblock import parse_b_mb_type, get_b_skip_info
 from inter.b_reconstruct import (
@@ -296,6 +313,27 @@ class H264Decoder:
         self.mmco_processor = MMCOProcessor()
         self._mmco = self.mmco_processor
 
+        self._trace_mb = None
+        self._trace_pixel = None
+        self._trace_pre_mb = None
+        trace_mb = os.environ.get("H264_TRACE_MB")
+        if trace_mb:
+            try:
+                parts = [p.strip() for p in trace_mb.split(",")]
+                if len(parts) == 3:
+                    self._trace_mb = (int(parts[0]), int(parts[1]), int(parts[2]))
+            except Exception:
+                self._trace_mb = None
+
+        trace_pixel = os.environ.get("H264_TRACE_PIXEL")
+        if trace_pixel:
+            try:
+                parts = [p.strip() for p in trace_pixel.split(",")]
+                if len(parts) == 2:
+                    self._trace_pixel = (int(parts[0]), int(parts[1]))
+            except Exception:
+                self._trace_pixel = None
+
     def _process_dec_ref_pic_marking(self, slice_header: SliceHeader, nal: NALUnit) -> None:
         marking = getattr(slice_header, "dec_ref_pic_marking", None)
         if nal.nal_ref_idc == 0 or marking is None:
@@ -461,9 +499,23 @@ class H264Decoder:
             logger.warning("No SPS/PPS available, skipping slice")
             return None
 
-        # Peek at first_mb_in_slice to determine PPS
-        # For now, assume PPS 0
-        pps = self.state.get_pps(0)
+        # Peek at first_mb_in_slice / slice_type / pic_parameter_set_id
+        # to select the correct PPS for this slice.
+        try:
+            probe_reader = BitReader(nal.rbsp)
+            probe_reader.read_ue()  # first_mb_in_slice
+            probe_reader.read_ue()  # slice_type
+            pps_id = probe_reader.read_ue()
+        except Exception as exc:
+            logger.warning(f"Failed to probe slice header PPS id: {exc}")
+            return None
+
+        try:
+            pps = self.state.get_pps(pps_id)
+        except Exception as exc:
+            logger.warning(f"PPS {pps_id} not found for slice: {exc}")
+            return None
+
         sps = self.state.get_sps(pps.seq_parameter_set_id)
 
         # Parse slice header (expects raw bytes)
@@ -535,16 +587,104 @@ class H264Decoder:
         if self.deblocking_enabled and slice_header.deblocking_enabled:
             self._deblock_frame(slice_header, sps, pps)
 
+        trace_pre_mb = getattr(self, "_trace_pre_mb", None)
+        if trace_pre_mb is not None:
+            try:
+                t_frame_num, t_mb_x, t_mb_y, pre_luma = trace_pre_mb
+                if t_frame_num == slice_header.frame_num:
+                    ly, lx = t_mb_y * 16, t_mb_x * 16
+                    post_luma = self.state.frame_luma[ly:ly + 16, lx:lx + 16]
+                    d = np.abs(post_luma.astype(np.int16) - pre_luma.astype(np.int16))
+                    logger.warning(
+                        "TRACE MB post-deblock frame_num=%s MB=(%s,%s) max_delta=%s mean_delta=%.6f",
+                        t_frame_num,
+                        t_mb_x,
+                        t_mb_y,
+                        int(d.max()),
+                        float(d.mean()),
+                    )
+                    trace_pixel = getattr(self, "_trace_pixel", None)
+                    if trace_pixel is not None:
+                        px, py = trace_pixel
+                        if lx <= px < lx + 16 and ly <= py < ly + 16:
+                            rx, ry = px - lx, py - ly
+                            logger.warning(
+                                "TRACE pixel post-deblock frame_num=%s (x,y)=(%s,%s) rel=(%s,%s) pre=%s post=%s",
+                                t_frame_num,
+                                px,
+                                py,
+                                rx,
+                                ry,
+                                int(pre_luma[ry, rx]),
+                                int(post_luma[ry, rx]),
+                            )
+            except Exception:
+                pass
+
         # Return completed frame
         # For simplicity, assume each slice is a complete frame
+        out_luma = self.state.frame_luma
+        out_cb = self.state.frame_cb
+        out_cr = self.state.frame_cr
+        out_width = sps.pic_width_in_mbs * 16
+        out_height = sps.frame_height_in_mbs * 16
+
+        if getattr(sps, "frame_cropping_flag", False):
+            chroma_format_idc = getattr(sps, "chroma_format_idc", 1)
+            separate_colour_plane_flag = getattr(
+                sps, "separate_colour_plane_flag", False
+            )
+
+            if separate_colour_plane_flag or chroma_format_idc == 0:
+                sub_w, sub_h = 1, 1
+            elif chroma_format_idc == 1:
+                sub_w, sub_h = 2, 2
+            elif chroma_format_idc == 2:
+                sub_w, sub_h = 2, 1
+            else:  # chroma_format_idc == 3
+                sub_w, sub_h = 1, 1
+
+            if separate_colour_plane_flag or chroma_format_idc == 0:
+                crop_unit_x = 1
+                crop_unit_y = 2 - (1 if sps.frame_mbs_only_flag else 0)
+            else:
+                crop_unit_x = sub_w
+                crop_unit_y = sub_h * (2 - (1 if sps.frame_mbs_only_flag else 0))
+
+            crop_left = int(sps.frame_crop_left_offset * crop_unit_x)
+            crop_right = int(sps.frame_crop_right_offset * crop_unit_x)
+            crop_top = int(sps.frame_crop_top_offset * crop_unit_y)
+            crop_bottom = int(sps.frame_crop_bottom_offset * crop_unit_y)
+
+            out_luma = out_luma[
+                crop_top : out_height - crop_bottom,
+                crop_left : out_width - crop_right,
+            ]
+            out_height, out_width = out_luma.shape
+
+            if chroma_format_idc != 0 and out_cb is not None and out_cr is not None:
+                crop_left_c = crop_left // sub_w
+                crop_right_c = crop_right // sub_w
+                crop_top_c = crop_top // sub_h
+                crop_bottom_c = crop_bottom // sub_h
+
+                out_cb = out_cb[
+                    crop_top_c : out_cb.shape[0] - crop_bottom_c,
+                    crop_left_c : out_cb.shape[1] - crop_right_c,
+                ]
+                out_cr = out_cr[
+                    crop_top_c : out_cr.shape[0] - crop_bottom_c,
+                    crop_left_c : out_cr.shape[1] - crop_right_c,
+                ]
+
         frame = DecodedFrame(
             frame_num=slice_header.frame_num,
             poc=getattr(slice_header, "pic_order_cnt_lsb", 0),
-            luma=self.state.frame_luma.copy(),
-            cb=self.state.frame_cb.copy(),
-            cr=self.state.frame_cr.copy(),
-            width=sps.pic_width_in_mbs * 16,
-            height=sps.frame_height_in_mbs * 16,
+            luma=out_luma.copy(),
+            cb=out_cb.copy() if out_cb is not None else None,
+            cr=out_cr.copy() if out_cr is not None else None,
+            width=out_width,
+            height=out_height,
             chroma_format_idc=getattr(sps, "chroma_format_idc", 1),
         )
 
@@ -585,6 +725,11 @@ class H264Decoder:
         total_mbs = mb_width * mb_height
 
         logger.debug(f"Decoding {total_mbs} macroblocks ({mb_width}x{mb_height})")
+
+        if slice_header.first_mb_in_slice == 0 and self.state.intra_modes is not None:
+            # Reset intra 4x4 prediction modes at the start of a new frame.
+            # Prevents stale modes from previous frames influencing MPM.
+            self.state.intra_modes[:] = 2
 
         current_qp = slice_qp
 
@@ -727,6 +872,35 @@ class H264Decoder:
         current_qp = slice_qp
         mb_idx = slice_header.first_mb_in_slice
 
+        use_weighted_pred = self._use_weighted_prediction(slice_header)
+        weight_table = slice_header.weighted_pred_table if use_weighted_pred else None
+        if use_weighted_pred and weight_table is None:
+            logger.debug(
+                "Weighted prediction enabled but no weight table found; "
+                "falling back to unweighted prediction."
+            )
+            use_weighted_pred = False
+
+        skip_weight_params = None
+        if use_weighted_pred and weight_table is not None:
+            w_luma, o_luma = weight_table.get_luma_weight(0)
+            w_cb, o_cb, w_cr, o_cr = weight_table.get_chroma_weight(0)
+            skip_weight_params = {
+                "weight_luma": w_luma,
+                "offset_luma": o_luma,
+                "log2_denom_luma": weight_table.luma_log2_weight_denom,
+                "weight_cb": w_cb,
+                "offset_cb": o_cb,
+                "weight_cr": w_cr,
+                "offset_cr": o_cr,
+                "log2_denom_chroma": weight_table.chroma_log2_weight_denom,
+            }
+
+        # Reset intra modes to DC (2) for this frame.
+        # H.264 8.3.1.1: non-I_NxN MBs use intraMxMPredModeN = 2 (DC).
+        # Without reset, stale I-frame modes leak through I_16x16 and P-MB positions.
+        self.state.intra_modes[:] = 2
+
         while mb_idx < total_mbs:
             mb_x = mb_idx % mb_width
             mb_y = mb_idx // mb_width
@@ -744,12 +918,21 @@ class H264Decoder:
                 mb_y = mb_idx // mb_width
 
                 # Reconstruct P_Skip macroblock
-                luma, cb, cr = reconstruct_p_skip(
-                    ref_buffer=self.state.ref_buffer,
-                    mv_cache=self.state.mv_cache,
-                    mb_x=mb_x,
-                    mb_y=mb_y,
-                )
+                if skip_weight_params is not None:
+                    luma, cb, cr = reconstruct_p_skip_weighted(
+                        ref_buffer=self.state.ref_buffer,
+                        mv_cache=self.state.mv_cache,
+                        mb_x=mb_x,
+                        mb_y=mb_y,
+                        **skip_weight_params,
+                    )
+                else:
+                    luma, cb, cr = reconstruct_p_skip(
+                        ref_buffer=self.state.ref_buffer,
+                        mv_cache=self.state.mv_cache,
+                        mb_x=mb_x,
+                        mb_y=mb_y,
+                    )
 
                 # Write to frame buffers
                 ly, lx = mb_y * 16, mb_x * 16
@@ -758,11 +941,56 @@ class H264Decoder:
                 self.state.frame_cb[cy:cy + 8, cx:cx + 8] = cb
                 self.state.frame_cr[cy:cy + 8, cx:cx + 8] = cr
 
+                # Clear nz_counts for CAVLC context (skip has no residual)
+                self.state.nz_counts[mb_idx] = 0
+
+                # Store deblocking metadata for P_Skip
+                if self.state.mb_types is not None:
+                    self.state.mb_types[mb_idx] = 99  # Non-intra sentinel
+                if self.state.mb_qps is not None:
+                    self.state.mb_qps[mb_idx] = current_qp
+                if self.state.mb_coeffs is not None:
+                    self.state.mb_coeffs[mb_idx] = 0
+
                 logger.debug(f"P_Skip MB ({mb_x}, {mb_y})")
                 mb_idx += 1
 
-            # After skip run, decode regular macroblock if not at end
+            # After skip run, check for end of slice (H.264 7.3.4)
             if mb_idx >= total_mbs:
+                break
+            if not reader.more_rbsp_data():
+                # Remaining MBs are implicitly skipped
+                while mb_idx < total_mbs:
+                    mb_x = mb_idx % mb_width
+                    mb_y = mb_idx // mb_width
+                    if skip_weight_params is not None:
+                        luma, cb, cr = reconstruct_p_skip_weighted(
+                            ref_buffer=self.state.ref_buffer,
+                            mv_cache=self.state.mv_cache,
+                            mb_x=mb_x,
+                            mb_y=mb_y,
+                            **skip_weight_params,
+                        )
+                    else:
+                        luma, cb, cr = reconstruct_p_skip(
+                            ref_buffer=self.state.ref_buffer,
+                            mv_cache=self.state.mv_cache,
+                            mb_x=mb_x, mb_y=mb_y,
+                        )
+                    ly, lx = mb_y * 16, mb_x * 16
+                    cy, cx = mb_y * 8, mb_x * 8
+                    self.state.frame_luma[ly:ly + 16, lx:lx + 16] = luma
+                    self.state.frame_cb[cy:cy + 8, cx:cx + 8] = cb
+                    self.state.frame_cr[cy:cy + 8, cx:cx + 8] = cr
+                    self.state.nz_counts[mb_idx] = 0
+                    if self.state.mb_types is not None:
+                        self.state.mb_types[mb_idx] = 99
+                    if self.state.mb_qps is not None:
+                        self.state.mb_qps[mb_idx] = current_qp
+                    if self.state.mb_coeffs is not None:
+                        self.state.mb_coeffs[mb_idx] = 0
+                    logger.debug(f"P_Skip MB ({mb_x}, {mb_y}) [implicit]")
+                    mb_idx += 1
                 break
 
             mb_x = mb_idx % mb_width
@@ -776,7 +1004,7 @@ class H264Decoder:
 
             if mb_type.is_intra:
                 # I-macroblock in P-slice - use I-MB decoder
-                # Need to parse using I-MB syntax
+                # mb_type already consumed above; pass intra_type to skip re-read
                 mb_data = decode_macroblock(
                     reader=reader,
                     sps=sps,
@@ -791,16 +1019,41 @@ class H264Decoder:
                     frame_nz_counts=self.state.nz_counts,
                     frame_width_mbs=mb_width,
                     frame_intra_modes=self.state.intra_modes,
+                    pre_parsed_mb_type=mb_type.intra_type,
                 )
-                # Clear MV cache for intra MB
-                self.state.mv_cache.set_mv_16x16(mb_x, mb_y, 0, 0)
+                # Mark intra MB: MV=(0,0) with ref_idx=-1
+                # Prevents P_Skip zero-MV shortcut for intra neighbors
+                self.state.mv_cache.mark_intra(mb_x, mb_y)
                 # Update running QP for next MB
                 current_qp = (current_qp + mb_data.mb_qp_delta + 52) % 52
 
+                # Store nz_counts for CAVLC context of neighboring MBs
+                mb_idx_p = mb_y * mb_width + mb_x
+                self.state.nz_counts[mb_idx_p] = mb_data.nz_counts
+
+                # Store deblocking metadata for intra-in-P
+                if self.state.mb_types is not None:
+                    self.state.mb_types[mb_idx_p] = mb_data.mb_type
+                if self.state.mb_qps is not None:
+                    self.state.mb_qps[mb_idx_p] = current_qp
+                if self.state.mb_coeffs is not None:
+                    self.state.mb_coeffs[mb_idx_p, :16] = (
+                        mb_data.nz_counts[:16] > 0
+                    )
+
             else:
                 # P-macroblock
-                self._decode_p_macroblock(
-                    reader, mb_type, mb_x, mb_y, current_qp, sps, pps
+                current_qp = self._decode_p_macroblock(
+                    reader,
+                    mb_type,
+                    mb_x,
+                    mb_y,
+                    current_qp,
+                    sps,
+                    pps,
+                    frame_num=slice_header.frame_num,
+                    use_weighted_pred=use_weighted_pred,
+                    weight_table=weight_table,
                 )
 
             mb_idx += 1
@@ -814,8 +1067,13 @@ class H264Decoder:
         qp: int,
         sps: SPS,
         pps: PPS,
-    ) -> None:
+        frame_num: Optional[int] = None,
+        use_weighted_pred: bool = False,
+        weight_table: Optional['WeightTable'] = None,
+    ) -> int:
         """Decode a single P-macroblock.
+
+        H.264 Spec Reference: Section 7.3.5 (macroblock_layer syntax)
 
         Args:
             reader: BitReader
@@ -823,342 +1081,505 @@ class H264Decoder:
             mb_x, mb_y: Macroblock position
             qp: Current QP
             sps, pps: Parameter sets
+
+        Returns:
+            Updated QP after mb_qp_delta
         """
-        # For P_L0_16x16 (simplest case)
+        mb_width = sps.pic_width_in_mbs
+        mb_idx = mb_y * mb_width + mb_x
+
+        trace_mb = getattr(self, "_trace_mb", None)
+        trace = (
+            trace_mb is not None
+            and frame_num is not None
+            and trace_mb == (frame_num, mb_x, mb_y)
+        )
+        if trace:
+            logger.warning(
+                "TRACE MB start frame_num=%s MB=(%s,%s) type=%s",
+                frame_num,
+                mb_x,
+                mb_y,
+                getattr(mb_type, "name", None),
+            )
+
+        use_weighted = use_weighted_pred and weight_table is not None
+        if use_weighted:
+            luma_log2_denom = weight_table.luma_log2_weight_denom
+            chroma_log2_denom = weight_table.chroma_log2_weight_denom
+
+            def _weights_for_ref(ref_index: int):
+                w_luma, o_luma = weight_table.get_luma_weight(ref_index)
+                w_cb, o_cb, w_cr, o_cr = weight_table.get_chroma_weight(ref_index)
+                return w_luma, o_luma, w_cb, o_cb, w_cr, o_cr
+
+        # ── Step 1: Parse MVs and do motion compensation (partition-specific) ──
+
         if mb_type.name == "P_L0_16x16":
-            # Read ref_idx if more than one reference
             ref_idx = 0
             if self.state.ref_buffer is not None and len(self.state.ref_buffer) > 1:
                 ref_idx = reader.read_te(len(self.state.ref_buffer) - 1)
 
-            # Read MVD
             mvd_x = reader.read_se()
             mvd_y = reader.read_se()
-
-            # Get predicted MV
             mvp_x, mvp_y = predict_mv_16x16(self.state.mv_cache, mb_x, mb_y)
-
-            # Final MV = prediction + difference
             mvx = mvp_x + mvd_x
             mvy = mvp_y + mvd_y
 
-            # Update MV cache
-            self.state.mv_cache.set_mv_16x16(mb_x, mb_y, mvx, mvy)
+            if trace:
+                logger.warning(
+                    "TRACE P_16x16 ref_idx=%s mvd=(%s,%s) mvp=(%s,%s) mv=(%s,%s)",
+                    ref_idx,
+                    mvd_x,
+                    mvd_y,
+                    mvp_x,
+                    mvp_y,
+                    mvx,
+                    mvy,
+                )
 
-            # TODO: Parse and decode residual if present
-            # For now, no residual
-            luma, cb, cr = reconstruct_p_16x16(
-                ref_buffer=self.state.ref_buffer,
-                ref_idx=ref_idx,
-                mvx=mvx,
-                mvy=mvy,
-                residual_luma=None,
-                residual_cb=None,
-                residual_cr=None,
-                mb_x=mb_x,
-                mb_y=mb_y,
-            )
+            # Store MV for this MB so neighbors can predict correctly.
+            if self.state.mv_cache is not None:
+                self.state.mv_cache.set_mv_16x16(mb_x, mb_y, mvx, mvy)
 
-            # Write to frame buffers
-            ly, lx = mb_y * 16, mb_x * 16
-            cy, cx = mb_y * 8, mb_x * 8
-            self.state.frame_luma[ly:ly + 16, lx:lx + 16] = luma
-            self.state.frame_cb[cy:cy + 8, cx:cx + 8] = cb
-            self.state.frame_cr[cy:cy + 8, cx:cx + 8] = cr
-
+            if use_weighted:
+                w_luma, o_luma, w_cb, o_cb, w_cr, o_cr = _weights_for_ref(ref_idx)
+                luma_pred, cb_pred, cr_pred = reconstruct_p_16x16_weighted(
+                    ref_buffer=self.state.ref_buffer,
+                    ref_idx=ref_idx,
+                    mvx=mvx,
+                    mvy=mvy,
+                    weight_luma=w_luma,
+                    offset_luma=o_luma,
+                    log2_denom_luma=luma_log2_denom,
+                    weight_cb=w_cb,
+                    offset_cb=o_cb,
+                    weight_cr=w_cr,
+                    offset_cr=o_cr,
+                    log2_denom_chroma=chroma_log2_denom,
+                    residual_luma=None,
+                    residual_cb=None,
+                    residual_cr=None,
+                    mb_x=mb_x,
+                    mb_y=mb_y,
+                )
+            else:
+                luma_pred, cb_pred, cr_pred = reconstruct_p_16x16(
+                    ref_buffer=self.state.ref_buffer,
+                    ref_idx=ref_idx,
+                    mvx=mvx,
+                    mvy=mvy,
+                    residual_luma=None,
+                    residual_cb=None,
+                    residual_cr=None,
+                    mb_x=mb_x,
+                    mb_y=mb_y,
+                )
             logger.debug(f"P_16x16 MB ({mb_x}, {mb_y}): MV=({mvx}, {mvy})")
 
         elif mb_type.name == "P_L0_L0_16x8":
-            # Two 16x8 partitions (top and bottom)
             ref_idx = [0, 0]
             mvx = [0, 0]
             mvy = [0, 0]
-
-            # Read ref_idx for each partition if multiple references
             num_refs = len(self.state.ref_buffer) if self.state.ref_buffer else 1
             if num_refs > 1:
                 ref_idx[0] = reader.read_te(num_refs - 1)
                 ref_idx[1] = reader.read_te(num_refs - 1)
-
-            # Read MVD for each partition
             for part in range(2):
                 mvd_x = reader.read_se()
                 mvd_y = reader.read_se()
-
-                # Get predicted MV for this partition
                 mvp_x, mvp_y = predict_mv_16x8(self.state.mv_cache, mb_x, mb_y, part)
-
                 mvx[part] = mvp_x + mvd_x
                 mvy[part] = mvp_y + mvd_y
+                if trace:
+                    logger.warning(
+                        "TRACE P_16x8 part=%s ref_idx=%s mvd=(%s,%s) mvp=(%s,%s) mv=(%s,%s)",
+                        part,
+                        ref_idx[part],
+                        mvd_x,
+                        mvd_y,
+                        mvp_x,
+                        mvp_y,
+                        mvx[part],
+                        mvy[part],
+                    )
+                # Store partition MV immediately so next partition can
+                # use it as a neighbor (H.264 8.4.1.3.1)
+                by_start = part * 2
+                for bx in range(4):
+                    for by in range(by_start, by_start + 2):
+                        self.state.mv_cache.set_mv(
+                            mb_x, mb_y, bx, by,
+                            mvx[part], mvy[part]
+                        )
 
-            # TODO: Parse residual
+            if use_weighted:
+                weights_luma = []
+                offsets_luma = []
+                weights_cb = []
+                offsets_cb = []
+                weights_cr = []
+                offsets_cr = []
+                for idx in ref_idx:
+                    w_luma, o_luma, w_cb, o_cb, w_cr, o_cr = _weights_for_ref(idx)
+                    weights_luma.append(w_luma)
+                    offsets_luma.append(o_luma)
+                    weights_cb.append(w_cb)
+                    offsets_cb.append(o_cb)
+                    weights_cr.append(w_cr)
+                    offsets_cr.append(o_cr)
 
-            luma, cb, cr = reconstruct_p_16x8(
-                ref_buffer=self.state.ref_buffer,
-                mv_cache=self.state.mv_cache,
-                ref_idx=ref_idx,
-                mvx=mvx,
-                mvy=mvy,
-                residual_luma=None,
-                residual_cb=None,
-                residual_cr=None,
-                mb_x=mb_x,
-                mb_y=mb_y,
-            )
-
-            ly, lx = mb_y * 16, mb_x * 16
-            cy, cx = mb_y * 8, mb_x * 8
-            self.state.frame_luma[ly:ly + 16, lx:lx + 16] = luma
-            self.state.frame_cb[cy:cy + 8, cx:cx + 8] = cb
-            self.state.frame_cr[cy:cy + 8, cx:cx + 8] = cr
-
+                luma_pred, cb_pred, cr_pred = reconstruct_p_16x8_weighted(
+                    ref_buffer=self.state.ref_buffer,
+                    mv_cache=self.state.mv_cache,
+                    ref_idx=ref_idx,
+                    mvx=mvx,
+                    mvy=mvy,
+                    weights_luma=weights_luma,
+                    offsets_luma=offsets_luma,
+                    log2_denom_luma=luma_log2_denom,
+                    weights_cb=weights_cb,
+                    offsets_cb=offsets_cb,
+                    weights_cr=weights_cr,
+                    offsets_cr=offsets_cr,
+                    log2_denom_chroma=chroma_log2_denom,
+                    residual_luma=None,
+                    residual_cb=None,
+                    residual_cr=None,
+                    mb_x=mb_x,
+                    mb_y=mb_y,
+                )
+            else:
+                luma_pred, cb_pred, cr_pred = reconstruct_p_16x8(
+                    ref_buffer=self.state.ref_buffer, mv_cache=self.state.mv_cache,
+                    ref_idx=ref_idx, mvx=mvx, mvy=mvy,
+                    residual_luma=None, residual_cb=None, residual_cr=None,
+                    mb_x=mb_x, mb_y=mb_y,
+                )
             logger.debug(f"P_16x8 MB ({mb_x}, {mb_y}): MVs={list(zip(mvx, mvy))}")
 
         elif mb_type.name == "P_L0_L0_8x16":
-            # Two 8x16 partitions (left and right)
             ref_idx = [0, 0]
             mvx = [0, 0]
             mvy = [0, 0]
-
             num_refs = len(self.state.ref_buffer) if self.state.ref_buffer else 1
             if num_refs > 1:
                 ref_idx[0] = reader.read_te(num_refs - 1)
                 ref_idx[1] = reader.read_te(num_refs - 1)
-
             for part in range(2):
                 mvd_x = reader.read_se()
                 mvd_y = reader.read_se()
-
                 mvp_x, mvp_y = predict_mv_8x16(self.state.mv_cache, mb_x, mb_y, part)
-
                 mvx[part] = mvp_x + mvd_x
                 mvy[part] = mvp_y + mvd_y
+                if trace:
+                    logger.warning(
+                        "TRACE P_8x16 part=%s ref_idx=%s mvd=(%s,%s) mvp=(%s,%s) mv=(%s,%s)",
+                        part,
+                        ref_idx[part],
+                        mvd_x,
+                        mvd_y,
+                        mvp_x,
+                        mvp_y,
+                        mvx[part],
+                        mvy[part],
+                    )
+                # Store partition MV immediately so next partition can
+                # use it as a neighbor (H.264 8.4.1.3.1)
+                bx_start = part * 2
+                for by in range(4):
+                    for bx in range(bx_start, bx_start + 2):
+                        self.state.mv_cache.set_mv(
+                            mb_x, mb_y, bx, by,
+                            mvx[part], mvy[part]
+                        )
 
-            luma, cb, cr = reconstruct_p_8x16(
-                ref_buffer=self.state.ref_buffer,
-                mv_cache=self.state.mv_cache,
-                ref_idx=ref_idx,
-                mvx=mvx,
-                mvy=mvy,
-                residual_luma=None,
-                residual_cb=None,
-                residual_cr=None,
-                mb_x=mb_x,
-                mb_y=mb_y,
-            )
+            if use_weighted:
+                weights_luma = []
+                offsets_luma = []
+                weights_cb = []
+                offsets_cb = []
+                weights_cr = []
+                offsets_cr = []
+                for idx in ref_idx:
+                    w_luma, o_luma, w_cb, o_cb, w_cr, o_cr = _weights_for_ref(idx)
+                    weights_luma.append(w_luma)
+                    offsets_luma.append(o_luma)
+                    weights_cb.append(w_cb)
+                    offsets_cb.append(o_cb)
+                    weights_cr.append(w_cr)
+                    offsets_cr.append(o_cr)
 
-            ly, lx = mb_y * 16, mb_x * 16
-            cy, cx = mb_y * 8, mb_x * 8
-            self.state.frame_luma[ly:ly + 16, lx:lx + 16] = luma
-            self.state.frame_cb[cy:cy + 8, cx:cx + 8] = cb
-            self.state.frame_cr[cy:cy + 8, cx:cx + 8] = cr
-
+                luma_pred, cb_pred, cr_pred = reconstruct_p_8x16_weighted(
+                    ref_buffer=self.state.ref_buffer,
+                    mv_cache=self.state.mv_cache,
+                    ref_idx=ref_idx,
+                    mvx=mvx,
+                    mvy=mvy,
+                    weights_luma=weights_luma,
+                    offsets_luma=offsets_luma,
+                    log2_denom_luma=luma_log2_denom,
+                    weights_cb=weights_cb,
+                    offsets_cb=offsets_cb,
+                    weights_cr=weights_cr,
+                    offsets_cr=offsets_cr,
+                    log2_denom_chroma=chroma_log2_denom,
+                    residual_luma=None,
+                    residual_cb=None,
+                    residual_cr=None,
+                    mb_x=mb_x,
+                    mb_y=mb_y,
+                )
+            else:
+                luma_pred, cb_pred, cr_pred = reconstruct_p_8x16(
+                    ref_buffer=self.state.ref_buffer, mv_cache=self.state.mv_cache,
+                    ref_idx=ref_idx, mvx=mvx, mvy=mvy,
+                    residual_luma=None, residual_cb=None, residual_cr=None,
+                    mb_x=mb_x, mb_y=mb_y,
+                )
             logger.debug(f"P_8x16 MB ({mb_x}, {mb_y}): MVs={list(zip(mvx, mvy))}")
 
         elif mb_type.name in ("P_8x8", "P_8x8ref0"):
-            # Four 8x8 sub-macroblocks
             sub_mb_types = []
             ref_idx = [0, 0, 0, 0]
             mvx = [0, 0, 0, 0]
             mvy = [0, 0, 0, 0]
-
-            # Read sub_mb_type for each 8x8 block
             for i in range(4):
-                sub_type_code = reader.read_ue()
-                sub_mb_types.append(sub_type_code)
-
-            # Read ref_idx for each sub-MB (unless P_8x8ref0)
+                sub_mb_types.append(reader.read_ue())
             num_refs = len(self.state.ref_buffer) if self.state.ref_buffer else 1
             if mb_type.name == "P_8x8" and num_refs > 1:
                 for i in range(4):
                     ref_idx[i] = reader.read_te(num_refs - 1)
-
-            # Read MVD for each sub-MB (assuming 8x8 sub-type for simplicity)
             for sub_idx in range(4):
                 mvd_x = reader.read_se()
                 mvd_y = reader.read_se()
-
                 mvp_x, mvp_y = predict_mv_8x8(self.state.mv_cache, mb_x, mb_y, sub_idx)
-
                 mvx[sub_idx] = mvp_x + mvd_x
                 mvy[sub_idx] = mvp_y + mvd_y
+                if trace:
+                    logger.warning(
+                        "TRACE P_8x8 sub=%s ref_idx=%s mvd=(%s,%s) mvp=(%s,%s) mv=(%s,%s)",
+                        sub_idx,
+                        ref_idx[sub_idx],
+                        mvd_x,
+                        mvd_y,
+                        mvp_x,
+                        mvp_y,
+                        mvx[sub_idx],
+                        mvy[sub_idx],
+                    )
+                # Store MV in cache immediately so subsequent sub-MBs
+                # can use it as a neighbor (H.264 8.4.1.3.1)
+                bx_start = (sub_idx % 2) * 2
+                by_start = (sub_idx // 2) * 2
+                for by in range(by_start, by_start + 2):
+                    for bx in range(bx_start, bx_start + 2):
+                        self.state.mv_cache.set_mv(
+                            mb_x, mb_y, bx, by,
+                            mvx[sub_idx], mvy[sub_idx]
+                        )
 
-            luma, cb, cr = reconstruct_p_8x8(
-                ref_buffer=self.state.ref_buffer,
-                mv_cache=self.state.mv_cache,
-                ref_idx=ref_idx,
-                mvx=mvx,
-                mvy=mvy,
-                sub_mb_types=sub_mb_types,
-                residual_luma=None,
-                residual_cb=None,
-                residual_cr=None,
-                mb_x=mb_x,
-                mb_y=mb_y,
-            )
+            if use_weighted:
+                weights_luma = []
+                offsets_luma = []
+                weights_cb = []
+                offsets_cb = []
+                weights_cr = []
+                offsets_cr = []
+                for idx in ref_idx:
+                    w_luma, o_luma, w_cb, o_cb, w_cr, o_cr = _weights_for_ref(idx)
+                    weights_luma.append(w_luma)
+                    offsets_luma.append(o_luma)
+                    weights_cb.append(w_cb)
+                    offsets_cb.append(o_cb)
+                    weights_cr.append(w_cr)
+                    offsets_cr.append(o_cr)
 
-            ly, lx = mb_y * 16, mb_x * 16
-            cy, cx = mb_y * 8, mb_x * 8
-            self.state.frame_luma[ly:ly + 16, lx:lx + 16] = luma
-            self.state.frame_cb[cy:cy + 8, cx:cx + 8] = cb
-            self.state.frame_cr[cy:cy + 8, cx:cx + 8] = cr
-
+                luma_pred, cb_pred, cr_pred = reconstruct_p_8x8_weighted(
+                    ref_buffer=self.state.ref_buffer,
+                    mv_cache=self.state.mv_cache,
+                    ref_idx=ref_idx,
+                    mvx=mvx,
+                    mvy=mvy,
+                    sub_mb_types=sub_mb_types,
+                    weights_luma=weights_luma,
+                    offsets_luma=offsets_luma,
+                    log2_denom_luma=luma_log2_denom,
+                    weights_cb=weights_cb,
+                    offsets_cb=offsets_cb,
+                    weights_cr=weights_cr,
+                    offsets_cr=offsets_cr,
+                    log2_denom_chroma=chroma_log2_denom,
+                    residual_luma=None,
+                    residual_cb=None,
+                    residual_cr=None,
+                    mb_x=mb_x,
+                    mb_y=mb_y,
+                )
+            else:
+                luma_pred, cb_pred, cr_pred = reconstruct_p_8x8(
+                    ref_buffer=self.state.ref_buffer, mv_cache=self.state.mv_cache,
+                    ref_idx=ref_idx, mvx=mvx, mvy=mvy,
+                    sub_mb_types=sub_mb_types,
+                    residual_luma=None, residual_cb=None, residual_cr=None,
+                    mb_x=mb_x, mb_y=mb_y,
+                )
             logger.debug(f"P_8x8 MB ({mb_x}, {mb_y}): MVs={list(zip(mvx, mvy))}")
 
         else:
-            # Unknown type - fall back to skip
             logger.warning(f"Unsupported P-MB type: {mb_type.name}, treating as skip")
-            luma, cb, cr = reconstruct_p_skip(
-                ref_buffer=self.state.ref_buffer,
-                mv_cache=self.state.mv_cache,
-                mb_x=mb_x,
-                mb_y=mb_y,
+            if use_weighted:
+                w_luma, o_luma, w_cb, o_cb, w_cr, o_cr = _weights_for_ref(0)
+                luma_pred, cb_pred, cr_pred = reconstruct_p_skip_weighted(
+                    ref_buffer=self.state.ref_buffer,
+                    mv_cache=self.state.mv_cache,
+                    mb_x=mb_x,
+                    mb_y=mb_y,
+                    weight_luma=w_luma,
+                    offset_luma=o_luma,
+                    log2_denom_luma=luma_log2_denom,
+                    weight_cb=w_cb,
+                    offset_cb=o_cb,
+                    weight_cr=w_cr,
+                    offset_cr=o_cr,
+                    log2_denom_chroma=chroma_log2_denom,
+                )
+            else:
+                luma_pred, cb_pred, cr_pred = reconstruct_p_skip(
+                    ref_buffer=self.state.ref_buffer,
+                    mv_cache=self.state.mv_cache,
+                    mb_x=mb_x, mb_y=mb_y,
+                )
+
+        # ── Step 2: Parse coded_block_pattern (H.264 Table 9-4, inter column) ──
+
+        cbp_coded = reader.read_ue()
+        cbp_luma, cbp_chroma = decode_cbp_inter(cbp_coded)
+
+        # Parse mb_qp_delta if any coefficients are coded
+        mb_qp_delta = 0
+        if cbp_luma > 0 or cbp_chroma > 0:
+            mb_qp_delta = reader.read_se()
+        current_qp = (qp + mb_qp_delta + 52) % 52
+
+        if trace:
+            logger.warning(
+                "TRACE CBP cbp_coded=%s luma=%s chroma=%s mb_qp_delta=%s qp=%s",
+                cbp_coded,
+                cbp_luma,
+                cbp_chroma,
+                mb_qp_delta,
+                current_qp,
             )
-            ly, lx = mb_y * 16, mb_x * 16
-            cy, cx = mb_y * 8, mb_x * 8
-            self.state.frame_luma[ly:ly + 16, lx:lx + 16] = luma
-            self.state.frame_cb[cy:cy + 8, cx:cx + 8] = cb
-            self.state.frame_cr[cy:cy + 8, cx:cx + 8] = cr
 
-    def _parse_p_mb_residual(
-        self,
-        reader: 'BitReader',
-        cbp: int,
-        qp: int,
-    ) -> Tuple[Optional[np.ndarray], Optional[np.ndarray], Optional[np.ndarray]]:
-        """Parse residual data for a P-macroblock.
+        logger.debug(
+            f"  CBP: luma={cbp_luma:#06b}, chroma={cbp_chroma}, "
+            f"qp_delta={mb_qp_delta}, qp={current_qp}"
+        )
 
-        Args:
-            reader: BitReader positioned at residual data
-            cbp: Coded block pattern
-            qp: Quantization parameter
+        # ── Step 3: Parse luma residual (16 4x4 blocks via CAVLC) ──
 
-        Returns:
-            Tuple of (luma, cb, cr) residual arrays or None if no residual
-        """
-        from inter.p_macroblock import parse_p_residual
-        return parse_p_residual(reader, cbp, qp)
+        nz_counts = np.zeros(24, dtype=np.int32)
+        luma_residual = np.zeros((16, 16), dtype=np.int32)
 
-    def _apply_p_residual(
-        self,
-        prediction: np.ndarray,
-        residual: Optional[np.ndarray],
-    ) -> np.ndarray:
-        """Apply residual to prediction to get reconstructed block.
-
-        Args:
-            prediction: Predicted block from motion compensation
-            residual: Residual block or None
-
-        Returns:
-            Reconstructed block (clipped to [0, 255])
-        """
-        if residual is None:
-            return prediction
-        return np.clip(
-            prediction.astype(np.int32) + residual, 0, 255
-        ).astype(np.uint8)
-
-    def _decode_p_luma_residual(
-        self,
-        reader: 'BitReader',
-        cbp_luma: int,
-        qp: int,
-    ) -> Optional[np.ndarray]:
-        """Decode luma residual blocks for P-macroblock.
-
-        Args:
-            reader: BitReader
-            cbp_luma: Lower 4 bits of CBP indicating which 8x8 blocks have residual
-            qp: Quantization parameter
-
-        Returns:
-            16x16 luma residual or None if CBP indicates no luma residual
-        """
-        if cbp_luma == 0:
-            return None
-
-        from entropy import decode_residual_block
-        from dequant import dequant_4x4
-        from transform import idct_4x4
-
-        residual = np.zeros((16, 16), dtype=np.int32)
-
-        # Process each 8x8 block
-        for i8x8 in range(4):
-            if not (cbp_luma & (1 << i8x8)):
+        for block_idx in range(16):
+            block_8x8_idx = block_idx // 4
+            if not (cbp_luma & (1 << block_8x8_idx)):
+                nz_counts[block_idx] = 0
                 continue
 
-            # 8x8 block position
-            bx8 = (i8x8 % 2) * 8
-            by8 = (i8x8 // 2) * 8
+            nA, nB = get_luma_neighbor_nz(
+                block_idx, mb_x, mb_y, nz_counts,
+                self.state.nz_counts, mb_width
+            )
+            nC = calculate_nC(nA, nB)
+            block = decode_residual_block(reader, nC, max_coeffs=16)
+            nz_counts[block_idx] = block.total_coeff
 
-            # Process four 4x4 blocks within this 8x8
-            for i4x4 in range(4):
-                bx4 = bx8 + (i4x4 % 2) * 4
-                by4 = by8 + (i4x4 // 2) * 4
+            if block.total_coeff > 0:
+                coeffs_2d = np.zeros((4, 4), dtype=np.int32)
+                for scan_idx in range(16):
+                    raster_pos = ZIGZAG_4x4[scan_idx]
+                    r, c = raster_pos // 4, raster_pos % 4
+                    coeffs_2d[r, c] = block.coefficients[scan_idx]
+                dequant = dequant_4x4(coeffs_2d, current_qp)
+                residual_block = idct_4x4(dequant)
+                row, col = BLOCK_SCAN_ORDER[block_idx]
+                luma_residual[row:row+4, col:col+4] = residual_block
 
-                # Decode coefficients
-                coeffs = decode_residual_block(reader, 16, 'luma_ac')
-                if coeffs is not None:
-                    dequant = dequant_4x4(coeffs, qp)
-                    block = idct_4x4(dequant)
-                    residual[by4:by4+4, bx4:bx4+4] = block
+        # ── Step 4: Parse chroma residual ──
 
-        return residual
+        chroma_qp_offset = getattr(pps, 'chroma_qp_index_offset', 0)
+        qpi = max(0, min(51, current_qp + chroma_qp_offset))
+        qp_chroma = get_chroma_qp(qpi)
 
-    def _decode_p_chroma_residual(
-        self,
-        reader: 'BitReader',
-        cbp_chroma: int,
-        qp: int,
-    ) -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]:
-        """Decode chroma residual blocks for P-macroblock.
+        # Chroma DC: Cb then Cr (H.264 7.3.5.3)
+        cb_dc = decode_chroma_dc(reader, cbp_chroma, qp_chroma)
+        cr_dc = decode_chroma_dc(reader, cbp_chroma, qp_chroma)
 
-        Args:
-            reader: BitReader
-            cbp_chroma: Upper bits of CBP for chroma (0=none, 1=DC only, 2=DC+AC)
-            qp: Quantization parameter
+        # Chroma AC: Cb then Cr
+        cb_ac = decode_chroma_ac(
+            reader, cbp_chroma, nz_counts, 16,
+            mb_x, mb_y, self.state.nz_counts, mb_width
+        )
+        cr_ac = decode_chroma_ac(
+            reader, cbp_chroma, nz_counts, 20,
+            mb_x, mb_y, self.state.nz_counts, mb_width
+        )
 
-        Returns:
-            Tuple of (cb, cr) 8x8 residual arrays or None
-        """
-        if cbp_chroma == 0:
-            return None, None
+        # Build chroma residual arrays
+        cb_residual = build_chroma_residual(cb_dc, cb_ac, cbp_chroma, qp_chroma)
+        cr_residual = build_chroma_residual(cr_dc, cr_ac, cbp_chroma, qp_chroma)
 
-        from entropy import decode_residual_block
-        from dequant import dequant_4x4, dequant_dc_2x2
-        from transform import idct_4x4, hadamard_2x2_inverse
+        # ── Step 5: Combine prediction + residual, write to frame ──
+        ly, lx = mb_y * 16, mb_x * 16
+        cy, cx = mb_y * 8, mb_x * 8
 
-        cb_residual = np.zeros((8, 8), dtype=np.int32)
-        cr_residual = np.zeros((8, 8), dtype=np.int32)
+        luma = np.clip(
+            luma_pred.astype(np.int32) + luma_residual, 0, 255
+        ).astype(np.uint8)
+        cb = np.clip(
+            cb_pred.astype(np.int32) + cb_residual, 0, 255
+        ).astype(np.uint8)
+        cr = np.clip(
+            cr_pred.astype(np.int32) + cr_residual, 0, 255
+        ).astype(np.uint8)
 
-        qp_c = min(qp, 51)  # Chroma QP
+        self.state.frame_luma[ly:ly + 16, lx:lx + 16] = luma
+        self.state.frame_cb[cy:cy + 8, cx:cx + 8] = cb
+        self.state.frame_cr[cy:cy + 8, cx:cx + 8] = cr
 
-        for chroma_idx, residual in enumerate([cb_residual, cr_residual]):
-            # Decode DC coefficients (2x2)
-            dc_coeffs = decode_residual_block(reader, 4, 'chroma_dc')
-            if dc_coeffs is not None:
-                dc_dequant = dequant_dc_2x2(dc_coeffs, qp_c)
-                dc_transform = hadamard_2x2_inverse(dc_dequant)
+        if trace:
+            trace_pixel = getattr(self, "_trace_pixel", None)
+            if trace_pixel is not None:
+                px, py = trace_pixel
+                if lx <= px < lx + 16 and ly <= py < ly + 16:
+                    rx, ry = px - lx, py - ly
+                    logger.warning(
+                        "TRACE pixel pre-deblock frame_num=%s (x,y)=(%s,%s) rel=(%s,%s) pred=%s resid=%s out=%s",
+                        frame_num,
+                        px,
+                        py,
+                        rx,
+                        ry,
+                        int(luma_pred[ry, rx]),
+                        int(luma_residual[ry, rx]),
+                        int(luma[ry, rx]),
+                    )
+            self._trace_pre_mb = (frame_num, mb_x, mb_y, luma.copy())
 
-            # Decode AC coefficients if cbp_chroma == 2
-            if cbp_chroma >= 2:
-                for i4x4 in range(4):
-                    bx = (i4x4 % 2) * 4
-                    by = (i4x4 // 2) * 4
+        # Store nz_counts for CAVLC context of neighboring MBs
+        self.state.nz_counts[mb_idx] = nz_counts
 
-                    ac_coeffs = decode_residual_block(reader, 15, 'chroma_ac')
-                    block = np.zeros((4, 4), dtype=np.int32)
-                    if dc_coeffs is not None:
-                        block[0, 0] = dc_transform[i4x4 // 2, i4x4 % 2]
-                    if ac_coeffs is not None:
-                        # Fill in AC coefficients
-                        pass  # Simplified for now
-                    dequant = dequant_4x4(block, qp_c)
-                    residual[by:by+4, bx:bx+4] = idct_4x4(dequant)
+        # Store deblocking metadata for inter P-MB
+        if self.state.mb_types is not None:
+            self.state.mb_types[mb_idx] = 99  # Non-intra sentinel
+        if self.state.mb_qps is not None:
+            self.state.mb_qps[mb_idx] = current_qp
+        if self.state.mb_coeffs is not None:
+            self.state.mb_coeffs[mb_idx, :16] = (nz_counts[:16] > 0)
 
-        return cb_residual, cr_residual
+        return current_qp
 
     def _deblock_frame(self, slice_header: 'SliceHeader', sps: 'SPS',
                        pps: 'PPS' = None) -> None:
@@ -1187,6 +1608,7 @@ class H264Decoder:
             disable_deblocking_filter_idc=slice_header.disable_deblocking_filter_idc,
             mb_slice_ids=self.state.mb_slice_ids,
             chroma_qp_index_offset=chroma_qp_offset,
+            mv_cache=self.state.mv_cache,
         )
 
     def _get_deblock_params(self, slice_header: 'SliceHeader') -> dict:
@@ -1544,6 +1966,7 @@ class H264Decoder:
 
             if mb_info.is_intra:
                 # I-macroblock in B-slice
+                # mb_type_code >= 23 means intra; intra type = mb_type_code - 23
                 mb_data = decode_macroblock(
                     reader=reader,
                     sps=sps,
@@ -1558,6 +1981,7 @@ class H264Decoder:
                     frame_nz_counts=self.state.nz_counts,
                     frame_width_mbs=mb_width,
                     frame_intra_modes=self.state.intra_modes,
+                    pre_parsed_mb_type=mb_type_code - 23,
                 )
             else:
                 # B-macroblock
@@ -1626,9 +2050,19 @@ class H264Decoder:
             mb_info = self._build_cabac_mb_info(mb_x, mb_y, mb_width, sps, pps)
 
             # Decode macroblock syntax using CABAC
-            mb_data = decode_macroblock_layer_cabac(
-                cabac, contexts, slice_type, mb_info
-            )
+            try:
+                mb_data = decode_macroblock_layer_cabac(
+                    cabac, contexts, slice_type, mb_info
+                )
+            except Exception as exc:
+                msg = str(exc)
+                if "Cannot read" in msg or "Needed a length" in msg:
+                    logger.warning(
+                        "CABAC bitstream ended early while decoding MB "
+                        f"({mb_x}, {mb_y}); stopping slice decode."
+                    )
+                    break
+                raise
 
             logger.debug(
                 f"CABAC MB ({mb_x}, {mb_y}): skip={mb_data.get('mb_skip_flag', 0)}, "
@@ -1637,17 +2071,37 @@ class H264Decoder:
             )
 
             # Process the decoded macroblock
-            self._process_cabac_macroblock(
-                cabac, contexts, mb_data, mb_x, mb_y,
-                current_qp, sps, pps, slice_type
-            )
+            try:
+                self._process_cabac_macroblock(
+                    cabac, contexts, mb_data, mb_x, mb_y,
+                    current_qp, sps, pps, slice_type
+                )
+            except Exception as exc:
+                msg = str(exc)
+                if "Cannot read" in msg or "Needed a length" in msg:
+                    logger.warning(
+                        "CABAC macroblock decode failed at MB "
+                        f"({mb_x}, {mb_y}); stopping slice decode."
+                    )
+                    break
+                raise
 
             # Update QP
             current_qp = (current_qp + mb_data.get('mb_qp_delta', 0) + 52) % 52
 
             # Check for end of slice
-            if decode_end_of_slice_flag_cabac(cabac, contexts) == 1:
-                break
+            try:
+                if decode_end_of_slice_flag_cabac(cabac, contexts) == 1:
+                    break
+            except Exception as exc:
+                msg = str(exc)
+                if "Cannot read" in msg or "Needed a length" in msg:
+                    logger.warning(
+                        "CABAC end_of_slice_flag read failed at MB "
+                        f"({mb_x}, {mb_y}); stopping slice decode."
+                    )
+                    break
+                raise
 
             mb_idx += 1
 

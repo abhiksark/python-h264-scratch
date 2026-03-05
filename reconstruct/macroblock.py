@@ -254,6 +254,77 @@ def decode_cbp_intra(coded_value: int) -> Tuple[int, int]:
     return 0, 0
 
 
+# CBP lookup table for Inter macroblocks (H.264 Table 9-4, Inter column)
+# Maps codeNum from me(v) to (cbp_luma, cbp_chroma)
+# Inter ordering prioritizes no-coefficient patterns (skip-like) first.
+CBP_INTER_TABLE = [
+    (0, 0),   # 0:  cbp=0
+    (0, 1),   # 1:  cbp=16
+    (1, 0),   # 2:  cbp=1
+    (2, 0),   # 3:  cbp=2
+    (4, 0),   # 4:  cbp=4
+    (8, 0),   # 5:  cbp=8
+    (0, 2),   # 6:  cbp=32
+    (3, 0),   # 7:  cbp=3
+    (5, 0),   # 8:  cbp=5
+    (10, 0),  # 9:  cbp=10
+    (12, 0),  # 10: cbp=12
+    (15, 0),  # 11: cbp=15
+    (15, 2),  # 12: cbp=47
+    (7, 0),   # 13: cbp=7
+    (11, 0),  # 14: cbp=11
+    (13, 0),  # 15: cbp=13
+    (14, 0),  # 16: cbp=14
+    (6, 0),   # 17: cbp=6
+    (9, 0),   # 18: cbp=9
+    (15, 1),  # 19: cbp=31
+    (3, 2),   # 20: cbp=35
+    (5, 2),   # 21: cbp=37
+    (10, 2),  # 22: cbp=42
+    (12, 2),  # 23: cbp=44
+    (1, 2),   # 24: cbp=33
+    (2, 2),   # 25: cbp=34
+    (4, 2),   # 26: cbp=36
+    (8, 2),   # 27: cbp=40
+    (7, 2),   # 28: cbp=39
+    (11, 2),  # 29: cbp=43
+    (13, 2),  # 30: cbp=45
+    (14, 2),  # 31: cbp=46
+    (1, 1),   # 32: cbp=17
+    (2, 1),   # 33: cbp=18
+    (4, 1),   # 34: cbp=20
+    (8, 1),   # 35: cbp=24
+    (3, 1),   # 36: cbp=19
+    (5, 1),   # 37: cbp=21
+    (10, 1),  # 38: cbp=26
+    (12, 1),  # 39: cbp=28
+    (7, 1),   # 40: cbp=23
+    (11, 1),  # 41: cbp=27
+    (13, 1),  # 42: cbp=29
+    (14, 1),  # 43: cbp=30
+    (6, 1),   # 44: cbp=22
+    (9, 1),   # 45: cbp=25
+    (6, 2),   # 46: cbp=38
+    (9, 2),   # 47: cbp=41
+]
+
+
+def decode_cbp_inter(coded_value: int) -> Tuple[int, int]:
+    """Decode coded_block_pattern for inter macroblocks.
+
+    H.264 Spec Reference: Table 9-4 (Inter column)
+
+    Args:
+        coded_value: ue(v) coded value (codeNum)
+
+    Returns:
+        Tuple of (cbp_luma, cbp_chroma)
+    """
+    if coded_value < len(CBP_INTER_TABLE):
+        return CBP_INTER_TABLE[coded_value]
+    return 0, 0
+
+
 def _get_4x4_block_position(block_idx: int) -> Tuple[int, int]:
     """Get top-left position of 4x4 block within 16x16 MB.
 
@@ -1676,6 +1747,65 @@ def reconstruct_chroma_plane(
     return _clip_block(reconstructed)
 
 
+def build_chroma_residual(
+    dc_dequant: Optional[np.ndarray],
+    ac_blocks: List[CAVLCBlock],
+    cbp_chroma: int,
+    qp_chroma: int,
+) -> np.ndarray:
+    """Build 8x8 chroma residual from decoded DC and AC coefficients.
+
+    Unlike reconstruct_chroma_plane, this does NOT add intra prediction.
+    Used for inter macroblocks where prediction comes from motion compensation.
+
+    H.264 Spec Reference: Section 8.5.1
+
+    Args:
+        dc_dequant: Dequantized 2x2 DC block (or None)
+        ac_blocks: List of 4 AC blocks (or empty list)
+        cbp_chroma: Chroma CBP
+        qp_chroma: Chroma QP
+
+    Returns:
+        8x8 chroma residual array (int32)
+    """
+    residual = np.zeros((8, 8), dtype=np.int32)
+
+    if dc_dequant is not None:
+        if ac_blocks:
+            # DC + AC
+            for block_idx, ac_block in enumerate(ac_blocks):
+                row = (block_idx // 2) * 4
+                col = (block_idx % 2) * 4
+
+                coeffs = np.zeros((4, 4), dtype=np.int32)
+                coeffs[0, 0] = dc_dequant[block_idx // 2, block_idx % 2]
+
+                for i, pos in enumerate(ZIGZAG_4x4[1:]):
+                    if i < len(ac_block.coefficients):
+                        r, c = pos // 4, pos % 4
+                        coeffs[r, c] = ac_block.coefficients[i]
+
+                coeffs_dequant = dequant_4x4(coeffs, qp_chroma)
+                coeffs_dequant[0, 0] = coeffs[0, 0]
+
+                block_residual = idct_4x4(coeffs_dequant)
+                residual[row:row+4, col:col+4] = block_residual
+        else:
+            # DC only
+            for block_idx in range(4):
+                row = (block_idx // 2) * 4
+                col = (block_idx % 2) * 4
+                dc_val = dc_dequant[block_idx // 2, block_idx % 2]
+                if dc_val != 0:
+                    coeffs = np.zeros((4, 4), dtype=np.int32)
+                    coeffs[0, 0] = dc_val
+                    block_residual = idct_4x4(coeffs)
+                    residual[row:row+4, col:col+4] = block_residual
+
+    return residual
+
+
 def reconstruct_chroma(
     reader: BitReader,
     pred_mode: int,
@@ -1745,6 +1875,7 @@ def decode_macroblock(
     frame_nz_counts: Optional[np.ndarray] = None,
     frame_width_mbs: Optional[int] = None,
     frame_intra_modes: Optional[np.ndarray] = None,
+    pre_parsed_mb_type: Optional[int] = None,
 ) -> MacroblockData:
     """Decode and reconstruct a complete macroblock.
 
@@ -1761,6 +1892,8 @@ def decode_macroblock(
         is_i_slice: Whether this is an I-slice
         frame_nz_counts: All MBs' nz_counts for CAVLC context, shape (num_mbs, 24)
         frame_width_mbs: Picture width in macroblocks for neighbor lookup
+        pre_parsed_mb_type: If provided, use this instead of reading from bitstream.
+            Used for intra MBs in P/B slices where mb_type was already consumed.
 
     Returns:
         Decoded macroblock data
@@ -1770,8 +1903,11 @@ def decode_macroblock(
     # Track starting position for checkpoints
     mb_start_pos = reader.position
 
-    # Parse mb_type
-    mb.mb_type = reader.read_ue()
+    # Parse mb_type (or use pre-parsed value for intra-in-P/B)
+    if pre_parsed_mb_type is not None:
+        mb.mb_type = pre_parsed_mb_type
+    else:
+        mb.mb_type = reader.read_ue()
 
     # Checkpoint: mb_type decoded
     if hasattr(reader, '_checkpoint_tracker'):

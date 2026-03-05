@@ -148,7 +148,7 @@ class TestPredict16x8:
     """Tests for 16x8 partition MV prediction (P_L0_L0_16x8)."""
 
     def test_top_partition(self):
-        """Top 16x8 partition uses standard median."""
+        """Top 16x8 partition prefers B (above) per H.264 8.4.1.3.1."""
         cache = MVCache(width_in_mbs=4, height_in_mbs=4)
 
         cache.set_mv_16x16(mb_x=0, mb_y=1, mvx=10, mvy=5)   # A
@@ -157,27 +157,26 @@ class TestPredict16x8:
 
         mvp_x, mvp_y = predict_mv_16x8(cache, mb_x=1, mb_y=1, partition=0)
 
-        # Same as 16x16
+        # Directional shortcut: top partition uses mvB directly
         assert mvp_x == 20
-        assert mvp_y == 10
+        assert mvp_y == 15
 
-    def test_bottom_partition_uses_top_as_b(self):
-        """Bottom 16x8 uses top partition of same MB as B."""
+    def test_bottom_partition_uses_a(self):
+        """Bottom 16x8 prefers A (left) per H.264 8.4.1.3.1."""
         cache = MVCache(width_in_mbs=4, height_in_mbs=4)
 
         # First decode top partition
         cache.set_mv(mb_x=1, mb_y=1, block_x=0, block_y=0, mvx=100, mvy=50)
         cache.set_mv(mb_x=1, mb_y=1, block_x=3, block_y=0, mvx=100, mvy=50)
 
-        # Left neighbor (bottom half)
+        # Left neighbor (bottom half) - block (3,2) is A for partition 1
         cache.set_mv(mb_x=0, mb_y=1, block_x=3, block_y=2, mvx=10, mvy=5)
 
         mvp_x, mvp_y = predict_mv_16x8(cache, mb_x=1, mb_y=1, partition=1)
 
-        # B comes from top partition of same MB
-        # Should prefer B for bottom 16x8
-        assert mvp_x == 100
-        assert mvp_y == 50
+        # Directional shortcut: bottom partition uses mvA directly
+        assert mvp_x == 10
+        assert mvp_y == 5
 
 
 class TestPredict8x16:

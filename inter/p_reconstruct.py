@@ -13,8 +13,12 @@ from typing import Tuple, Optional
 import numpy as np
 
 from inter.reference import ReferenceFrameBuffer
-from inter.motion_comp import get_luma_block_fractional, get_block_integer
-from inter.mv_prediction import MVCache, predict_mv_16x16
+from inter.motion_comp import (
+    get_luma_block_fractional,
+    get_block_integer,
+    get_chroma_block_fractional,
+)
+from inter.mv_prediction import MVCache, predict_mv_skip
 
 logger = logging.getLogger(__name__)
 
@@ -59,23 +63,25 @@ def apply_chroma_prediction(
     """Apply inter prediction for chroma component.
 
     Chroma uses bilinear interpolation at 1/8-pixel precision.
-    Input dx, dy are in luma quarter-pixel units.
+    Input dx, dy are in chroma eighth-pixel units (0-7).
 
     Args:
         ref_chroma: Reference frame chroma component
         ref_x: Integer X position (in chroma coordinates)
         ref_y: Integer Y position (in chroma coordinates)
-        dx: Fractional X from luma MV (0-3)
-        dy: Fractional Y from luma MV (0-3)
+        dx: Fractional X offset (0-7, in eighth-pixels)
+        dy: Fractional Y offset (0-7, in eighth-pixels)
         width: Block width
         height: Block height
 
     Returns:
         Predicted chroma block
+
+    H.264 Spec: Section 8.4.2.2.2
     """
-    # For simplicity, use integer position
-    # Full implementation would do bilinear at 1/8 pixel
-    return get_block_integer(ref_chroma, ref_x, ref_y, width, height)
+    return get_chroma_block_fractional(
+        ref_chroma, ref_x, ref_y, dx, dy, width, height
+    )
 
 
 def reconstruct_p_skip(
@@ -99,8 +105,8 @@ def reconstruct_p_skip(
     Returns:
         Tuple of (luma, cb, cr), each reconstructed block
     """
-    # Get predicted MV
-    mvp_x, mvp_y = predict_mv_16x16(mv_cache, mb_x, mb_y)
+    # Get predicted MV (H.264 8.4.1.2 — P_Skip special case)
+    mvp_x, mvp_y = predict_mv_skip(mv_cache, mb_x, mb_y)
 
     # MV is in quarter-pixel units
     # Convert to integer + fractional parts
@@ -122,13 +128,13 @@ def reconstruct_p_skip(
     )
 
     # Chroma prediction (8x8 each)
-    # Chroma MV is half of luma MV
-    chroma_mvx = mvp_x >> 1
-    chroma_mvy = mvp_y >> 1
-    int_cmvx = chroma_mvx >> 2
-    int_cmvy = chroma_mvy >> 2
-    frac_cx = chroma_mvx & 3
-    frac_cy = chroma_mvy & 3
+    # For 4:2:0, quarter-luma-pixel = eighth-chroma-pixel, so MV value is unchanged
+    chroma_mvx = mvp_x
+    chroma_mvy = mvp_y
+    int_cmvx = chroma_mvx >> 3
+    int_cmvy = chroma_mvy >> 3
+    frac_cx = chroma_mvx & 7
+    frac_cy = chroma_mvy & 7
 
     ref_cx = mb_x * 8 + int_cmvx
     ref_cy = mb_y * 8 + int_cmvy
@@ -199,13 +205,13 @@ def reconstruct_p_16x16(
     else:
         luma = pred_luma
 
-    # Chroma
-    chroma_mvx = mvx >> 1
-    chroma_mvy = mvy >> 1
-    int_cmvx = chroma_mvx >> 2
-    int_cmvy = chroma_mvy >> 2
-    frac_cx = chroma_mvx & 3
-    frac_cy = chroma_mvy & 3
+    # Chroma: quarter-luma-pixel = eighth-chroma-pixel, MV unchanged
+    chroma_mvx = mvx
+    chroma_mvy = mvy
+    int_cmvx = chroma_mvx >> 3
+    int_cmvy = chroma_mvy >> 3
+    frac_cx = chroma_mvx & 7
+    frac_cy = chroma_mvy & 7
 
     ref_cx = mb_x * 8 + int_cmvx
     ref_cy = mb_y * 8 + int_cmvy
@@ -355,10 +361,31 @@ def reconstruct_p_16x8(
         for by in range(2, 4):
             mv_cache.set_mv(mb_x, mb_y, bx, by, mvx[1], mvy[1])
 
-    # Chroma reconstruction (simplified - use partition 0 MV for whole MB)
-    cb, cr = _reconstruct_chroma_16x16(
-        ref_buffer, ref_idx[0], mvx[0], mvy[0], residual_cb, residual_cr, mb_x, mb_y
-    )
+    # Chroma reconstruction: per-partition MVs (top 4 rows / bottom 4 rows)
+    ref_frame = ref_buffer.get_frame(ref_idx[0])
+    pred_cb = np.zeros((8, 8), dtype=np.uint8)
+    pred_cr = np.zeros((8, 8), dtype=np.uint8)
+    for part in range(2):
+        cmvx = mvx[part]
+        cmvy = mvy[part]
+        cx = mb_x * 8 + (cmvx >> 3)
+        cy = mb_y * 8 + part * 4 + (cmvy >> 3)
+        fx, fy = cmvx & 7, cmvy & 7
+        pred_cb[part*4:(part+1)*4, :] = apply_chroma_prediction(
+            ref_frame.cb, cx, cy, fx, fy, 8, 4
+        )
+        pred_cr[part*4:(part+1)*4, :] = apply_chroma_prediction(
+            ref_frame.cr, cx, cy, fx, fy, 8, 4
+        )
+
+    if residual_cb is not None:
+        cb = np.clip(pred_cb.astype(np.int32) + residual_cb, 0, 255).astype(np.uint8)
+    else:
+        cb = pred_cb
+    if residual_cr is not None:
+        cr = np.clip(pred_cr.astype(np.int32) + residual_cr, 0, 255).astype(np.uint8)
+    else:
+        cr = pred_cr
 
     logger.debug(f"P_16x8 MB({mb_x},{mb_y}): MVs=[({mvx[0]},{mvy[0]}),({mvx[1]},{mvy[1]})]")
 
@@ -432,10 +459,31 @@ def reconstruct_p_8x16(
         for bx in range(2, 4):
             mv_cache.set_mv(mb_x, mb_y, bx, by, mvx[1], mvy[1])
 
-    # Chroma reconstruction
-    cb, cr = _reconstruct_chroma_16x16(
-        ref_buffer, ref_idx[0], mvx[0], mvy[0], residual_cb, residual_cr, mb_x, mb_y
-    )
+    # Chroma reconstruction: per-partition MVs (left 4 cols / right 4 cols)
+    ref_frame = ref_buffer.get_frame(ref_idx[0])
+    pred_cb = np.zeros((8, 8), dtype=np.uint8)
+    pred_cr = np.zeros((8, 8), dtype=np.uint8)
+    for part in range(2):
+        cmvx = mvx[part]
+        cmvy = mvy[part]
+        cx = mb_x * 8 + part * 4 + (cmvx >> 3)
+        cy = mb_y * 8 + (cmvy >> 3)
+        fx, fy = cmvx & 7, cmvy & 7
+        pred_cb[:, part*4:(part+1)*4] = apply_chroma_prediction(
+            ref_frame.cb, cx, cy, fx, fy, 4, 8
+        )
+        pred_cr[:, part*4:(part+1)*4] = apply_chroma_prediction(
+            ref_frame.cr, cx, cy, fx, fy, 4, 8
+        )
+
+    if residual_cb is not None:
+        cb = np.clip(pred_cb.astype(np.int32) + residual_cb, 0, 255).astype(np.uint8)
+    else:
+        cb = pred_cb
+    if residual_cr is not None:
+        cr = np.clip(pred_cr.astype(np.int32) + residual_cr, 0, 255).astype(np.uint8)
+    else:
+        cr = pred_cr
 
     logger.debug(f"P_8x16 MB({mb_x},{mb_y}): MVs=[({mvx[0]},{mvy[0]}),({mvx[1]},{mvy[1]})]")
 
@@ -506,10 +554,34 @@ def reconstruct_p_8x8(
             for bx in range(bx_start, bx_start + 2):
                 mv_cache.set_mv(mb_x, mb_y, bx, by, mvx[sub_idx], mvy[sub_idx])
 
-    # Chroma reconstruction
-    cb, cr = _reconstruct_chroma_16x16(
-        ref_buffer, ref_idx[0], mvx[0], mvy[0], residual_cb, residual_cr, mb_x, mb_y
-    )
+    # Chroma reconstruction: per-sub-MB MVs (each sub-MB → 4x4 chroma quadrant)
+    ref_frame = ref_buffer.get_frame(ref_idx[0])
+    pred_cb = np.zeros((8, 8), dtype=np.uint8)
+    pred_cr = np.zeros((8, 8), dtype=np.uint8)
+    # Sub-MB chroma offsets: (cx_off, cy_off) within 8x8 chroma
+    chroma_offsets = [(0, 0), (4, 0), (0, 4), (4, 4)]
+    for sub_idx in range(4):
+        cx_off, cy_off = chroma_offsets[sub_idx]
+        cmvx = mvx[sub_idx]
+        cmvy = mvy[sub_idx]
+        cx = mb_x * 8 + cx_off + (cmvx >> 3)
+        cy = mb_y * 8 + cy_off + (cmvy >> 3)
+        fx, fy = cmvx & 7, cmvy & 7
+        pred_cb[cy_off:cy_off+4, cx_off:cx_off+4] = apply_chroma_prediction(
+            ref_frame.cb, cx, cy, fx, fy, 4, 4
+        )
+        pred_cr[cy_off:cy_off+4, cx_off:cx_off+4] = apply_chroma_prediction(
+            ref_frame.cr, cx, cy, fx, fy, 4, 4
+        )
+
+    if residual_cb is not None:
+        cb = np.clip(pred_cb.astype(np.int32) + residual_cb, 0, 255).astype(np.uint8)
+    else:
+        cb = pred_cb
+    if residual_cr is not None:
+        cr = np.clip(pred_cr.astype(np.int32) + residual_cr, 0, 255).astype(np.uint8)
+    else:
+        cr = pred_cr
 
     logger.debug(f"P_8x8 MB({mb_x},{mb_y}): MVs={list(zip(mvx, mvy))}")
 
@@ -695,13 +767,13 @@ def _reconstruct_chroma_16x16(
     """
     ref_frame = ref_buffer.get_frame(ref_idx)
 
-    # Chroma MV is half of luma MV
-    chroma_mvx = mvx >> 1
-    chroma_mvy = mvy >> 1
-    int_cmvx = chroma_mvx >> 2
-    int_cmvy = chroma_mvy >> 2
-    frac_cx = chroma_mvx & 3
-    frac_cy = chroma_mvy & 3
+    # For 4:2:0, quarter-luma-pixel = eighth-chroma-pixel, MV unchanged
+    chroma_mvx = mvx
+    chroma_mvy = mvy
+    int_cmvx = chroma_mvx >> 3
+    int_cmvy = chroma_mvy >> 3
+    frac_cx = chroma_mvx & 7
+    frac_cy = chroma_mvy & 7
 
     ref_cx = mb_x * 8 + int_cmvx
     ref_cy = mb_y * 8 + int_cmvy
@@ -804,13 +876,13 @@ def reconstruct_p_16x16_weighted(
     else:
         luma = weighted_luma
 
-    # Chroma prediction
-    chroma_mvx = mvx >> 1
-    chroma_mvy = mvy >> 1
-    int_cmvx = chroma_mvx >> 2
-    int_cmvy = chroma_mvy >> 2
-    frac_cx = chroma_mvx & 3
-    frac_cy = chroma_mvy & 3
+    # Chroma prediction: quarter-luma-pixel = eighth-chroma-pixel, MV unchanged
+    chroma_mvx = mvx
+    chroma_mvy = mvy
+    int_cmvx = chroma_mvx >> 3
+    int_cmvy = chroma_mvy >> 3
+    frac_cx = chroma_mvx & 7
+    frac_cy = chroma_mvy & 7
 
     ref_cx = mb_x * 8 + int_cmvx
     ref_cy = mb_y * 8 + int_cmvy
@@ -890,8 +962,8 @@ def reconstruct_p_skip_weighted(
     """
     from inter.weighted_pred import apply_weighted_prediction, apply_weighted_prediction_chroma
 
-    # Get predicted MV (P_Skip uses predicted MV with no residual)
-    mvp_x, mvp_y = predict_mv_16x16(mv_cache, mb_x, mb_y)
+    # Get predicted MV (H.264 8.4.1.2 — P_Skip special case)
+    mvp_x, mvp_y = predict_mv_skip(mv_cache, mb_x, mb_y)
 
     # MV to integer + fractional
     int_mvx = mvp_x >> 2
@@ -915,13 +987,13 @@ def reconstruct_p_skip_weighted(
         pred_luma, weight_luma, offset_luma, log2_denom_luma
     )
 
-    # Chroma prediction
-    chroma_mvx = mvp_x >> 1
-    chroma_mvy = mvp_y >> 1
-    int_cmvx = chroma_mvx >> 2
-    int_cmvy = chroma_mvy >> 2
-    frac_cx = chroma_mvx & 3
-    frac_cy = chroma_mvy & 3
+    # Chroma prediction: quarter-luma-pixel = eighth-chroma-pixel, MV unchanged
+    chroma_mvx = mvp_x
+    chroma_mvy = mvp_y
+    int_cmvx = chroma_mvx >> 3
+    int_cmvy = chroma_mvy >> 3
+    frac_cx = chroma_mvx & 7
+    frac_cy = chroma_mvy & 7
 
     ref_cx = mb_x * 8 + int_cmvx
     ref_cy = mb_y * 8 + int_cmvy
@@ -1285,13 +1357,13 @@ def _reconstruct_chroma_weighted(
 
     ref_frame = ref_buffer.get_frame(ref_idx)
 
-    # Chroma MV is half of luma
-    chroma_mvx = mvx >> 1
-    chroma_mvy = mvy >> 1
-    int_cmvx = chroma_mvx >> 2
-    int_cmvy = chroma_mvy >> 2
-    frac_cx = chroma_mvx & 3
-    frac_cy = chroma_mvy & 3
+    # For 4:2:0, quarter-luma-pixel = eighth-chroma-pixel, MV unchanged
+    chroma_mvx = mvx
+    chroma_mvy = mvy
+    int_cmvx = chroma_mvx >> 3
+    int_cmvy = chroma_mvy >> 3
+    frac_cx = chroma_mvx & 7
+    frac_cy = chroma_mvy & 7
 
     ref_cx = mb_x * 8 + int_cmvx
     ref_cy = mb_y * 8 + int_cmvy

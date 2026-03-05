@@ -376,23 +376,27 @@ def get_luma_block_fractional(
 
     else:
         # Quarter-pixel in both directions (dx=1 or 3, dy=1 or 3)
-        # Average the two nearest half-pixel positions
-        half_hv = interpolate_half_hv(ref_frame, x, y, width, height)
-
+        # H.264 spec 8.4.2.2.1: average two nearest half-pel samples
+        # e(1,1) = (b + h + 1) >> 1   b=half_h(x,y), h=half_v(x,y)
+        # g(3,1) = (b + m + 1) >> 1   b=half_h(x,y), m=half_v(x+1,y)
+        # p(1,3) = (h + s + 1) >> 1   h=half_v(x,y), s=half_h(x,y+1)
+        # r(3,3) = (m + s + 1) >> 1   m=half_v(x+1,y), s=half_h(x,y+1)
         if dx == 1 and dy == 1:
-            # Average half-hv with half-h (above) and half-v (left)
-            # Per spec, use diagonal and one of the cardinal half-pixels
             half_h = interpolate_half_h(ref_frame, x, y, width, height)
-            avg = (half_hv.astype(np.int32) + half_h.astype(np.int32) + 1) >> 1
+            half_v = interpolate_half_v(ref_frame, x, y, width, height)
+            avg = (half_h.astype(np.int32) + half_v.astype(np.int32) + 1) >> 1
         elif dx == 3 and dy == 1:
-            half_h = interpolate_half_h(ref_frame, x + 1, y, width, height)
-            avg = (half_hv.astype(np.int32) + half_h.astype(np.int32) + 1) >> 1
+            half_h = interpolate_half_h(ref_frame, x, y, width, height)
+            half_v = interpolate_half_v(ref_frame, x + 1, y, width, height)
+            avg = (half_h.astype(np.int32) + half_v.astype(np.int32) + 1) >> 1
         elif dx == 1 and dy == 3:
-            half_v = interpolate_half_v(ref_frame, x, y + 1, width, height)
-            avg = (half_hv.astype(np.int32) + half_v.astype(np.int32) + 1) >> 1
+            half_v = interpolate_half_v(ref_frame, x, y, width, height)
+            half_h = interpolate_half_h(ref_frame, x, y + 1, width, height)
+            avg = (half_v.astype(np.int32) + half_h.astype(np.int32) + 1) >> 1
         else:  # dx == 3 and dy == 3
-            half_v = interpolate_half_v(ref_frame, x + 1, y + 1, width, height)
-            avg = (half_hv.astype(np.int32) + half_v.astype(np.int32) + 1) >> 1
+            half_v = interpolate_half_v(ref_frame, x + 1, y, width, height)
+            half_h = interpolate_half_h(ref_frame, x, y + 1, width, height)
+            avg = (half_v.astype(np.int32) + half_h.astype(np.int32) + 1) >> 1
         block = avg.astype(np.uint8)
 
     return block
