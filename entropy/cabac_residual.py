@@ -261,6 +261,38 @@ def decode_residual_block_cabac(
     return coeffs
 
 
+def decode_residual_block_cabac_with_cbf(
+    decoder: 'CABACDecoder',
+    contexts: List['CABACContext'],
+    max_coeff: int,
+    block_cat: int,
+    coded_block_flag_ctx_idx: int,
+) -> np.ndarray:
+    """Decode residual block with coded_block_flag check.
+
+    For CABAC, each block has a coded_block_flag decoded before the
+    significance map. If coded_block_flag=0, the block is all zeros.
+
+    H.264 Spec Reference: Section 9.3.3.1.1.9
+
+    Args:
+        decoder: CABAC decoder
+        contexts: Context models
+        max_coeff: Maximum coefficients (4, 15, or 16)
+        block_cat: Block category (0-4)
+        coded_block_flag_ctx_idx: Context index for coded_block_flag
+
+    Returns:
+        Array of coefficients (all zeros if coded_block_flag=0)
+    """
+    cbf = decoder.decode_decision(contexts[coded_block_flag_ctx_idx])
+
+    if cbf == 0:
+        return np.zeros(max_coeff, dtype=np.int32)
+
+    return decode_residual_block_cabac(decoder, contexts, max_coeff, block_cat)
+
+
 def decode_coeff_abs_level_suffix_bypass(
     decoder: 'CABACDecoder',
     prefix_value: int,
