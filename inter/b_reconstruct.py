@@ -13,7 +13,10 @@ from typing import Tuple, Optional, List
 import numpy as np
 
 from inter.reference import ReferenceFrameBuffer
-from inter.motion_comp import get_luma_block_fractional, get_block_integer
+from inter.motion_comp import (
+    get_luma_block_fractional,
+    get_chroma_block_fractional,
+)
 from inter.mv_prediction import MVCache
 from inter.bipred import bipred_average, bipred_chroma
 from inter.direct_mode import derive_direct_mv
@@ -45,8 +48,13 @@ def _apply_chroma_prediction(
     width: int,
     height: int,
 ) -> np.ndarray:
-    """Apply inter prediction for chroma component."""
-    return get_block_integer(ref_chroma, ref_x, ref_y, width, height)
+    """Apply inter prediction for chroma component.
+
+    H.264 Spec: Section 8.4.2.2.2 - Chroma sample interpolation (1/8-pixel bilinear)
+    """
+    return get_chroma_block_fractional(
+        ref_chroma, ref_x, ref_y, frac_x, frac_y, width, height
+    )
 
 
 def _get_prediction_l0(
@@ -74,13 +82,11 @@ def _get_prediction_l0(
         ref_frame.luma, ref_x, ref_y, frac_x, frac_y, width, height
     )
 
-    # Chroma
-    chroma_mvx = mvx >> 1
-    chroma_mvy = mvy >> 1
-    int_cmvx = chroma_mvx >> 2
-    int_cmvy = chroma_mvy >> 2
-    frac_cx = chroma_mvx & 3
-    frac_cy = chroma_mvy & 3
+    # Chroma: luma quarter-pel MV → chroma eighth-pel (4:2:0 halves resolution)
+    int_cmvx = mvx >> 3
+    int_cmvy = mvy >> 3
+    frac_cx = mvx & 7
+    frac_cy = mvy & 7
 
     ref_cx = mb_x * 8 + int_cmvx
     ref_cy = mb_y * 8 + int_cmvy
@@ -120,13 +126,11 @@ def _get_prediction_l1(
         ref_frame.luma, ref_x, ref_y, frac_x, frac_y, width, height
     )
 
-    # Chroma
-    chroma_mvx = mvx >> 1
-    chroma_mvy = mvy >> 1
-    int_cmvx = chroma_mvx >> 2
-    int_cmvy = chroma_mvy >> 2
-    frac_cx = chroma_mvx & 3
-    frac_cy = chroma_mvy & 3
+    # Chroma: luma quarter-pel MV → chroma eighth-pel (4:2:0 halves resolution)
+    int_cmvx = mvx >> 3
+    int_cmvy = mvy >> 3
+    frac_cx = mvx & 7
+    frac_cy = mvy & 7
 
     ref_cx = mb_x * 8 + int_cmvx
     ref_cy = mb_y * 8 + int_cmvy
