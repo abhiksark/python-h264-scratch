@@ -1335,6 +1335,123 @@ def _get_i4x4_neighbors(
     return top, left, top_left, top_right
 
 
+def reconstruct_i16x16_from_coeffs(
+    pred_mode: int,
+    cbp_luma: int,
+    qp: int,
+    dc_coeffs: np.ndarray,
+    ac_coeffs_list: List[Optional[np.ndarray]],
+    neighbors_top: Optional[np.ndarray],
+    neighbors_left: Optional[np.ndarray],
+    neighbor_top_left: Optional[int],
+) -> np.ndarray:
+    """Reconstruct I_16x16 luma macroblock from pre-parsed coefficients.
+
+    Entropy-independent reconstruction: takes DC and AC coefficient arrays
+    instead of a BitReader. This allows both CAVLC and CABAC to share the
+    same reconstruction pipeline.
+
+    H.264 Spec Reference: Section 8.5 (transform decoding)
+
+    Args:
+        pred_mode: Intra 16x16 prediction mode (0-3).
+        cbp_luma: Luma CBP (0 or 15).
+        qp: Quantization parameter.
+        dc_coeffs: 16-element array of DC coefficients in scan order.
+        ac_coeffs_list: List of 16 elements. Each is either None (uncoded
+            block) or a 15-element array of AC coefficients in scan order.
+        neighbors_top: Top neighbor pixels (16,) or None.
+        neighbors_left: Left neighbor pixels (16,) or None.
+        neighbor_top_left: Top-left corner pixel or None.
+
+    Returns:
+        Reconstructed 16x16 luma block.
+    """
+    # Step 1: Generate prediction
+    top_available = neighbors_top is not None
+    left_available = neighbors_left is not None
+
+    prediction = predict_intra_16x16(
+        pred_mode,
+        neighbors_top,
+        neighbors_left,
+        neighbor_top_left,
+        top_available=top_available,
+        left_available=left_available
+    )
+
+    # Step 2: Reconstruct residual
+    residual = np.zeros((16, 16), dtype=np.int32)
+
+    # Arrange DC coefficients in 4x4 for inverse Hadamard
+    # Coefficients are in scan order - apply zigzag to convert to raster
+    dc_4x4 = np.zeros((4, 4), dtype=np.int32)
+    for scan_idx in range(16):
+        raster_pos = ZIGZAG_4x4[scan_idx]
+        row, col = raster_pos // 4, raster_pos % 4
+        dc_4x4[row, col] = dc_coeffs[scan_idx]
+
+    # Inverse Hadamard transform
+    dc_transformed = hadamard_4x4(dc_4x4)
+
+    # Dequantize DC coefficients
+    dc_dequant = dequant_dc_4x4(dc_transformed, qp)
+
+    # Reconstruct each 4x4 block with AC coefficients (when cbp_luma != 0)
+    if cbp_luma != 0:
+        for block_idx in range(16):
+            row, col = _get_4x4_block_position(block_idx)
+
+            # Check if this 8x8 region has AC coefficients
+            block_8x8_idx = block_idx // 4  # Which 8x8 quadrant
+            if not (cbp_luma & (1 << block_8x8_idx)):
+                continue
+
+            ac_coeffs = ac_coeffs_list[block_idx]
+
+            # Build coefficient block with DC from Hadamard
+            # DC array is in raster order: dc[i,j] corresponds to block at
+            # pixel (i*4, j*4). Use spatial position, not scan order.
+            coeffs = np.zeros((4, 4), dtype=np.int32)
+            dc_row, dc_col = row // 4, col // 4
+            coeffs[0, 0] = dc_dequant[dc_row, dc_col]
+
+            # Fill AC coefficients (zigzag order, starting from position 1)
+            if ac_coeffs is not None:
+                for i, pos in enumerate(ZIGZAG_4x4[1:]):  # Skip DC
+                    if i < len(ac_coeffs):
+                        r, c = pos // 4, pos % 4
+                        coeffs[r, c] = ac_coeffs[i]
+
+            # Dequantize AC
+            coeffs_dequant = dequant_4x4(coeffs, qp)
+            coeffs_dequant[0, 0] = coeffs[0, 0]  # DC already dequantized
+
+            # Inverse transform
+            block_residual = idct_4x4(coeffs_dequant)
+
+            # Place in residual
+            residual[row:row+4, col:col+4] = block_residual
+
+    # When cbp_luma=0: DC block was parsed (possibly all zeros), but no AC
+    # Apply DC contribution to residual even when cbp_luma=0
+    if cbp_luma == 0:
+        for block_idx in range(16):
+            row, col = _get_4x4_block_position(block_idx)
+            dc_row, dc_col = row // 4, col // 4
+
+            if dc_dequant[dc_row, dc_col] != 0:
+                coeffs = np.zeros((4, 4), dtype=np.int32)
+                coeffs[0, 0] = dc_dequant[dc_row, dc_col]
+
+                block_residual = idct_4x4(coeffs)
+                residual[row:row+4, col:col+4] = block_residual
+
+    # Step 3: Add residual to prediction and clip
+    reconstructed = prediction.astype(np.int32) + residual
+    return _clip_block(reconstructed)
+
+
 def reconstruct_i16x16_luma(
     reader: BitReader,
     pred_mode: int,
@@ -1349,81 +1466,45 @@ def reconstruct_i16x16_luma(
     frame_nz_counts: Optional[np.ndarray] = None,
     frame_width_mbs: int = 0,
 ) -> np.ndarray:
-    """Reconstruct I_16x16 luma macroblock.
+    """Reconstruct I_16x16 luma macroblock (CAVLC wrapper).
+
+    Parses DC and AC coefficients from a BitReader using CAVLC, updates
+    nz_counts, then delegates to reconstruct_i16x16_from_coeffs.
 
     Args:
-        reader: Bit reader for coefficient data
-        pred_mode: Intra 16x16 prediction mode (0-3)
-        cbp_luma: Luma CBP (0 or 15)
-        qp: Quantization parameter
-        neighbors_top: Top neighbor pixels (16,) or None
-        neighbors_left: Left neighbor pixels (16,) or None
-        neighbor_top_left: Top-left corner pixel or None
-        nz_counts: Array to store non-zero counts for context
-        mb_x: Macroblock X position (for CAVLC context)
-        mb_y: Macroblock Y position (for CAVLC context)
-        frame_nz_counts: All MBs' nz_counts for CAVLC context
-        frame_width_mbs: Picture width in macroblocks
+        reader: Bit reader for coefficient data.
+        pred_mode: Intra 16x16 prediction mode (0-3).
+        cbp_luma: Luma CBP (0 or 15).
+        qp: Quantization parameter.
+        neighbors_top: Top neighbor pixels (16,) or None.
+        neighbors_left: Left neighbor pixels (16,) or None.
+        neighbor_top_left: Top-left corner pixel or None.
+        nz_counts: Array to store non-zero counts for context.
+        mb_x: Macroblock X position (for CAVLC context).
+        mb_y: Macroblock Y position (for CAVLC context).
+        frame_nz_counts: All MBs' nz_counts for CAVLC context.
+        frame_width_mbs: Picture width in macroblocks.
 
     Returns:
-        Reconstructed 16x16 luma block
+        Reconstructed 16x16 luma block.
     """
-    # Step 1: Generate prediction
-    # Infer availability from whether arrays are provided
-    top_available = neighbors_top is not None
-    left_available = neighbors_left is not None
-
-    prediction = predict_intra_16x16(
-        pred_mode,
-        neighbors_top,
-        neighbors_left,
-        neighbor_top_left,
-        top_available=top_available,
-        left_available=left_available
-    )
-
-    # Step 2: Decode and reconstruct residual
-    residual = np.zeros((16, 16), dtype=np.int32)
-
-    # H.264 Spec 7.3.5.3: For I_16x16, DC block is ALWAYS coded
-    # AC blocks are only coded when cbp_luma bits are set
-
-    # Decode DC coefficients (Hadamard-coded 4x4 block) - ALWAYS for I_16x16
+    # Parse DC coefficients (Hadamard-coded 4x4 block) - ALWAYS for I_16x16
     # H.264 Spec 9.2.1: For Intra16x16DCLevel, nC is derived from neighbors
-    # using the same process as luma blocks, with blkIdx=0
     dc_nA, dc_nB = get_luma_neighbor_nz(
         0, mb_x, mb_y, nz_counts, frame_nz_counts, frame_width_mbs
     )
     dc_nC = calculate_nC(dc_nA, dc_nB)
     dc_block = decode_residual_block(reader, nC=dc_nC, max_coeffs=16)
-    # Note: DC total_coeff is NOT stored in nz_counts - those are for AC blocks only
 
-    # Arrange DC coefficients in 4x4 for inverse Hadamard
-    # CAVLC places coefficients in scan order - apply zigzag to convert to raster
-    dc_4x4 = np.zeros((4, 4), dtype=np.int32)
-    for scan_idx in range(16):
-        raster_pos = ZIGZAG_4x4[scan_idx]
-        row, col = raster_pos // 4, raster_pos % 4
-        dc_4x4[row, col] = dc_block.coefficients[scan_idx]
-
-    # Inverse Hadamard transform
-    # Note: No division here - normalization is in dequant and IDCT
-    dc_transformed = hadamard_4x4(dc_4x4)
-
-    # Dequantize DC coefficients
-    dc_dequant = dequant_dc_4x4(dc_transformed, qp)
-
-    # Decode AC coefficients for each 4x4 block (only when cbp_luma != 0)
+    # Parse AC coefficients and update nz_counts (CAVLC-specific)
+    ac_coeffs_list: List[Optional[np.ndarray]] = [None] * 16
     if cbp_luma != 0:
         for block_idx in range(16):
-            row, col = _get_4x4_block_position(block_idx)
-
             # Check if this 8x8 region has AC coefficients
-            block_8x8_idx = block_idx // 4  # Which 8x8 quadrant
+            block_8x8_idx = block_idx // 4
             if not (cbp_luma & (1 << block_8x8_idx)):
                 continue
 
-            # Decode AC (15 coefficients, DC is separate)
             ac_nA, ac_nB = get_luma_neighbor_nz(
                 block_idx, mb_x, mb_y, nz_counts,
                 frame_nz_counts, frame_width_mbs or 0
@@ -1431,50 +1512,40 @@ def reconstruct_i16x16_luma(
             ac_nC = calculate_nC(ac_nA, ac_nB)
             ac_block = decode_residual_block(reader, ac_nC, max_coeffs=15)
             nz_counts[block_idx] = ac_block.total_coeff
+            ac_coeffs_list[block_idx] = ac_block.coefficients
 
-            # Build coefficient block with DC from Hadamard
-            # DC array is in raster order: dc[i,j] corresponds to block at pixel (i*4, j*4)
-            # Use spatial position, not block_idx scan order
-            coeffs = np.zeros((4, 4), dtype=np.int32)
-            dc_row, dc_col = row // 4, col // 4
-            coeffs[0, 0] = dc_dequant[dc_row, dc_col]
+    return reconstruct_i16x16_from_coeffs(
+        pred_mode, cbp_luma, qp,
+        dc_block.coefficients, ac_coeffs_list,
+        neighbors_top, neighbors_left, neighbor_top_left,
+    )
 
-            # Fill AC coefficients (zigzag order, starting from position 1)
-            for i, pos in enumerate(ZIGZAG_4x4[1:]):  # Skip DC
-                if i < len(ac_block.coefficients):
-                    r, c = pos // 4, pos % 4
-                    coeffs[r, c] = ac_block.coefficients[i]
 
-            # Dequantize AC
-            coeffs_dequant = dequant_4x4(coeffs, qp)
-            coeffs_dequant[0, 0] = coeffs[0, 0]  # DC already dequantized
+def process_chroma_dc_coeffs(
+    dc_coeffs: np.ndarray,
+    qp_chroma: int,
+) -> np.ndarray:
+    """Process pre-parsed chroma DC coefficients.
 
-            # Inverse transform
-            block_residual = idct_4x4(coeffs_dequant)
+    Applies inverse Hadamard 2x2 and dequantization. Entropy-independent:
+    works with coefficients from both CAVLC and CABAC.
 
-            # Place in residual
-            residual[row:row+4, col:col+4] = block_residual
+    H.264 Spec Reference: Section 8.5.1 (chroma DC transform)
 
-    # When cbp_luma=0: DC block was read (possibly all zeros), but no AC
-    # Apply DC contribution to residual even when cbp_luma=0
-    if cbp_luma == 0:
-        for block_idx in range(16):
-            row, col = _get_4x4_block_position(block_idx)
-            # DC array is in raster order: dc[i,j] corresponds to block at pixel (i*4, j*4)
-            dc_row, dc_col = row // 4, col // 4
+    Args:
+        dc_coeffs: 4-element coefficient array (scan order).
+        qp_chroma: Chroma QP.
 
-            if dc_dequant[dc_row, dc_col] != 0:
-                # Build coefficient block with only DC
-                coeffs = np.zeros((4, 4), dtype=np.int32)
-                coeffs[0, 0] = dc_dequant[dc_row, dc_col]
+    Returns:
+        Dequantized 2x2 DC block.
+    """
+    dc_2x2 = np.zeros((2, 2), dtype=np.int32)
+    for i in range(min(4, len(dc_coeffs))):
+        dc_2x2[i // 2, i % 2] = dc_coeffs[i]
 
-                # Inverse transform
-                block_residual = idct_4x4(coeffs)
-                residual[row:row+4, col:col+4] = block_residual
-
-    # Step 3: Add residual to prediction and clip
-    reconstructed = prediction.astype(np.int32) + residual
-    return _clip_block(reconstructed)
+    dc_transformed = hadamard_2x2(dc_2x2)
+    dc_dequant = dequant_dc_2x2(dc_transformed, qp_chroma)
+    return dc_dequant
 
 
 def decode_chroma_dc(
@@ -1482,33 +1553,26 @@ def decode_chroma_dc(
     cbp_chroma: int,
     qp_chroma: int,
 ) -> Optional[np.ndarray]:
-    """Decode chroma DC coefficients.
+    """Decode chroma DC coefficients (CAVLC wrapper).
+
+    Parses chroma DC coefficients from a BitReader using CAVLC, then
+    delegates to process_chroma_dc_coeffs for Hadamard + dequant.
 
     H.264 Spec Section 7.3.5.3: Chroma DC is decoded before chroma AC.
 
     Args:
-        reader: Bit reader
-        cbp_chroma: Chroma CBP (0=none, 1=DC only, 2=DC+AC)
-        qp_chroma: Chroma QP
+        reader: Bit reader.
+        cbp_chroma: Chroma CBP (0=none, 1=DC only, 2=DC+AC).
+        qp_chroma: Chroma QP.
 
     Returns:
-        Dequantized 2x2 DC block, or None if cbp_chroma < 1
+        Dequantized 2x2 DC block, or None if cbp_chroma < 1.
     """
     if cbp_chroma < 1:
         return None
 
-    # Decode DC coefficients (2x2 block)
     dc_block = decode_residual_block(reader, nC=-1, max_coeffs=4)
-
-    # Arrange into 2x2 and inverse Hadamard
-    dc_2x2 = np.zeros((2, 2), dtype=np.int32)
-    for i in range(min(4, len(dc_block.coefficients))):
-        dc_2x2[i // 2, i % 2] = dc_block.coefficients[i]
-
-    dc_transformed = hadamard_2x2(dc_2x2)
-    dc_dequant = dequant_dc_2x2(dc_transformed, qp_chroma)
-
-    return dc_dequant
+    return process_chroma_dc_coeffs(dc_block.coefficients, qp_chroma)
 
 
 def decode_chroma_ac(
