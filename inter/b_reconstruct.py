@@ -18,10 +18,24 @@ from inter.motion_comp import (
     get_chroma_block_fractional,
 )
 from inter.mv_prediction import MVCache
-from inter.bipred import bipred_average, bipred_chroma
+from inter.bipred import bipred_average, bipred_chroma, implicit_bipred
 from inter.direct_mode import derive_direct_mv
 
 logger = logging.getLogger(__name__)
+
+
+def _bipred(
+    pred_l0: np.ndarray,
+    pred_l1: np.ndarray,
+    weighted_bipred_idc: int = 0,
+    current_poc: int = 0,
+    l0_poc: int = 0,
+    l1_poc: int = 0,
+) -> np.ndarray:
+    """Bi-predict with implicit weighting when enabled."""
+    if weighted_bipred_idc == 2:
+        return implicit_bipred(pred_l0, pred_l1, current_poc, l0_poc, l1_poc)
+    return bipred_average(pred_l0, pred_l1)
 
 
 def _apply_inter_prediction(
@@ -55,6 +69,50 @@ def _apply_chroma_prediction(
     return get_chroma_block_fractional(
         ref_chroma, ref_x, ref_y, frac_x, frac_y, width, height
     )
+
+
+def _get_partition_chroma(
+    ref_buffer: ReferenceFrameBuffer,
+    list_id: str,
+    ref_idx: int,
+    mvx: int,
+    mvy: int,
+    mb_x: int,
+    mb_y: int,
+    cx_off: int,
+    cy_off: int,
+    width: int,
+    height: int,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Get chroma prediction for a partition sub-block.
+
+    Args:
+        list_id: "L0" or "L1"
+        ref_idx: Reference index
+        mvx, mvy: Motion vector (quarter-pel luma units)
+        mb_x, mb_y: Macroblock position
+        cx_off, cy_off: Chroma offset within MB (in chroma samples)
+        width, height: Chroma block dimensions
+
+    Returns:
+        Tuple of (cb, cr) prediction blocks
+    """
+    if list_id == "L0":
+        ref_frame = ref_buffer.get_l0_frame(ref_idx)
+    else:
+        ref_frame = ref_buffer.get_l1_frame(ref_idx)
+
+    int_cmvx = mvx >> 3
+    int_cmvy = mvy >> 3
+    frac_cx = mvx & 7
+    frac_cy = mvy & 7
+
+    cx = mb_x * 8 + cx_off + int_cmvx
+    cy = mb_y * 8 + cy_off + int_cmvy
+
+    cb = _apply_chroma_prediction(ref_frame.cb, cx, cy, frac_cx, frac_cy, width, height)
+    cr = _apply_chroma_prediction(ref_frame.cr, cx, cy, frac_cx, frac_cy, width, height)
+    return cb, cr
 
 
 def _get_prediction_l0(
@@ -165,6 +223,7 @@ def reconstruct_b_skip(
     use_spatial: bool = True,
     current_poc: int = 0,
     mv_cache_l1: Optional[MVCache] = None,
+    weighted_bipred_idc: int = 0,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Reconstruct B_Skip macroblock.
 
@@ -177,6 +236,7 @@ def reconstruct_b_skip(
         use_spatial: True for spatial direct, False for temporal
         current_poc: POC of current picture (for temporal direct)
         mv_cache_l1: L1 MV cache for L1 prediction context
+        weighted_bipred_idc: 0=none, 1=explicit, 2=implicit
 
     Returns:
         Tuple of (luma, cb, cr) reconstructed blocks
@@ -195,9 +255,12 @@ def reconstruct_b_skip(
         ref_buffer, 0, mvx_l1, mvy_l1, mb_x, mb_y
     )
 
-    # Bi-predict
-    luma = bipred_average(l0_luma, l1_luma)
-    cb, cr = bipred_chroma(l0_cb, l1_cb, l0_cr, l1_cr)
+    # Bi-predict (with implicit weighting if enabled)
+    l0_poc = ref_buffer.get_l0_frame(0).poc
+    l1_poc = ref_buffer.get_l1_frame(0).poc
+    luma = _bipred(l0_luma, l1_luma, weighted_bipred_idc, current_poc, l0_poc, l1_poc)
+    cb = _bipred(l0_cb, l1_cb, weighted_bipred_idc, current_poc, l0_poc, l1_poc)
+    cr = _bipred(l0_cr, l1_cr, weighted_bipred_idc, current_poc, l0_poc, l1_poc)
 
     # Update MV caches
     mv_cache.set_mv_16x16(mb_x, mb_y, mvx_l0, mvy_l0)
@@ -298,10 +361,12 @@ def reconstruct_b_bi_16x16(
     residual_cr: Optional[np.ndarray],
     mb_x: int,
     mb_y: int,
+    weighted_bipred_idc: int = 0,
+    current_poc: int = 0,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Reconstruct B_Bi_16x16 macroblock.
 
-    Averages L0 and L1 predictions.
+    Averages L0 and L1 predictions (with implicit weighting if enabled).
 
     Args:
         ref_buffer: Reference frame buffer
@@ -309,6 +374,8 @@ def reconstruct_b_bi_16x16(
         mvx_l0, mvy_l0, mvx_l1, mvy_l1: Motion vectors
         residual_*: Residual blocks
         mb_x, mb_y: Macroblock position
+        weighted_bipred_idc: 0=none, 1=explicit, 2=implicit
+        current_poc: Current picture POC
 
     Returns:
         Tuple of (luma, cb, cr) reconstructed blocks
@@ -322,8 +389,11 @@ def reconstruct_b_bi_16x16(
     )
 
     # Bi-predict
-    pred_luma = bipred_average(l0_luma, l1_luma)
-    pred_cb, pred_cr = bipred_chroma(l0_cb, l1_cb, l0_cr, l1_cr)
+    l0_poc = ref_buffer.get_l0_frame(ref_idx_l0).poc
+    l1_poc = ref_buffer.get_l1_frame(ref_idx_l1).poc
+    pred_luma = _bipred(l0_luma, l1_luma, weighted_bipred_idc, current_poc, l0_poc, l1_poc)
+    pred_cb = _bipred(l0_cb, l1_cb, weighted_bipred_idc, current_poc, l0_poc, l1_poc)
+    pred_cr = _bipred(l0_cr, l1_cr, weighted_bipred_idc, current_poc, l0_poc, l1_poc)
 
     # Add residual
     luma = _add_residual(pred_luma, residual_luma)
@@ -350,6 +420,7 @@ def reconstruct_b_direct_16x16(
     use_spatial: bool = True,
     current_poc: int = 0,
     mv_cache_l1: Optional[MVCache] = None,
+    weighted_bipred_idc: int = 0,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Reconstruct B_Direct_16x16 macroblock.
 
@@ -363,6 +434,7 @@ def reconstruct_b_direct_16x16(
         use_spatial: True for spatial direct, False for temporal
         current_poc: POC for temporal direct
         mv_cache_l1: L1 MV cache for L1 prediction context
+        weighted_bipred_idc: 0=none, 1=explicit, 2=implicit
 
     Returns:
         Tuple of (luma, cb, cr) reconstructed blocks
@@ -382,8 +454,11 @@ def reconstruct_b_direct_16x16(
     )
 
     # Bi-predict
-    pred_luma = bipred_average(l0_luma, l1_luma)
-    pred_cb, pred_cr = bipred_chroma(l0_cb, l1_cb, l0_cr, l1_cr)
+    l0_poc = ref_buffer.get_l0_frame(0).poc
+    l1_poc = ref_buffer.get_l1_frame(0).poc
+    pred_luma = _bipred(l0_luma, l1_luma, weighted_bipred_idc, current_poc, l0_poc, l1_poc)
+    pred_cb = _bipred(l0_cb, l1_cb, weighted_bipred_idc, current_poc, l0_poc, l1_poc)
+    pred_cr = _bipred(l0_cr, l1_cr, weighted_bipred_idc, current_poc, l0_poc, l1_poc)
 
     # Add residual
     luma = _add_residual(pred_luma, residual_luma)
@@ -414,6 +489,8 @@ def reconstruct_b_16x8(
     residual_cr: Optional[np.ndarray],
     mb_x: int,
     mb_y: int,
+    weighted_bipred_idc: int = 0,
+    current_poc: int = 0,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Reconstruct B macroblock with 16x8 partitions.
 
@@ -451,19 +528,41 @@ def reconstruct_b_16x8(
             l1_luma, _, _ = _get_prediction_l1(
                 ref_buffer, ref_idx_l1[part], mvx_l1[part], mvy_l1[part], mb_x, mb_y
             )
-            part_luma = bipred_average(l0_luma, l1_luma)
+            l0p = ref_buffer.get_l0_frame(ref_idx_l0[part]).poc
+            l1p = ref_buffer.get_l1_frame(ref_idx_l1[part]).poc
+            part_luma = _bipred(l0_luma, l1_luma, weighted_bipred_idc, current_poc, l0p, l1p)
 
         luma[part_y:part_y + 8, :] = part_luma[part_y:part_y + 8, :]
 
-    # Simplified chroma: use first partition mode
-    if pred_modes[0] in ("L0", "Bi"):
-        _, pred_cb, pred_cr = _get_prediction_l0(
-            ref_buffer, ref_idx_l0[0], mvx_l0[0], mvy_l0[0], mb_x, mb_y
-        )
-    else:
-        _, pred_cb, pred_cr = _get_prediction_l1(
-            ref_buffer, ref_idx_l1[0], mvx_l1[0], mvy_l1[0], mb_x, mb_y
-        )
+    # Chroma: per-partition (top 4 rows / bottom 4 rows)
+    pred_cb = np.zeros((8, 8), dtype=np.uint8)
+    pred_cr = np.zeros((8, 8), dtype=np.uint8)
+    for part in range(2):
+        mode = pred_modes[part]
+        cy_off = part * 4
+
+        if mode in ("L0", "Bi"):
+            l0_cb, l0_cr = _get_partition_chroma(
+                ref_buffer, "L0", ref_idx_l0[part],
+                mvx_l0[part], mvy_l0[part], mb_x, mb_y, 0, cy_off, 8, 4
+            )
+        if mode in ("L1", "Bi"):
+            l1_cb, l1_cr = _get_partition_chroma(
+                ref_buffer, "L1", ref_idx_l1[part],
+                mvx_l1[part], mvy_l1[part], mb_x, mb_y, 0, cy_off, 8, 4
+            )
+
+        if mode == "L0":
+            pred_cb[cy_off:cy_off + 4, :] = l0_cb
+            pred_cr[cy_off:cy_off + 4, :] = l0_cr
+        elif mode == "L1":
+            pred_cb[cy_off:cy_off + 4, :] = l1_cb
+            pred_cr[cy_off:cy_off + 4, :] = l1_cr
+        else:
+            l0p = ref_buffer.get_l0_frame(ref_idx_l0[part]).poc
+            l1p = ref_buffer.get_l1_frame(ref_idx_l1[part]).poc
+            pred_cb[cy_off:cy_off + 4, :] = _bipred(l0_cb, l1_cb, weighted_bipred_idc, current_poc, l0p, l1p)
+            pred_cr[cy_off:cy_off + 4, :] = _bipred(l0_cr, l1_cr, weighted_bipred_idc, current_poc, l0p, l1p)
 
     cb = pred_cb
     cr = pred_cr
@@ -490,6 +589,8 @@ def reconstruct_b_8x16(
     residual_cr: Optional[np.ndarray],
     mb_x: int,
     mb_y: int,
+    weighted_bipred_idc: int = 0,
+    current_poc: int = 0,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Reconstruct B macroblock with 8x16 partitions."""
     luma = np.zeros((16, 16), dtype=np.uint8)
@@ -515,19 +616,41 @@ def reconstruct_b_8x16(
             l1_luma, _, _ = _get_prediction_l1(
                 ref_buffer, ref_idx_l1[part], mvx_l1[part], mvy_l1[part], mb_x, mb_y
             )
-            part_luma = bipred_average(l0_luma, l1_luma)
+            l0p = ref_buffer.get_l0_frame(ref_idx_l0[part]).poc
+            l1p = ref_buffer.get_l1_frame(ref_idx_l1[part]).poc
+            part_luma = _bipred(l0_luma, l1_luma, weighted_bipred_idc, current_poc, l0p, l1p)
 
         luma[:, part_x:part_x + 8] = part_luma[:, part_x:part_x + 8]
 
-    # Simplified chroma
-    if pred_modes[0] in ("L0", "Bi"):
-        _, pred_cb, pred_cr = _get_prediction_l0(
-            ref_buffer, ref_idx_l0[0], mvx_l0[0], mvy_l0[0], mb_x, mb_y
-        )
-    else:
-        _, pred_cb, pred_cr = _get_prediction_l1(
-            ref_buffer, ref_idx_l1[0], mvx_l1[0], mvy_l1[0], mb_x, mb_y
-        )
+    # Chroma: per-partition (left 4 cols / right 4 cols)
+    pred_cb = np.zeros((8, 8), dtype=np.uint8)
+    pred_cr = np.zeros((8, 8), dtype=np.uint8)
+    for part in range(2):
+        mode = pred_modes[part]
+        cx_off = part * 4
+
+        if mode in ("L0", "Bi"):
+            l0_cb, l0_cr = _get_partition_chroma(
+                ref_buffer, "L0", ref_idx_l0[part],
+                mvx_l0[part], mvy_l0[part], mb_x, mb_y, cx_off, 0, 4, 8
+            )
+        if mode in ("L1", "Bi"):
+            l1_cb, l1_cr = _get_partition_chroma(
+                ref_buffer, "L1", ref_idx_l1[part],
+                mvx_l1[part], mvy_l1[part], mb_x, mb_y, cx_off, 0, 4, 8
+            )
+
+        if mode == "L0":
+            pred_cb[:, cx_off:cx_off + 4] = l0_cb
+            pred_cr[:, cx_off:cx_off + 4] = l0_cr
+        elif mode == "L1":
+            pred_cb[:, cx_off:cx_off + 4] = l1_cb
+            pred_cr[:, cx_off:cx_off + 4] = l1_cr
+        else:
+            l0p = ref_buffer.get_l0_frame(ref_idx_l0[part]).poc
+            l1p = ref_buffer.get_l1_frame(ref_idx_l1[part]).poc
+            pred_cb[:, cx_off:cx_off + 4] = _bipred(l0_cb, l1_cb, weighted_bipred_idc, current_poc, l0p, l1p)
+            pred_cr[:, cx_off:cx_off + 4] = _bipred(l0_cr, l1_cr, weighted_bipred_idc, current_poc, l0p, l1p)
 
     cb = pred_cb
     cr = pred_cr
@@ -555,6 +678,8 @@ def reconstruct_b_8x8(
     residual_cr: Optional[np.ndarray],
     mb_x: int,
     mb_y: int,
+    weighted_bipred_idc: int = 0,
+    current_poc: int = 0,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Reconstruct B_8x8 macroblock with 4 sub-blocks."""
     luma = np.zeros((16, 16), dtype=np.uint8)
@@ -584,14 +709,47 @@ def reconstruct_b_8x8(
                 ref_buffer, ref_idx_l1[sub_idx], mvx_l1[sub_idx], mvy_l1[sub_idx],
                 mb_x, mb_y, width=16, height=16
             )
-            sub_luma = bipred_average(l0_luma, l1_luma)
+            l0p = ref_buffer.get_l0_frame(ref_idx_l0[sub_idx]).poc
+            l1p = ref_buffer.get_l1_frame(ref_idx_l1[sub_idx]).poc
+            sub_luma = _bipred(l0_luma, l1_luma, weighted_bipred_idc, current_poc, l0p, l1p)
 
         luma[sub_y:sub_y + 8, sub_x:sub_x + 8] = sub_luma[sub_y:sub_y + 8, sub_x:sub_x + 8]
 
-    # Simplified chroma
-    _, cb, cr = _get_prediction_l0(
-        ref_buffer, ref_idx_l0[0], mvx_l0[0], mvy_l0[0], mb_x, mb_y
-    )
+    # Chroma: per-sub-MB (4 quadrants of 4x4 chroma)
+    chroma_offsets = [(0, 0), (4, 0), (0, 4), (4, 4)]
+    pred_cb = np.zeros((8, 8), dtype=np.uint8)
+    pred_cr = np.zeros((8, 8), dtype=np.uint8)
+    for sub_idx in range(4):
+        cx_off, cy_off = chroma_offsets[sub_idx]
+        mode = pred_modes[sub_idx]
+
+        if mode in ("L0", "Bi", "Direct"):
+            l0_cb, l0_cr = _get_partition_chroma(
+                ref_buffer, "L0", ref_idx_l0[sub_idx],
+                mvx_l0[sub_idx], mvy_l0[sub_idx], mb_x, mb_y,
+                cx_off, cy_off, 4, 4
+            )
+        if mode in ("L1", "Bi", "Direct"):
+            l1_cb, l1_cr = _get_partition_chroma(
+                ref_buffer, "L1", ref_idx_l1[sub_idx],
+                mvx_l1[sub_idx], mvy_l1[sub_idx], mb_x, mb_y,
+                cx_off, cy_off, 4, 4
+            )
+
+        if mode == "L0":
+            pred_cb[cy_off:cy_off + 4, cx_off:cx_off + 4] = l0_cb
+            pred_cr[cy_off:cy_off + 4, cx_off:cx_off + 4] = l0_cr
+        elif mode == "L1":
+            pred_cb[cy_off:cy_off + 4, cx_off:cx_off + 4] = l1_cb
+            pred_cr[cy_off:cy_off + 4, cx_off:cx_off + 4] = l1_cr
+        else:  # Bi or Direct
+            l0p = ref_buffer.get_l0_frame(ref_idx_l0[sub_idx]).poc
+            l1p = ref_buffer.get_l1_frame(ref_idx_l1[sub_idx]).poc
+            pred_cb[cy_off:cy_off + 4, cx_off:cx_off + 4] = _bipred(l0_cb, l1_cb, weighted_bipred_idc, current_poc, l0p, l1p)
+            pred_cr[cy_off:cy_off + 4, cx_off:cx_off + 4] = _bipred(l0_cr, l1_cr, weighted_bipred_idc, current_poc, l0p, l1p)
+
+    cb = pred_cb
+    cr = pred_cr
 
     luma = _add_residual(luma, residual_luma)
     cb = _add_residual(cb, residual_cb)

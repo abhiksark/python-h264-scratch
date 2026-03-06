@@ -1948,6 +1948,7 @@ class H264Decoder:
         # Get direct mode flag
         use_spatial = getattr(slice_header, 'direct_spatial_mv_pred_flag', True)
         current_poc = getattr(slice_header, 'pic_order_cnt_lsb', 0)
+        weighted_bipred_idc = getattr(pps, 'weighted_bipred_idc', 0)
 
         # Build L0/L1 reference lists before decoding B-slice
         self._build_b_slice_ref_lists(slice_header)
@@ -1959,7 +1960,8 @@ class H264Decoder:
                     mb_x = mb_idx % mb_width
                     mb_y = mb_idx // mb_width
                     self._process_b_skip_run(
-                        mb_x, mb_y, use_spatial, current_poc
+                        mb_x, mb_y, use_spatial, current_poc,
+                        weighted_bipred_idc,
                     )
                     mb_idx += 1
                 break
@@ -1980,7 +1982,8 @@ class H264Decoder:
                 mb_y = mb_idx // mb_width
 
                 self._process_b_skip_run(
-                    mb_x, mb_y, use_spatial, current_poc
+                    mb_x, mb_y, use_spatial, current_poc,
+                    weighted_bipred_idc,
                 )
                 mb_idx += 1
 
@@ -1992,7 +1995,8 @@ class H264Decoder:
                     mb_x = mb_idx % mb_width
                     mb_y = mb_idx // mb_width
                     self._process_b_skip_run(
-                        mb_x, mb_y, use_spatial, current_poc
+                        mb_x, mb_y, use_spatial, current_poc,
+                        weighted_bipred_idc,
                     )
                     mb_idx += 1
                 break
@@ -2771,6 +2775,7 @@ class H264Decoder:
         part_modes = get_partition_pred_modes(mb_info)
         num_parts = mb_info.num_partitions
         part_size = mb_info.partition_size  # (w, h)
+        weighted_bipred_idc = getattr(pps, 'weighted_bipred_idc', 0)
 
         if mb_info.is_direct:
             # B_Direct_16x16 — no ref_idx or MVD in bitstream
@@ -2785,6 +2790,7 @@ class H264Decoder:
                 use_spatial=use_spatial,
                 current_poc=current_poc,
                 mv_cache_l1=self.state.mv_cache_l1,
+                weighted_bipred_idc=weighted_bipred_idc,
             )
 
         elif mb_info.name == "B_8x8":
@@ -2842,16 +2848,31 @@ class H264Decoder:
                             mvx_l1[i] = mvp_x + mvd_x
                             mvy_l1[i] = mvp_y + mvd_y
 
+            # Derive direct-mode MVs for Direct sub-blocks
+            has_direct = any(s.is_direct for s in sub_mb_infos)
+            if has_direct:
+                from inter.direct_mode import derive_direct_mv
+                d_mvx_l0, d_mvy_l0, d_mvx_l1, d_mvy_l1 = derive_direct_mv(
+                    self.state.mv_cache, self.state.ref_buffer,
+                    current_poc, mb_x, mb_y, use_spatial,
+                    self.state.mv_cache_l1
+                )
+                for i in range(4):
+                    if sub_mb_infos[i].is_direct:
+                        mvx_l0[i] = d_mvx_l0
+                        mvy_l0[i] = d_mvy_l0
+                        mvx_l1[i] = d_mvx_l1
+                        mvy_l1[i] = d_mvy_l1
+
             # Update MV caches with L0 and L1 MVs
             for i in range(4):
-                if not sub_mb_infos[i].is_direct:
-                    self.state.mv_cache.set_mv_8x8(
-                        mb_x, mb_y, i, mvx_l0[i], mvy_l0[i]
+                self.state.mv_cache.set_mv_8x8(
+                    mb_x, mb_y, i, mvx_l0[i], mvy_l0[i]
+                )
+                if self.state.mv_cache_l1 is not None:
+                    self.state.mv_cache_l1.set_mv_8x8(
+                        mb_x, mb_y, i, mvx_l1[i], mvy_l1[i]
                     )
-                    if self.state.mv_cache_l1 is not None:
-                        self.state.mv_cache_l1.set_mv_8x8(
-                            mb_x, mb_y, i, mvx_l1[i], mvy_l1[i]
-                        )
 
             luma_pred, cb_pred, cr_pred = reconstruct_b_8x8(
                 ref_buffer=self.state.ref_buffer,
@@ -2869,6 +2890,8 @@ class H264Decoder:
                 residual_cr=None,
                 mb_x=mb_x,
                 mb_y=mb_y,
+                weighted_bipred_idc=weighted_bipred_idc,
+                current_poc=current_poc,
             )
 
         elif num_parts == 1:
@@ -2946,6 +2969,8 @@ class H264Decoder:
                     mvx_l1=mvx_l1[0], mvy_l1=mvy_l1[0],
                     residual_luma=None, residual_cb=None, residual_cr=None,
                     mb_x=mb_x, mb_y=mb_y,
+                    weighted_bipred_idc=weighted_bipred_idc,
+                    current_poc=current_poc,
                 )
 
         else:
@@ -3027,6 +3052,8 @@ class H264Decoder:
                     mvx_l1=mvx_l1, mvy_l1=mvy_l1,
                     residual_luma=None, residual_cb=None, residual_cr=None,
                     mb_x=mb_x, mb_y=mb_y,
+                    weighted_bipred_idc=weighted_bipred_idc,
+                    current_poc=current_poc,
                 )
             else:
                 luma_pred, cb_pred, cr_pred = reconstruct_b_8x16(
@@ -3037,6 +3064,8 @@ class H264Decoder:
                     mvx_l1=mvx_l1, mvy_l1=mvy_l1,
                     residual_luma=None, residual_cb=None, residual_cr=None,
                     mb_x=mb_x, mb_y=mb_y,
+                    weighted_bipred_idc=weighted_bipred_idc,
+                    current_poc=current_poc,
                 )
 
         # ── Parse coded_block_pattern (H.264 Table 9-4, inter column) ──
@@ -3136,6 +3165,7 @@ class H264Decoder:
         mb_y: int,
         use_spatial: bool,
         current_poc: int,
+        weighted_bipred_idc: int = 0,
     ) -> None:
         """Process a B_Skip macroblock.
 
@@ -3145,6 +3175,7 @@ class H264Decoder:
             mb_x, mb_y: Macroblock position
             use_spatial: True for spatial direct mode
             current_poc: Picture order count
+            weighted_bipred_idc: 0=none, 1=explicit, 2=implicit
         """
         luma, cb, cr = reconstruct_b_skip(
             ref_buffer=self.state.ref_buffer,
@@ -3154,6 +3185,7 @@ class H264Decoder:
             use_spatial=use_spatial,
             current_poc=current_poc,
             mv_cache_l1=self.state.mv_cache_l1,
+            weighted_bipred_idc=weighted_bipred_idc,
         )
 
         ly, lx = mb_y * 16, mb_x * 16
