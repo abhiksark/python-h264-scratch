@@ -2852,7 +2852,7 @@ class H264Decoder:
             has_direct = any(s.is_direct for s in sub_mb_infos)
             if has_direct:
                 from inter.direct_mode import derive_direct_mv
-                d_mvx_l0, d_mvy_l0, d_mvx_l1, d_mvy_l1 = derive_direct_mv(
+                d_mvx_l0, d_mvy_l0, d_mvx_l1, d_mvy_l1, d_pred_l0, d_pred_l1 = derive_direct_mv(
                     self.state.mv_cache, self.state.ref_buffer,
                     current_poc, mb_x, mb_y, use_spatial,
                     self.state.mv_cache_l1

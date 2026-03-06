@@ -36,7 +36,7 @@ class TestSpatialDirectMode:
         mv_cache.set_mv(0, 0, 3, 3, 4, 8)  # Left neighbor
         mv_cache.set_mv(0, 0, 0, 3, 8, 4)  # Top neighbor
 
-        mvx_l0, mvy_l0, mvx_l1, mvy_l1 = derive_direct_spatial(
+        mvx_l0, mvy_l0, mvx_l1, mvy_l1, pred_l0, pred_l1 = derive_direct_spatial(
             mv_cache, mb_x=1, mb_y=1
         )
 
@@ -55,7 +55,7 @@ class TestSpatialDirectMode:
         # Set a forward MV in neighbor
         mv_cache.set_mv(0, 0, 3, 3, 8, 8)
 
-        mvx_l0, mvy_l0, mvx_l1, mvy_l1 = derive_direct_spatial(
+        mvx_l0, mvy_l0, mvx_l1, mvy_l1, pred_l0, pred_l1 = derive_direct_spatial(
             mv_cache, mb_x=1, mb_y=1
         )
 
@@ -70,7 +70,7 @@ class TestSpatialDirectMode:
         mv_cache = MVCache(width_in_mbs=2, height_in_mbs=2)
 
         # No neighbors set - first MB
-        mvx_l0, mvy_l0, mvx_l1, mvy_l1 = derive_direct_spatial(
+        mvx_l0, mvy_l0, mvx_l1, mvy_l1, pred_l0, pred_l1 = derive_direct_spatial(
             mv_cache, mb_x=0, mb_y=0
         )
 
@@ -192,7 +192,7 @@ class TestBSkipMV:
         mv_cache = MVCache(width_in_mbs=2, height_in_mbs=2)
         mv_cache.set_mv(0, 0, 3, 3, 4, 4)
 
-        mvx_l0, mvy_l0, mvx_l1, mvy_l1 = derive_b_skip_mv(
+        mvx_l0, mvy_l0, mvx_l1, mvy_l1, pred_l0, pred_l1 = derive_b_skip_mv(
             mv_cache=mv_cache,
             ref_buffer=None,
             current_poc=2,

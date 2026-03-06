@@ -21,10 +21,11 @@ def derive_direct_spatial(
     mb_x: int,
     mb_y: int,
     mv_cache_l1: Optional[MVCache] = None,
-) -> Tuple[int, int, int, int]:
+) -> Tuple[int, int, int, int, bool, bool]:
     """Derive direct mode MVs using spatial prediction.
 
-    Derives L0 and L1 MVs independently from neighbor MVs in each list.
+    Derives L0 and L1 MVs from neighbor MVs, and determines prediction flags
+    based on neighbor reference indices per H.264 8.4.1.2.2.
 
     Args:
         mv_cache: L0 MV cache with neighbor MVs
@@ -32,44 +33,78 @@ def derive_direct_spatial(
         mv_cache_l1: L1 MV cache (if None, L1 MV = median of L0 neighbors negated)
 
     Returns:
-        Tuple of (mvx_l0, mvy_l0, mvx_l1, mvy_l1)
+        Tuple of (mvx_l0, mvy_l0, mvx_l1, mvy_l1, pred_flag_l0, pred_flag_l1)
 
     H.264 Spec: Section 8.4.1.2.2
     """
-    # Get L0 neighbor MVs
+    # Get L0 neighbor reference indices and MVs
+    ref_a_l0 = mv_cache.get_ref_idx(mb_x - 1, mb_y, 3, 0) if mb_x > 0 else -1
+    ref_b_l0 = mv_cache.get_ref_idx(mb_x, mb_y - 1, 0, 3) if mb_y > 0 else -1
+
     mv_a_l0 = mv_cache.get_mv(mb_x - 1, mb_y, 3, 0) if mb_x > 0 else (0, 0)
     mv_b_l0 = mv_cache.get_mv(mb_x, mb_y - 1, 0, 3) if mb_y > 0 else (0, 0)
 
     if mb_y > 0 and mb_x < mv_cache.width_in_mbs - 1:
+        ref_c_l0 = mv_cache.get_ref_idx(mb_x + 1, mb_y - 1, 0, 3)
         mv_c_l0 = mv_cache.get_mv(mb_x + 1, mb_y - 1, 0, 3)
     elif mb_y > 0 and mb_x > 0:
+        ref_c_l0 = mv_cache.get_ref_idx(mb_x - 1, mb_y - 1, 3, 3)
         mv_c_l0 = mv_cache.get_mv(mb_x - 1, mb_y - 1, 3, 3)
     else:
+        ref_c_l0 = -1
         mv_c_l0 = (0, 0)
 
-    # Median prediction for L0
+    # Derive L0 ref_idx: minimum of available neighbor ref indices
+    l0_refs = [r for r in (ref_a_l0, ref_b_l0, ref_c_l0) if r >= 0]
+    ref_idx_l0 = min(l0_refs) if l0_refs else 0
+
+    # Median prediction for L0 MV
     mvx_l0 = _median(mv_a_l0[0], mv_b_l0[0], mv_c_l0[0])
     mvy_l0 = _median(mv_a_l0[1], mv_b_l0[1], mv_c_l0[1])
 
-    # Get L1 neighbor MVs from L1 cache
+    # Get L1 neighbor reference indices and MVs
+    ref_idx_l1 = -1
+    mvx_l1 = 0
+    mvy_l1 = 0
+
     if mv_cache_l1 is not None:
+        ref_a_l1 = mv_cache_l1.get_ref_idx(mb_x - 1, mb_y, 3, 0) if mb_x > 0 else -1
+        ref_b_l1 = mv_cache_l1.get_ref_idx(mb_x, mb_y - 1, 0, 3) if mb_y > 0 else -1
+
+        if mb_y > 0 and mb_x < mv_cache_l1.width_in_mbs - 1:
+            ref_c_l1 = mv_cache_l1.get_ref_idx(mb_x + 1, mb_y - 1, 0, 3)
+            mv_c_l1 = mv_cache_l1.get_mv(mb_x + 1, mb_y - 1, 0, 3)
+        elif mb_y > 0 and mb_x > 0:
+            ref_c_l1 = mv_cache_l1.get_ref_idx(mb_x - 1, mb_y - 1, 3, 3)
+            mv_c_l1 = mv_cache_l1.get_mv(mb_x - 1, mb_y - 1, 3, 3)
+        else:
+            ref_c_l1 = -1
+            mv_c_l1 = (0, 0)
+
         mv_a_l1 = mv_cache_l1.get_mv(mb_x - 1, mb_y, 3, 0) if mb_x > 0 else (0, 0)
         mv_b_l1 = mv_cache_l1.get_mv(mb_x, mb_y - 1, 0, 3) if mb_y > 0 else (0, 0)
 
-        if mb_y > 0 and mb_x < mv_cache_l1.width_in_mbs - 1:
-            mv_c_l1 = mv_cache_l1.get_mv(mb_x + 1, mb_y - 1, 0, 3)
-        elif mb_y > 0 and mb_x > 0:
-            mv_c_l1 = mv_cache_l1.get_mv(mb_x - 1, mb_y - 1, 3, 3)
-        else:
-            mv_c_l1 = (0, 0)
+        l1_refs = [r for r in (ref_a_l1, ref_b_l1, ref_c_l1) if r >= 0]
+        ref_idx_l1 = min(l1_refs) if l1_refs else -1
 
         mvx_l1 = _median(mv_a_l1[0], mv_b_l1[0], mv_c_l1[0])
         mvy_l1 = _median(mv_a_l1[1], mv_b_l1[1], mv_c_l1[1])
     else:
         mvx_l1 = -mvx_l0
         mvy_l1 = -mvy_l0
+        ref_idx_l1 = 0
 
-    return mvx_l0, mvy_l0, mvx_l1, mvy_l1
+    # Determine prediction flags based on derived ref indices
+    # H.264 8.4.1.2.2: predFlagL0/L1 depend on refIdxL0/L1
+    pred_flag_l0 = ref_idx_l0 >= 0
+    pred_flag_l1 = ref_idx_l1 >= 0
+
+    # If neither has valid reference, default to bi-pred with ref_idx=0
+    if not pred_flag_l0 and not pred_flag_l1:
+        pred_flag_l0 = True
+        pred_flag_l1 = True
+
+    return mvx_l0, mvy_l0, mvx_l1, mvy_l1, pred_flag_l0, pred_flag_l1
 
 
 def derive_direct_temporal(
@@ -147,7 +182,7 @@ def derive_direct_mv(
     mb_y: int,
     use_spatial: bool,
     mv_cache_l1: Optional[MVCache] = None,
-) -> Tuple[int, int, int, int]:
+) -> Tuple[int, int, int, int, bool, bool]:
     """Derive direct mode MVs based on direct_spatial_mv_pred_flag.
 
     Args:
@@ -159,14 +194,15 @@ def derive_direct_mv(
         mv_cache_l1: L1 MV cache for spatial direct mode
 
     Returns:
-        Tuple of (mvx_l0, mvy_l0, mvx_l1, mvy_l1)
+        Tuple of (mvx_l0, mvy_l0, mvx_l1, mvy_l1, pred_flag_l0, pred_flag_l1)
     """
     if use_spatial:
         return derive_direct_spatial(mv_cache, mb_x, mb_y, mv_cache_l1)
     else:
         if ref_buffer is None:
-            return (0, 0, 0, 0)
-        return derive_direct_temporal(ref_buffer, current_poc, mb_x, mb_y)
+            return (0, 0, 0, 0, True, True)
+        mvs = derive_direct_temporal(ref_buffer, current_poc, mb_x, mb_y)
+        return mvs + (True, True)  # Temporal always bi-predicts
 
 
 def derive_b_skip_mv(
@@ -177,7 +213,7 @@ def derive_b_skip_mv(
     mb_y: int,
     use_spatial: bool,
     mv_cache_l1: Optional[MVCache] = None,
-) -> Tuple[int, int, int, int]:
+) -> Tuple[int, int, int, int, bool, bool]:
     """Derive MVs for B_Skip macroblock.
 
     B_Skip is equivalent to B_Direct_16x16 with no residual.
@@ -191,7 +227,7 @@ def derive_b_skip_mv(
         mv_cache_l1: L1 MV cache for spatial direct mode
 
     Returns:
-        Tuple of (mvx_l0, mvy_l0, mvx_l1, mvy_l1)
+        Tuple of (mvx_l0, mvy_l0, mvx_l1, mvy_l1, pred_flag_l0, pred_flag_l1)
     """
     return derive_direct_mv(
         mv_cache, ref_buffer, current_poc, mb_x, mb_y, use_spatial,

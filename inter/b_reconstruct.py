@@ -241,33 +241,45 @@ def reconstruct_b_skip(
     Returns:
         Tuple of (luma, cb, cr) reconstructed blocks
     """
-    # Derive MVs using direct mode
-    mvx_l0, mvy_l0, mvx_l1, mvy_l1 = derive_direct_mv(
+    # Derive MVs and prediction flags using direct mode
+    mvx_l0, mvy_l0, mvx_l1, mvy_l1, pred_l0, pred_l1 = derive_direct_mv(
         mv_cache, ref_buffer, current_poc, mb_x, mb_y, use_spatial,
         mv_cache_l1
     )
 
-    # Get L0 and L1 predictions
-    l0_luma, l0_cb, l0_cr = _get_prediction_l0(
-        ref_buffer, 0, mvx_l0, mvy_l0, mb_x, mb_y
-    )
-    l1_luma, l1_cb, l1_cr = _get_prediction_l1(
-        ref_buffer, 0, mvx_l1, mvy_l1, mb_x, mb_y
-    )
-
-    # Bi-predict (with implicit weighting if enabled)
-    l0_poc = ref_buffer.get_l0_frame(0).poc
-    l1_poc = ref_buffer.get_l1_frame(0).poc
-    luma = _bipred(l0_luma, l1_luma, weighted_bipred_idc, current_poc, l0_poc, l1_poc)
-    cb = _bipred(l0_cb, l1_cb, weighted_bipred_idc, current_poc, l0_poc, l1_poc)
-    cr = _bipred(l0_cr, l1_cr, weighted_bipred_idc, current_poc, l0_poc, l1_poc)
+    if pred_l0 and pred_l1:
+        # Bi-prediction
+        l0_luma, l0_cb, l0_cr = _get_prediction_l0(
+            ref_buffer, 0, mvx_l0, mvy_l0, mb_x, mb_y
+        )
+        l1_luma, l1_cb, l1_cr = _get_prediction_l1(
+            ref_buffer, 0, mvx_l1, mvy_l1, mb_x, mb_y
+        )
+        l0_poc = ref_buffer.get_l0_frame(0).poc
+        l1_poc = ref_buffer.get_l1_frame(0).poc
+        luma = _bipred(l0_luma, l1_luma, weighted_bipred_idc, current_poc, l0_poc, l1_poc)
+        cb = _bipred(l0_cb, l1_cb, weighted_bipred_idc, current_poc, l0_poc, l1_poc)
+        cr = _bipred(l0_cr, l1_cr, weighted_bipred_idc, current_poc, l0_poc, l1_poc)
+    elif pred_l0:
+        # L0-only prediction
+        luma, cb, cr = _get_prediction_l0(
+            ref_buffer, 0, mvx_l0, mvy_l0, mb_x, mb_y
+        )
+    else:
+        # L1-only prediction
+        luma, cb, cr = _get_prediction_l1(
+            ref_buffer, 0, mvx_l1, mvy_l1, mb_x, mb_y
+        )
 
     # Update MV caches
     mv_cache.set_mv_16x16(mb_x, mb_y, mvx_l0, mvy_l0)
     if mv_cache_l1 is not None:
-        mv_cache_l1.set_mv_16x16(mb_x, mb_y, mvx_l1, mvy_l1)
+        if pred_l1:
+            mv_cache_l1.set_mv_16x16(mb_x, mb_y, mvx_l1, mvy_l1)
+        else:
+            mv_cache_l1.mark_intra(mb_x, mb_y)
 
-    logger.debug(f"B_Skip MB({mb_x},{mb_y}): MVL0=({mvx_l0},{mvy_l0}), MVL1=({mvx_l1},{mvy_l1})")
+    logger.debug(f"B_Skip MB({mb_x},{mb_y}): MVL0=({mvx_l0},{mvy_l0}), MVL1=({mvx_l1},{mvy_l1}), pred=({'L0' if pred_l0 else ''}{'L1' if pred_l1 else ''})")
 
     return luma, cb, cr
 
@@ -439,26 +451,33 @@ def reconstruct_b_direct_16x16(
     Returns:
         Tuple of (luma, cb, cr) reconstructed blocks
     """
-    # Derive MVs
-    mvx_l0, mvy_l0, mvx_l1, mvy_l1 = derive_direct_mv(
+    # Derive MVs and prediction flags
+    mvx_l0, mvy_l0, mvx_l1, mvy_l1, pred_l0, pred_l1 = derive_direct_mv(
         mv_cache, ref_buffer, current_poc, mb_x, mb_y, use_spatial,
         mv_cache_l1
     )
 
-    # Get predictions
-    l0_luma, l0_cb, l0_cr = _get_prediction_l0(
-        ref_buffer, 0, mvx_l0, mvy_l0, mb_x, mb_y
-    )
-    l1_luma, l1_cb, l1_cr = _get_prediction_l1(
-        ref_buffer, 0, mvx_l1, mvy_l1, mb_x, mb_y
-    )
-
-    # Bi-predict
-    l0_poc = ref_buffer.get_l0_frame(0).poc
-    l1_poc = ref_buffer.get_l1_frame(0).poc
-    pred_luma = _bipred(l0_luma, l1_luma, weighted_bipred_idc, current_poc, l0_poc, l1_poc)
-    pred_cb = _bipred(l0_cb, l1_cb, weighted_bipred_idc, current_poc, l0_poc, l1_poc)
-    pred_cr = _bipred(l0_cr, l1_cr, weighted_bipred_idc, current_poc, l0_poc, l1_poc)
+    if pred_l0 and pred_l1:
+        # Bi-prediction
+        l0_luma, l0_cb, l0_cr = _get_prediction_l0(
+            ref_buffer, 0, mvx_l0, mvy_l0, mb_x, mb_y
+        )
+        l1_luma, l1_cb, l1_cr = _get_prediction_l1(
+            ref_buffer, 0, mvx_l1, mvy_l1, mb_x, mb_y
+        )
+        l0_poc = ref_buffer.get_l0_frame(0).poc
+        l1_poc = ref_buffer.get_l1_frame(0).poc
+        pred_luma = _bipred(l0_luma, l1_luma, weighted_bipred_idc, current_poc, l0_poc, l1_poc)
+        pred_cb = _bipred(l0_cb, l1_cb, weighted_bipred_idc, current_poc, l0_poc, l1_poc)
+        pred_cr = _bipred(l0_cr, l1_cr, weighted_bipred_idc, current_poc, l0_poc, l1_poc)
+    elif pred_l0:
+        pred_luma, pred_cb, pred_cr = _get_prediction_l0(
+            ref_buffer, 0, mvx_l0, mvy_l0, mb_x, mb_y
+        )
+    else:
+        pred_luma, pred_cb, pred_cr = _get_prediction_l1(
+            ref_buffer, 0, mvx_l1, mvy_l1, mb_x, mb_y
+        )
 
     # Add residual
     luma = _add_residual(pred_luma, residual_luma)
@@ -468,7 +487,10 @@ def reconstruct_b_direct_16x16(
     # Update MV caches
     mv_cache.set_mv_16x16(mb_x, mb_y, mvx_l0, mvy_l0)
     if mv_cache_l1 is not None:
-        mv_cache_l1.set_mv_16x16(mb_x, mb_y, mvx_l1, mvy_l1)
+        if pred_l1:
+            mv_cache_l1.set_mv_16x16(mb_x, mb_y, mvx_l1, mvy_l1)
+        else:
+            mv_cache_l1.mark_intra(mb_x, mb_y)
 
     logger.debug(f"B_Direct MB({mb_x},{mb_y}): MVL0=({mvx_l0},{mvy_l0}), MVL1=({mvx_l1},{mvy_l1})")
 
