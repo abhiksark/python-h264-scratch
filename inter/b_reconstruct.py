@@ -160,6 +160,7 @@ def reconstruct_b_skip(
     mb_y: int,
     use_spatial: bool = True,
     current_poc: int = 0,
+    mv_cache_l1: Optional[MVCache] = None,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Reconstruct B_Skip macroblock.
 
@@ -167,17 +168,19 @@ def reconstruct_b_skip(
 
     Args:
         ref_buffer: Reference frame buffer
-        mv_cache: MV cache for spatial prediction
+        mv_cache: MV cache for spatial prediction (L0)
         mb_x, mb_y: Macroblock position
         use_spatial: True for spatial direct, False for temporal
         current_poc: POC of current picture (for temporal direct)
+        mv_cache_l1: L1 MV cache for L1 prediction context
 
     Returns:
         Tuple of (luma, cb, cr) reconstructed blocks
     """
     # Derive MVs using direct mode
     mvx_l0, mvy_l0, mvx_l1, mvy_l1 = derive_direct_mv(
-        mv_cache, ref_buffer, current_poc, mb_x, mb_y, use_spatial
+        mv_cache, ref_buffer, current_poc, mb_x, mb_y, use_spatial,
+        mv_cache_l1
     )
 
     # Get L0 and L1 predictions
@@ -192,8 +195,10 @@ def reconstruct_b_skip(
     luma = bipred_average(l0_luma, l1_luma)
     cb, cr = bipred_chroma(l0_cb, l1_cb, l0_cr, l1_cr)
 
-    # Update MV cache
+    # Update MV caches
     mv_cache.set_mv_16x16(mb_x, mb_y, mvx_l0, mvy_l0)
+    if mv_cache_l1 is not None:
+        mv_cache_l1.set_mv_16x16(mb_x, mb_y, mvx_l1, mvy_l1)
 
     logger.debug(f"B_Skip MB({mb_x},{mb_y}): MVL0=({mvx_l0},{mvy_l0}), MVL1=({mvx_l1},{mvy_l1})")
 
@@ -340,6 +345,7 @@ def reconstruct_b_direct_16x16(
     mb_y: int,
     use_spatial: bool = True,
     current_poc: int = 0,
+    mv_cache_l1: Optional[MVCache] = None,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Reconstruct B_Direct_16x16 macroblock.
 
@@ -347,18 +353,20 @@ def reconstruct_b_direct_16x16(
 
     Args:
         ref_buffer: Reference frame buffer
-        mv_cache: MV cache for spatial prediction
+        mv_cache: MV cache for spatial prediction (L0)
         residual_*: Residual blocks
         mb_x, mb_y: Macroblock position
         use_spatial: True for spatial direct, False for temporal
         current_poc: POC for temporal direct
+        mv_cache_l1: L1 MV cache for L1 prediction context
 
     Returns:
         Tuple of (luma, cb, cr) reconstructed blocks
     """
     # Derive MVs
     mvx_l0, mvy_l0, mvx_l1, mvy_l1 = derive_direct_mv(
-        mv_cache, ref_buffer, current_poc, mb_x, mb_y, use_spatial
+        mv_cache, ref_buffer, current_poc, mb_x, mb_y, use_spatial,
+        mv_cache_l1
     )
 
     # Get predictions
@@ -378,8 +386,10 @@ def reconstruct_b_direct_16x16(
     cb = _add_residual(pred_cb, residual_cb)
     cr = _add_residual(pred_cr, residual_cr)
 
-    # Update MV cache
+    # Update MV caches
     mv_cache.set_mv_16x16(mb_x, mb_y, mvx_l0, mvy_l0)
+    if mv_cache_l1 is not None:
+        mv_cache_l1.set_mv_16x16(mb_x, mb_y, mvx_l1, mvy_l1)
 
     logger.debug(f"B_Direct MB({mb_x},{mb_y}): MVL0=({mvx_l0},{mvy_l0}), MVL1=({mvx_l1},{mvy_l1})")
 

@@ -182,8 +182,9 @@ class DecoderState:
     # Reference frame buffer for inter prediction
     ref_buffer: Optional[ReferenceFrameBuffer] = None
 
-    # MV cache for current frame
+    # MV cache for current frame (L0 and L1 for B-frames)
     mv_cache: Optional[MVCache] = None
+    mv_cache_l1: Optional[MVCache] = None
 
     # Current macroblock QP (updated by mb_qp_delta)
     current_mb_qp: int = 26
@@ -287,6 +288,10 @@ class DecoderState:
     def init_mv_cache(self, sps: SPS) -> None:
         """Initialize MV cache for a new frame."""
         self.mv_cache = MVCache(
+            width_in_mbs=sps.pic_width_in_mbs,
+            height_in_mbs=sps.frame_height_in_mbs
+        )
+        self.mv_cache_l1 = MVCache(
             width_in_mbs=sps.pic_width_in_mbs,
             height_in_mbs=sps.frame_height_in_mbs
         )
@@ -703,6 +708,7 @@ class H264Decoder:
                 cb=self.state.frame_cb.copy(),
                 cr=self.state.frame_cr.copy(),
                 frame_num=slice_header.frame_num,
+                poc=getattr(slice_header, "pic_order_cnt_lsb", 0),
             )
             self.state.ref_buffer.add_frame(ref_frame)
             logger.debug(f"Added frame {slice_header.frame_num} to reference buffer")
@@ -2026,9 +2032,11 @@ class H264Decoder:
                 mb_idx_b = mb_y * mb_width + mb_x
                 self.state.nz_counts[mb_idx_b] = mb_data.nz_counts
 
-                # Mark intra MB in MV cache
+                # Mark intra MB in MV caches
                 if self.state.mv_cache is not None:
                     self.state.mv_cache.mark_intra(mb_x, mb_y)
+                if self.state.mv_cache_l1 is not None:
+                    self.state.mv_cache_l1.mark_intra(mb_x, mb_y)
 
                 # Store deblocking metadata
                 if self.state.mb_types is not None:
@@ -2776,9 +2784,10 @@ class H264Decoder:
                 mb_y=mb_y,
                 use_spatial=use_spatial,
                 current_poc=current_poc,
+                mv_cache_l1=self.state.mv_cache_l1,
             )
 
-        if mb_info.name == "B_8x8":
+        elif mb_info.name == "B_8x8":
             # ── B_8x8: sub-macroblock partition types ──
             sub_mb_infos = []
             for i in range(4):
@@ -2827,15 +2836,22 @@ class H264Decoder:
                         mvd_x = reader.read_se()
                         mvd_y = reader.read_se()
                         if j == 0:
-                            mvx_l1[i] = mvd_x
-                            mvy_l1[i] = mvd_y
+                            mvp_x, mvp_y = predict_mv_8x8(
+                                self.state.mv_cache_l1, mb_x, mb_y, i
+                            )
+                            mvx_l1[i] = mvp_x + mvd_x
+                            mvy_l1[i] = mvp_y + mvd_y
 
-            # Update MV cache with L0 MVs
+            # Update MV caches with L0 and L1 MVs
             for i in range(4):
                 if not sub_mb_infos[i].is_direct:
                     self.state.mv_cache.set_mv_8x8(
                         mb_x, mb_y, i, mvx_l0[i], mvy_l0[i]
                     )
+                    if self.state.mv_cache_l1 is not None:
+                        self.state.mv_cache_l1.set_mv_8x8(
+                            mb_x, mb_y, i, mvx_l1[i], mvy_l1[i]
+                        )
 
             luma_pred, cb_pred, cr_pred = reconstruct_b_8x8(
                 ref_buffer=self.state.ref_buffer,
@@ -2882,15 +2898,28 @@ class H264Decoder:
             if part_modes[0] in ("L1", "Bi"):
                 mvd_x = reader.read_se()
                 mvd_y = reader.read_se()
-                # Simplified L1 prediction
-                mvx_l1[0] = mvd_x
-                mvy_l1[0] = mvd_y
+                mvp_x, mvp_y = predict_mv_16x16(
+                    self.state.mv_cache_l1, mb_x, mb_y
+                )
+                mvx_l1[0] = mvp_x + mvd_x
+                mvy_l1[0] = mvp_y + mvd_y
 
-            # Store L0 MV in cache
+            # Store MVs in caches
             if part_modes[0] in ("L0", "Bi"):
                 self.state.mv_cache.set_mv_16x16(
                     mb_x, mb_y, mvx_l0[0], mvy_l0[0]
                 )
+            else:
+                # L1-only: mark L0 as unavailable (MV=0, ref=-1)
+                self.state.mv_cache.mark_intra(mb_x, mb_y)
+            if self.state.mv_cache_l1 is not None:
+                if part_modes[0] in ("L1", "Bi"):
+                    self.state.mv_cache_l1.set_mv_16x16(
+                        mb_x, mb_y, mvx_l1[0], mvy_l1[0]
+                    )
+                else:
+                    # L0-only: mark L1 as unavailable (MV=0, ref=-1)
+                    self.state.mv_cache_l1.mark_intra(mb_x, mb_y)
 
             if part_modes[0] == "L0":
                 luma_pred, cb_pred, cr_pred = reconstruct_b_l0_16x16(
@@ -2967,9 +2996,27 @@ class H264Decoder:
                 if part_modes[part] in ("L1", "Bi"):
                     mvd_x = reader.read_se()
                     mvd_y = reader.read_se()
-                    # Simplified L1 prediction
-                    mvx_l1[part] = mvd_x
-                    mvy_l1[part] = mvd_y
+                    if part_size == (16, 8):
+                        mvp_x, mvp_y = predict_mv_16x8(
+                            self.state.mv_cache_l1, mb_x, mb_y, part
+                        )
+                    else:
+                        mvp_x, mvp_y = predict_mv_8x16(
+                            self.state.mv_cache_l1, mb_x, mb_y, part
+                        )
+                    mvx_l1[part] = mvp_x + mvd_x
+                    mvy_l1[part] = mvp_y + mvd_y
+
+                    # Store L1 MV immediately for next partition
+                    if self.state.mv_cache_l1 is not None:
+                        if part_size == (16, 8):
+                            self.state.mv_cache_l1.set_mv_16x8(
+                                mb_x, mb_y, part, mvx_l1[part], mvy_l1[part]
+                            )
+                        else:
+                            self.state.mv_cache_l1.set_mv_8x16(
+                                mb_x, mb_y, part, mvx_l1[part], mvy_l1[part]
+                            )
 
             if part_size == (16, 8):
                 luma_pred, cb_pred, cr_pred = reconstruct_b_16x8(
@@ -3106,6 +3153,7 @@ class H264Decoder:
             mb_y=mb_y,
             use_spatial=use_spatial,
             current_poc=current_poc,
+            mv_cache_l1=self.state.mv_cache_l1,
         )
 
         ly, lx = mb_y * 16, mb_x * 16

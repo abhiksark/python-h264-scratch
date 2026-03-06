@@ -20,41 +20,54 @@ def derive_direct_spatial(
     mv_cache: MVCache,
     mb_x: int,
     mb_y: int,
+    mv_cache_l1: Optional[MVCache] = None,
 ) -> Tuple[int, int, int, int]:
     """Derive direct mode MVs using spatial prediction.
 
-    Uses neighbor MVs to derive L0 and L1 MVs.
-    Similar to P_Skip MV prediction but for bi-prediction.
+    Derives L0 and L1 MVs independently from neighbor MVs in each list.
 
     Args:
-        mv_cache: MV cache with neighbor MVs
+        mv_cache: L0 MV cache with neighbor MVs
         mb_x, mb_y: Macroblock position
+        mv_cache_l1: L1 MV cache (if None, L1 MV = median of L0 neighbors negated)
 
     Returns:
         Tuple of (mvx_l0, mvy_l0, mvx_l1, mvy_l1)
 
     H.264 Spec: Section 8.4.1.2.2
     """
-    # Get neighbor MVs (using L0 MVs from neighbors)
-    mv_a = mv_cache.get_mv(mb_x - 1, mb_y, 3, 0) if mb_x > 0 else (0, 0)
-    mv_b = mv_cache.get_mv(mb_x, mb_y - 1, 0, 3) if mb_y > 0 else (0, 0)
+    # Get L0 neighbor MVs
+    mv_a_l0 = mv_cache.get_mv(mb_x - 1, mb_y, 3, 0) if mb_x > 0 else (0, 0)
+    mv_b_l0 = mv_cache.get_mv(mb_x, mb_y - 1, 0, 3) if mb_y > 0 else (0, 0)
 
-    # Get top-right or top-left
     if mb_y > 0 and mb_x < mv_cache.width_in_mbs - 1:
-        mv_c = mv_cache.get_mv(mb_x + 1, mb_y - 1, 0, 3)
+        mv_c_l0 = mv_cache.get_mv(mb_x + 1, mb_y - 1, 0, 3)
     elif mb_y > 0 and mb_x > 0:
-        mv_c = mv_cache.get_mv(mb_x - 1, mb_y - 1, 3, 3)
+        mv_c_l0 = mv_cache.get_mv(mb_x - 1, mb_y - 1, 3, 3)
     else:
-        mv_c = (0, 0)
+        mv_c_l0 = (0, 0)
 
     # Median prediction for L0
-    mvx_l0 = _median(mv_a[0], mv_b[0], mv_c[0])
-    mvy_l0 = _median(mv_a[1], mv_b[1], mv_c[1])
+    mvx_l0 = _median(mv_a_l0[0], mv_b_l0[0], mv_c_l0[0])
+    mvy_l0 = _median(mv_a_l0[1], mv_b_l0[1], mv_c_l0[1])
 
-    # L1 MV: typically opposite direction or zero
-    # Simplified: use negative of L0 for symmetric bi-prediction
-    mvx_l1 = -mvx_l0
-    mvy_l1 = -mvy_l0
+    # Get L1 neighbor MVs from L1 cache
+    if mv_cache_l1 is not None:
+        mv_a_l1 = mv_cache_l1.get_mv(mb_x - 1, mb_y, 3, 0) if mb_x > 0 else (0, 0)
+        mv_b_l1 = mv_cache_l1.get_mv(mb_x, mb_y - 1, 0, 3) if mb_y > 0 else (0, 0)
+
+        if mb_y > 0 and mb_x < mv_cache_l1.width_in_mbs - 1:
+            mv_c_l1 = mv_cache_l1.get_mv(mb_x + 1, mb_y - 1, 0, 3)
+        elif mb_y > 0 and mb_x > 0:
+            mv_c_l1 = mv_cache_l1.get_mv(mb_x - 1, mb_y - 1, 3, 3)
+        else:
+            mv_c_l1 = (0, 0)
+
+        mvx_l1 = _median(mv_a_l1[0], mv_b_l1[0], mv_c_l1[0])
+        mvy_l1 = _median(mv_a_l1[1], mv_b_l1[1], mv_c_l1[1])
+    else:
+        mvx_l1 = -mvx_l0
+        mvy_l1 = -mvy_l0
 
     return mvx_l0, mvy_l0, mvx_l1, mvy_l1
 
@@ -133,21 +146,23 @@ def derive_direct_mv(
     mb_x: int,
     mb_y: int,
     use_spatial: bool,
+    mv_cache_l1: Optional[MVCache] = None,
 ) -> Tuple[int, int, int, int]:
     """Derive direct mode MVs based on direct_spatial_mv_pred_flag.
 
     Args:
-        mv_cache: MV cache for spatial prediction
+        mv_cache: MV cache for spatial prediction (L0)
         ref_buffer: Reference buffer for temporal prediction
         current_poc: POC of current picture
         mb_x, mb_y: Macroblock position
         use_spatial: True for spatial direct, False for temporal
+        mv_cache_l1: L1 MV cache for spatial direct mode
 
     Returns:
         Tuple of (mvx_l0, mvy_l0, mvx_l1, mvy_l1)
     """
     if use_spatial:
-        return derive_direct_spatial(mv_cache, mb_x, mb_y)
+        return derive_direct_spatial(mv_cache, mb_x, mb_y, mv_cache_l1)
     else:
         if ref_buffer is None:
             return (0, 0, 0, 0)
@@ -161,23 +176,26 @@ def derive_b_skip_mv(
     mb_x: int,
     mb_y: int,
     use_spatial: bool,
+    mv_cache_l1: Optional[MVCache] = None,
 ) -> Tuple[int, int, int, int]:
     """Derive MVs for B_Skip macroblock.
 
     B_Skip is equivalent to B_Direct_16x16 with no residual.
 
     Args:
-        mv_cache: MV cache for spatial prediction
+        mv_cache: MV cache for spatial prediction (L0)
         ref_buffer: Reference buffer for temporal prediction
         current_poc: POC of current picture
         mb_x, mb_y: Macroblock position
         use_spatial: True for spatial direct, False for temporal
+        mv_cache_l1: L1 MV cache for spatial direct mode
 
     Returns:
         Tuple of (mvx_l0, mvy_l0, mvx_l1, mvy_l1)
     """
     return derive_direct_mv(
-        mv_cache, ref_buffer, current_poc, mb_x, mb_y, use_spatial
+        mv_cache, ref_buffer, current_poc, mb_x, mb_y, use_spatial,
+        mv_cache_l1
     )
 
 
