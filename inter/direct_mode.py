@@ -237,6 +237,7 @@ def derive_direct_temporal(
     current_poc: int,
     mb_x: int,
     mb_y: int,
+    sub_idx: int = 0,
 ) -> Tuple[int, int, int, int]:
     """Derive direct mode MVs using temporal prediction.
 
@@ -246,6 +247,7 @@ def derive_direct_temporal(
         ref_buffer: Reference frame buffer with L0/L1 lists
         current_poc: POC of current picture
         mb_x, mb_y: Macroblock position
+        sub_idx: 8x8 sub-block index (0-3)
 
     Returns:
         Tuple of (mvx_l0, mvy_l0, mvx_l1, mvy_l1)
@@ -260,8 +262,8 @@ def derive_direct_temporal(
     l1_frame = l1_list[0]
     l1_poc = l1_frame.poc
 
-    # Get co-located MV from L1 reference
-    col_mv = l1_frame.get_colocated_mv(mb_x, mb_y)
+    # Get co-located MV from L1 reference (per sub-block)
+    col_mv = l1_frame.get_colocated_mv(mb_x, mb_y, sub_idx=sub_idx)
     col_mvx, col_mvy = col_mv
 
     # If co-located MV is zero, return zeros

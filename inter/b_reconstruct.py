@@ -19,7 +19,7 @@ from inter.motion_comp import (
 )
 from inter.mv_prediction import MVCache
 from inter.bipred import bipred_average, bipred_chroma, implicit_bipred
-from inter.direct_mode import derive_direct_mv
+from inter.direct_mode import derive_direct_mv, derive_direct_spatial_sub8x8, derive_direct_temporal
 
 logger = logging.getLogger(__name__)
 
@@ -215,6 +215,67 @@ def _add_residual(
     ).astype(np.uint8)
 
 
+def _get_sub_prediction(
+    ref_buffer: ReferenceFrameBuffer,
+    list_id: str,
+    ref_idx: int,
+    mvx: int,
+    mvy: int,
+    mb_x: int,
+    mb_y: int,
+    x_off: int,
+    y_off: int,
+    width: int,
+    height: int,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Get prediction for a sub-block within an MB.
+
+    Args:
+        ref_buffer: Reference frame buffer
+        list_id: "L0" or "L1"
+        ref_idx: Reference index
+        mvx, mvy: Motion vector (quarter-pel)
+        mb_x, mb_y: Macroblock position
+        x_off, y_off: Pixel offset within MB
+        width, height: Sub-block dimensions
+
+    Returns:
+        Tuple of (luma, cb, cr) prediction blocks
+    """
+    int_mvx = mvx >> 2
+    int_mvy = mvy >> 2
+    frac_x = mvx & 3
+    frac_y = mvy & 3
+
+    ref_x = mb_x * 16 + x_off + int_mvx
+    ref_y = mb_y * 16 + y_off + int_mvy
+
+    if list_id == "L0":
+        ref_frame = ref_buffer.get_l0_frame(ref_idx)
+    else:
+        ref_frame = ref_buffer.get_l1_frame(ref_idx)
+
+    luma = _apply_inter_prediction(
+        ref_frame.luma, ref_x, ref_y, frac_x, frac_y, width, height
+    )
+
+    int_cmvx = mvx >> 3
+    int_cmvy = mvy >> 3
+    frac_cx = mvx & 7
+    frac_cy = mvy & 7
+    cx = mb_x * 8 + x_off // 2 + int_cmvx
+    cy = mb_y * 8 + y_off // 2 + int_cmvy
+
+    cb = _apply_chroma_prediction(
+        ref_frame.cb, cx, cy, frac_cx, frac_cy, width // 2, height // 2
+    )
+    cr = _apply_chroma_prediction(
+        ref_frame.cr, cx, cy, frac_cx, frac_cy, width // 2, height // 2
+    )
+
+    return luma, cb, cr
+
+
 def reconstruct_b_skip(
     ref_buffer: ReferenceFrameBuffer,
     mv_cache: MVCache,
@@ -225,70 +286,20 @@ def reconstruct_b_skip(
     mv_cache_l1: Optional[MVCache] = None,
     weighted_bipred_idc: int = 0,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Reconstruct B_Skip macroblock.
-
-    B_Skip uses direct mode MVs with no residual.
-
-    Args:
-        ref_buffer: Reference frame buffer
-        mv_cache: MV cache for spatial prediction (L0)
-        mb_x, mb_y: Macroblock position
-        use_spatial: True for spatial direct, False for temporal
-        current_poc: POC of current picture (for temporal direct)
-        mv_cache_l1: L1 MV cache for L1 prediction context
-        weighted_bipred_idc: 0=none, 1=explicit, 2=implicit
-
-    Returns:
-        Tuple of (luma, cb, cr) reconstructed blocks
-    """
-    # Derive MVs and prediction flags using direct mode
-    (mvx_l0, mvy_l0, mvx_l1, mvy_l1, pred_l0, pred_l1,
-     ri_l0, ri_l1) = derive_direct_mv(
-        mv_cache, ref_buffer, current_poc, mb_x, mb_y, use_spatial,
-        mv_cache_l1
+    """Reconstruct B_Skip macroblock (B_Direct_16x16 with no residual)."""
+    return reconstruct_b_direct_16x16(
+        ref_buffer=ref_buffer,
+        mv_cache=mv_cache,
+        residual_luma=None,
+        residual_cb=None,
+        residual_cr=None,
+        mb_x=mb_x,
+        mb_y=mb_y,
+        use_spatial=use_spatial,
+        current_poc=current_poc,
+        mv_cache_l1=mv_cache_l1,
+        weighted_bipred_idc=weighted_bipred_idc,
     )
-    # Clamp ref_idx for prediction (use 0 if negative)
-    eff_ri_l0 = max(ri_l0, 0)
-    eff_ri_l1 = max(ri_l1, 0)
-
-    if pred_l0 and pred_l1:
-        # Bi-prediction
-        l0_luma, l0_cb, l0_cr = _get_prediction_l0(
-            ref_buffer, eff_ri_l0, mvx_l0, mvy_l0, mb_x, mb_y
-        )
-        l1_luma, l1_cb, l1_cr = _get_prediction_l1(
-            ref_buffer, eff_ri_l1, mvx_l1, mvy_l1, mb_x, mb_y
-        )
-        l0_poc = ref_buffer.get_l0_frame(eff_ri_l0).poc
-        l1_poc = ref_buffer.get_l1_frame(eff_ri_l1).poc
-        luma = _bipred(l0_luma, l1_luma, weighted_bipred_idc, current_poc, l0_poc, l1_poc)
-        cb = _bipred(l0_cb, l1_cb, weighted_bipred_idc, current_poc, l0_poc, l1_poc)
-        cr = _bipred(l0_cr, l1_cr, weighted_bipred_idc, current_poc, l0_poc, l1_poc)
-    elif pred_l0:
-        # L0-only prediction
-        luma, cb, cr = _get_prediction_l0(
-            ref_buffer, eff_ri_l0, mvx_l0, mvy_l0, mb_x, mb_y
-        )
-    else:
-        # L1-only prediction
-        luma, cb, cr = _get_prediction_l1(
-            ref_buffer, eff_ri_l1, mvx_l1, mvy_l1, mb_x, mb_y
-        )
-
-    # Update MV caches with derived ref_idx
-    if pred_l0:
-        mv_cache.set_mv_16x16(mb_x, mb_y, mvx_l0, mvy_l0, ref_idx=eff_ri_l0)
-    else:
-        mv_cache.mark_intra(mb_x, mb_y)
-    if mv_cache_l1 is not None:
-        if pred_l1:
-            mv_cache_l1.set_mv_16x16(mb_x, mb_y, mvx_l1, mvy_l1, ref_idx=eff_ri_l1)
-        else:
-            mv_cache_l1.mark_intra(mb_x, mb_y)
-
-    logger.debug(f"B_Skip MB({mb_x},{mb_y}): MVL0=({mvx_l0},{mvy_l0}), MVL1=({mvx_l1},{mvy_l1}), pred=({'L0' if pred_l0 else ''}{'L1' if pred_l1 else ''})")
-
-    return luma, cb, cr
 
 
 def reconstruct_b_l0_16x16(
@@ -441,9 +452,11 @@ def reconstruct_b_direct_16x16(
     mv_cache_l1: Optional[MVCache] = None,
     weighted_bipred_idc: int = 0,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Reconstruct B_Direct_16x16 macroblock.
+    """Reconstruct B_Direct_16x16 macroblock as 4 B_Direct_8x8 sub-blocks.
 
-    MVs are derived from neighbors (spatial) or co-located (temporal).
+    H.264 8.4.1.2.2: B_Direct_16x16 is treated as 4 independent B_Direct_8x8
+    partitions, each with its own colZeroFlag check against the co-located
+    8x8 block in the L1 reference.
 
     Args:
         ref_buffer: Reference frame buffer
@@ -458,54 +471,91 @@ def reconstruct_b_direct_16x16(
     Returns:
         Tuple of (luma, cb, cr) reconstructed blocks
     """
-    # Derive MVs and prediction flags
-    (mvx_l0, mvy_l0, mvx_l1, mvy_l1, pred_l0, pred_l1,
-     ri_l0, ri_l1) = derive_direct_mv(
-        mv_cache, ref_buffer, current_poc, mb_x, mb_y, use_spatial,
-        mv_cache_l1
-    )
-    eff_ri_l0 = max(ri_l0, 0)
-    eff_ri_l1 = max(ri_l1, 0)
+    pred_luma = np.zeros((16, 16), dtype=np.uint8)
+    pred_cb = np.zeros((8, 8), dtype=np.uint8)
+    pred_cr = np.zeros((8, 8), dtype=np.uint8)
 
-    if pred_l0 and pred_l1:
-        # Bi-prediction
-        l0_luma, l0_cb, l0_cr = _get_prediction_l0(
-            ref_buffer, eff_ri_l0, mvx_l0, mvy_l0, mb_x, mb_y
-        )
-        l1_luma, l1_cb, l1_cr = _get_prediction_l1(
-            ref_buffer, eff_ri_l1, mvx_l1, mvy_l1, mb_x, mb_y
-        )
-        l0_poc = ref_buffer.get_l0_frame(eff_ri_l0).poc
-        l1_poc = ref_buffer.get_l1_frame(eff_ri_l1).poc
-        pred_luma = _bipred(l0_luma, l1_luma, weighted_bipred_idc, current_poc, l0_poc, l1_poc)
-        pred_cb = _bipred(l0_cb, l1_cb, weighted_bipred_idc, current_poc, l0_poc, l1_poc)
-        pred_cr = _bipred(l0_cr, l1_cr, weighted_bipred_idc, current_poc, l0_poc, l1_poc)
-    elif pred_l0:
-        pred_luma, pred_cb, pred_cr = _get_prediction_l0(
-            ref_buffer, eff_ri_l0, mvx_l0, mvy_l0, mb_x, mb_y
-        )
-    else:
-        pred_luma, pred_cb, pred_cr = _get_prediction_l1(
-            ref_buffer, eff_ri_l1, mvx_l1, mvy_l1, mb_x, mb_y
-        )
+    # Sub-block layout: 0=TL(0,0), 1=TR(8,0), 2=BL(0,8), 3=BR(8,8)
+    sub_offsets = [(0, 0), (8, 0), (0, 8), (8, 8)]
+
+    for sub_idx in range(4):
+        x_off, y_off = sub_offsets[sub_idx]
+
+        if use_spatial:
+            (mvx_l0, mvy_l0, mvx_l1, mvy_l1, pf0, pf1,
+             ri0, ri1) = derive_direct_spatial_sub8x8(
+                mv_cache, mv_cache_l1, mb_x, mb_y, sub_idx,
+                ref_buffer=ref_buffer,
+            )
+        else:
+            if ref_buffer is not None:
+                mvx_l0, mvy_l0, mvx_l1, mvy_l1 = derive_direct_temporal(
+                    ref_buffer, current_poc, mb_x, mb_y, sub_idx=sub_idx,
+                )
+            else:
+                mvx_l0, mvy_l0, mvx_l1, mvy_l1 = 0, 0, 0, 0
+            pf0, pf1, ri0, ri1 = True, True, 0, 0
+
+        eff_ri0 = max(ri0, 0)
+        eff_ri1 = max(ri1, 0)
+
+        # Get 8x8 prediction per sub-block
+        if pf0 and pf1:
+            l0 = _get_sub_prediction(
+                ref_buffer, "L0", eff_ri0, mvx_l0, mvy_l0,
+                mb_x, mb_y, x_off, y_off, 8, 8,
+            )
+            l1 = _get_sub_prediction(
+                ref_buffer, "L1", eff_ri1, mvx_l1, mvy_l1,
+                mb_x, mb_y, x_off, y_off, 8, 8,
+            )
+            l0_poc = ref_buffer.get_l0_frame(eff_ri0).poc
+            l1_poc = ref_buffer.get_l1_frame(eff_ri1).poc
+            sub_luma = _bipred(l0[0], l1[0], weighted_bipred_idc,
+                               current_poc, l0_poc, l1_poc)
+            sub_cb = _bipred(l0[1], l1[1], weighted_bipred_idc,
+                             current_poc, l0_poc, l1_poc)
+            sub_cr = _bipred(l0[2], l1[2], weighted_bipred_idc,
+                             current_poc, l0_poc, l1_poc)
+        elif pf0:
+            sub_luma, sub_cb, sub_cr = _get_sub_prediction(
+                ref_buffer, "L0", eff_ri0, mvx_l0, mvy_l0,
+                mb_x, mb_y, x_off, y_off, 8, 8,
+            )
+        else:
+            sub_luma, sub_cb, sub_cr = _get_sub_prediction(
+                ref_buffer, "L1", eff_ri1, mvx_l1, mvy_l1,
+                mb_x, mb_y, x_off, y_off, 8, 8,
+            )
+
+        # Place sub-block into prediction arrays
+        pred_luma[y_off:y_off + 8, x_off:x_off + 8] = sub_luma
+        cx_off, cy_off = x_off // 2, y_off // 2
+        pred_cb[cy_off:cy_off + 4, cx_off:cx_off + 4] = sub_cb
+        pred_cr[cy_off:cy_off + 4, cx_off:cx_off + 4] = sub_cr
+
+        # Update MV caches per sub-block (4 4x4 blocks per 8x8)
+        for dy in range(2):
+            for dx in range(2):
+                bx = (x_off // 4) + dx
+                by = (y_off // 4) + dy
+                if pf0:
+                    mv_cache.set_mv(mb_x, mb_y, bx, by,
+                                    mvx_l0, mvy_l0, ref_idx=eff_ri0)
+                else:
+                    mv_cache.set_mv(mb_x, mb_y, bx, by, 0, 0, ref_idx=-1)
+                if mv_cache_l1 is not None:
+                    if pf1:
+                        mv_cache_l1.set_mv(mb_x, mb_y, bx, by,
+                                           mvx_l1, mvy_l1, ref_idx=eff_ri1)
+                    else:
+                        mv_cache_l1.set_mv(mb_x, mb_y, bx, by,
+                                           0, 0, ref_idx=-1)
 
     # Add residual
     luma = _add_residual(pred_luma, residual_luma)
     cb = _add_residual(pred_cb, residual_cb)
     cr = _add_residual(pred_cr, residual_cr)
-
-    # Update MV caches with derived ref_idx
-    if pred_l0:
-        mv_cache.set_mv_16x16(mb_x, mb_y, mvx_l0, mvy_l0, ref_idx=eff_ri_l0)
-    else:
-        mv_cache.mark_intra(mb_x, mb_y)
-    if mv_cache_l1 is not None:
-        if pred_l1:
-            mv_cache_l1.set_mv_16x16(mb_x, mb_y, mvx_l1, mvy_l1, ref_idx=eff_ri_l1)
-        else:
-            mv_cache_l1.mark_intra(mb_x, mb_y)
-
-    logger.debug(f"B_Direct MB({mb_x},{mb_y}): MVL0=({mvx_l0},{mvy_l0}), MVL1=({mvx_l1},{mvy_l1})")
 
     return luma, cb, cr
 
