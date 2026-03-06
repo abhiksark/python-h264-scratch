@@ -9,6 +9,12 @@ H.264 Spec Reference: Section 7.3.5 - Macroblock layer syntax
 
 from typing import List, Dict, Any, Optional, TYPE_CHECKING
 
+import numpy as np
+
+from entropy.cabac_residual import (
+    decode_residual_block_cabac,
+    decode_residual_block_cabac_with_cbf,
+)
 from entropy.cabac_syntax import (
     decode_mb_skip_flag,
     decode_mb_type_i,
@@ -365,6 +371,15 @@ def decode_macroblock_layer_cabac(
     if has_coded_blocks:
         result['mb_qp_delta'] = decode_mb_qp_delta(decoder, contexts)
 
+    # Decode residual blocks
+    if has_coded_blocks:
+        result['residual'] = _decode_residual_cabac(
+            decoder, contexts, result['mb_type'], slice_type, result['cbp'],
+            result.get('transform_size_8x8_flag', 0),
+        )
+    else:
+        result['residual'] = _empty_residual()
+
     return result
 
 
@@ -452,6 +467,125 @@ def decode_mb_field_decoding_flag_cabac(
     ctx_idx = CTX_MB_FIELD_DECODING_FLAG + ctx_inc
 
     return decoder.decode_decision(contexts[ctx_idx])
+
+
+# Coded block flag context base indices (H.264 Table 9-39)
+CTX_CBF_LUMA_DC_BASE = 85
+CTX_CBF_LUMA_AC_BASE = 89
+CTX_CBF_CHROMA_DC_BASE = 93
+CTX_CBF_CHROMA_AC_BASE = 97
+
+
+def _decode_residual_cabac(
+    decoder: 'CABACDecoder',
+    contexts: List['CABACContext'],
+    mb_type: int,
+    slice_type: int,
+    cbp: int,
+    transform_size_8x8_flag: int,
+) -> Dict[str, Any]:
+    """Decode residual coefficient blocks using CABAC.
+
+    Handles the H.264 residual() syntax for all block categories:
+    - block_cat=0: Luma DC (I_16x16) -- 16 coefficients
+    - block_cat=1: Luma AC (I_16x16) -- 15 coefficients per block
+    - block_cat=2: Luma 4x4 (I_4x4/inter) -- 16 coefficients per block
+    - block_cat=3: Chroma DC -- 4 coefficients per block
+    - block_cat=4: Chroma AC -- 15 coefficients per block
+
+    H.264 Spec Reference: Section 7.3.5.3
+
+    Args:
+        decoder: CABAC decoder.
+        contexts: Context models.
+        mb_type: Macroblock type value.
+        slice_type: Slice type (0=P, 1=B, 2=I).
+        cbp: Coded block pattern (bits 0-3: luma, bits 4-5: chroma).
+        transform_size_8x8_flag: 1 for 8x8 transform (High profile).
+
+    Returns:
+        Dict with residual block arrays keyed by block type.
+    """
+    residual = _empty_residual()
+
+    is_16x16 = _is_i_16x16(mb_type, slice_type)
+
+    if is_16x16:
+        cbp_luma = cbp & 0x0F
+        cbp_chroma = (cbp >> 4) & 0x03
+
+        # Luma DC: block_cat=0, 16 coefficients, always decoded (no cbf)
+        residual['luma_dc'] = decode_residual_block_cabac(
+            decoder, contexts, max_coeff=16, block_cat=0,
+        )
+
+        # Luma AC: block_cat=1, 15 coefficients per 4x4 block
+        # Only decoded if cbp_luma indicates AC coefficients present
+        if cbp_luma != 0:
+            for i in range(16):
+                residual['luma_ac'][i] = decode_residual_block_cabac_with_cbf(
+                    decoder, contexts, max_coeff=15, block_cat=1,
+                    coded_block_flag_ctx_idx=CTX_CBF_LUMA_AC_BASE,
+                )
+    else:
+        # I_4x4 or inter: block_cat=2, 16 coefficients per 4x4 block
+        cbp_luma = cbp & 0x0F
+        cbp_chroma = (cbp >> 4) & 0x03
+
+        for i8x8 in range(4):
+            if cbp_luma & (1 << i8x8):
+                for i4x4 in range(4):
+                    blk_idx = i8x8 * 4 + i4x4
+                    residual['luma_4x4'][blk_idx] = (
+                        decode_residual_block_cabac_with_cbf(
+                            decoder, contexts, max_coeff=16, block_cat=2,
+                            coded_block_flag_ctx_idx=CTX_CBF_LUMA_AC_BASE,
+                        )
+                    )
+
+    # Chroma DC: block_cat=3, 4 coefficients, no cbf (always decoded
+    # when cbp_chroma >= 1)
+    if cbp_chroma >= 1:
+        residual['chroma_dc_cb'] = decode_residual_block_cabac(
+            decoder, contexts, max_coeff=4, block_cat=3,
+        )
+        residual['chroma_dc_cr'] = decode_residual_block_cabac(
+            decoder, contexts, max_coeff=4, block_cat=3,
+        )
+
+    # Chroma AC: block_cat=4, 15 coefficients, with cbf (only when
+    # cbp_chroma == 2)
+    if cbp_chroma == 2:
+        for i in range(4):
+            residual['chroma_ac_cb'][i] = decode_residual_block_cabac_with_cbf(
+                decoder, contexts, max_coeff=15, block_cat=4,
+                coded_block_flag_ctx_idx=CTX_CBF_CHROMA_AC_BASE,
+            )
+        for i in range(4):
+            residual['chroma_ac_cr'][i] = decode_residual_block_cabac_with_cbf(
+                decoder, contexts, max_coeff=15, block_cat=4,
+                coded_block_flag_ctx_idx=CTX_CBF_CHROMA_AC_BASE,
+            )
+
+    return residual
+
+
+def _empty_residual() -> Dict[str, Any]:
+    """Return an empty residual dict with all None/zero arrays.
+
+    Returns:
+        Dict with keys for each residual block type, initialized to
+        None or lists of None.
+    """
+    return {
+        'luma_dc': None,
+        'luma_ac': [None] * 16,
+        'luma_4x4': [None] * 16,
+        'chroma_dc_cb': None,
+        'chroma_dc_cr': None,
+        'chroma_ac_cb': [None] * 4,
+        'chroma_ac_cr': [None] * 4,
+    }
 
 
 # Helper functions
