@@ -2008,6 +2008,7 @@ class H264Decoder:
                     self._process_b_skip_run(
                         mb_x, mb_y, use_spatial, current_poc,
                         weighted_bipred_idc,
+                        current_qp=current_qp,
                     )
                     mb_idx += 1
                 break
@@ -2030,6 +2031,7 @@ class H264Decoder:
                 self._process_b_skip_run(
                     mb_x, mb_y, use_spatial, current_poc,
                     weighted_bipred_idc,
+                    current_qp=current_qp,
                 )
                 mb_idx += 1
 
@@ -2043,6 +2045,7 @@ class H264Decoder:
                     self._process_b_skip_run(
                         mb_x, mb_y, use_spatial, current_poc,
                         weighted_bipred_idc,
+                        current_qp=current_qp,
                     )
                     mb_idx += 1
                 break
@@ -3297,6 +3300,7 @@ class H264Decoder:
         use_spatial: bool,
         current_poc: int,
         weighted_bipred_idc: int = 0,
+        current_qp: int = 26,
     ) -> None:
         """Process a B_Skip macroblock.
 
@@ -3332,7 +3336,7 @@ class H264Decoder:
         if self.state.mb_types is not None:
             self.state.mb_types[mb_idx_skip] = 99  # Non-intra sentinel
         if self.state.mb_qps is not None:
-            self.state.mb_qps[mb_idx_skip] = self.state.current_mb_qp
+            self.state.mb_qps[mb_idx_skip] = current_qp
         if self.state.mb_coeffs is not None:
             self.state.mb_coeffs[mb_idx_skip] = 0
 

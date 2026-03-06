@@ -1218,13 +1218,22 @@ def _get_bs_for_edge(
 
     if p_dirs <= 1 and q_dirs <= 1:
         # Both unipred (or skip with single ref)
-        if ref_p != ref_q:
-            return 1
-        if not _mv_same(mv_p, mv_q):
-            return 1
-        # Also check if one uses L1 and other uses L0
+        # Check if using different lists
         if p_has_l0 != q_has_l0:
             return 1
+        # Compare actual active list's ref and MV
+        if p_has_l0:
+            # Both use L0
+            if ref_p != ref_q:
+                return 1
+            if not _mv_same(mv_p, mv_q):
+                return 1
+        else:
+            # Both use L1
+            if ref_l1_p != ref_l1_q:
+                return 1
+            if not _mv_same(mv_l1_p, mv_l1_q):
+                return 1
         return 0
 
     # Both bipred: check both direct match and cross match
