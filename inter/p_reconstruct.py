@@ -460,10 +460,10 @@ def reconstruct_p_8x16(
             mv_cache.set_mv(mb_x, mb_y, bx, by, mvx[1], mvy[1])
 
     # Chroma reconstruction: per-partition MVs (left 4 cols / right 4 cols)
-    ref_frame = ref_buffer.get_frame(ref_idx[0])
     pred_cb = np.zeros((8, 8), dtype=np.uint8)
     pred_cr = np.zeros((8, 8), dtype=np.uint8)
     for part in range(2):
+        ref_frame = ref_buffer.get_frame(ref_idx[part])
         cmvx = mvx[part]
         cmvy = mvy[part]
         cx = mb_x * 8 + part * 4 + (cmvx >> 3)
@@ -1109,12 +1109,41 @@ def reconstruct_p_16x8_weighted(
         for by in range(2, 4):
             mv_cache.set_mv(mb_x, mb_y, bx, by, mvx[1], mvy[1])
 
-    # Chroma reconstruction (simplified - use top partition weights)
-    cb, cr = _reconstruct_chroma_weighted(
-        ref_buffer, ref_idx[0], mvx[0], mvy[0],
-        weights_cb[0], offsets_cb[0], weights_cr[0], offsets_cr[0],
-        log2_denom_chroma, residual_cb, residual_cr, mb_x, mb_y
-    )
+    # Chroma reconstruction: per-partition MVs (top 4 rows / bottom 4 rows)
+    from inter.weighted_pred import apply_weighted_prediction_chroma
+
+    pred_cb = np.zeros((8, 8), dtype=np.uint8)
+    pred_cr = np.zeros((8, 8), dtype=np.uint8)
+    for part in range(2):
+        ref_frame = ref_buffer.get_frame(ref_idx[part])
+        cmvx = mvx[part]
+        cmvy = mvy[part]
+        cx = mb_x * 8 + (cmvx >> 3)
+        cy = mb_y * 8 + part * 4 + (cmvy >> 3)
+        fx, fy = cmvx & 7, cmvy & 7
+        part_cb = apply_chroma_prediction(
+            ref_frame.cb, cx, cy, fx, fy, 8, 4
+        )
+        part_cr = apply_chroma_prediction(
+            ref_frame.cr, cx, cy, fx, fy, 8, 4
+        )
+        part_cb, part_cr = apply_weighted_prediction_chroma(
+            part_cb, part_cr,
+            weights_cb[part], offsets_cb[part],
+            weights_cr[part], offsets_cr[part],
+            log2_denom_chroma,
+        )
+        pred_cb[part*4:(part+1)*4, :] = part_cb
+        pred_cr[part*4:(part+1)*4, :] = part_cr
+
+    if residual_cb is not None:
+        cb = np.clip(pred_cb.astype(np.int32) + residual_cb, 0, 255).astype(np.uint8)
+    else:
+        cb = pred_cb
+    if residual_cr is not None:
+        cr = np.clip(pred_cr.astype(np.int32) + residual_cr, 0, 255).astype(np.uint8)
+    else:
+        cr = pred_cr
 
     logger.debug(f"P_16x8_weighted MB({mb_x},{mb_y})")
 
@@ -1207,12 +1236,42 @@ def reconstruct_p_8x16_weighted(
         for bx in range(2, 4):
             mv_cache.set_mv(mb_x, mb_y, bx, by, mvx[1], mvy[1])
 
-    # Chroma reconstruction (use left partition weights)
-    cb, cr = _reconstruct_chroma_weighted(
-        ref_buffer, ref_idx[0], mvx[0], mvy[0],
-        weights_cb[0], offsets_cb[0], weights_cr[0], offsets_cr[0],
-        log2_denom_chroma, residual_cb, residual_cr, mb_x, mb_y
-    )
+    # Chroma reconstruction: per-partition MVs (left 4 cols / right 4 cols)
+    from inter.weighted_pred import apply_weighted_prediction_chroma
+
+    pred_cb = np.zeros((8, 8), dtype=np.uint8)
+    pred_cr = np.zeros((8, 8), dtype=np.uint8)
+    for part in range(2):
+        ref_frame = ref_buffer.get_frame(ref_idx[part])
+        cmvx = mvx[part]
+        cmvy = mvy[part]
+        cx = mb_x * 8 + part * 4 + (cmvx >> 3)
+        cy = mb_y * 8 + (cmvy >> 3)
+        fx, fy = cmvx & 7, cmvy & 7
+        part_cb = apply_chroma_prediction(
+            ref_frame.cb, cx, cy, fx, fy, 4, 8
+        )
+        part_cr = apply_chroma_prediction(
+            ref_frame.cr, cx, cy, fx, fy, 4, 8
+        )
+        # Apply weighted prediction per partition
+        part_cb, part_cr = apply_weighted_prediction_chroma(
+            part_cb, part_cr,
+            weights_cb[part], offsets_cb[part],
+            weights_cr[part], offsets_cr[part],
+            log2_denom_chroma,
+        )
+        pred_cb[:, part*4:(part+1)*4] = part_cb
+        pred_cr[:, part*4:(part+1)*4] = part_cr
+
+    if residual_cb is not None:
+        cb = np.clip(pred_cb.astype(np.int32) + residual_cb, 0, 255).astype(np.uint8)
+    else:
+        cb = pred_cb
+    if residual_cr is not None:
+        cr = np.clip(pred_cr.astype(np.int32) + residual_cr, 0, 255).astype(np.uint8)
+    else:
+        cr = pred_cr
 
     logger.debug(f"P_8x16_weighted MB({mb_x},{mb_y})")
 
@@ -1309,12 +1368,43 @@ def reconstruct_p_8x8_weighted(
             for bx in range(bx_start, bx_start + 2):
                 mv_cache.set_mv(mb_x, mb_y, bx, by, mvx[sub_idx], mvy[sub_idx])
 
-    # Chroma reconstruction (use first sub-MB weights)
-    cb, cr = _reconstruct_chroma_weighted(
-        ref_buffer, ref_idx[0], mvx[0], mvy[0],
-        weights_cb[0], offsets_cb[0], weights_cr[0], offsets_cr[0],
-        log2_denom_chroma, residual_cb, residual_cr, mb_x, mb_y
-    )
+    # Chroma reconstruction: per-sub-MB MVs (4 quadrants of 4x4 chroma)
+    from inter.weighted_pred import apply_weighted_prediction_chroma
+
+    pred_cb = np.zeros((8, 8), dtype=np.uint8)
+    pred_cr = np.zeros((8, 8), dtype=np.uint8)
+    chroma_offsets = [(0, 0), (4, 0), (0, 4), (4, 4)]
+    for sub_idx in range(4):
+        coff_x, coff_y = chroma_offsets[sub_idx]
+        ref_frame = ref_buffer.get_frame(ref_idx[sub_idx])
+        cmvx = mvx[sub_idx]
+        cmvy = mvy[sub_idx]
+        cx = mb_x * 8 + coff_x + (cmvx >> 3)
+        cy = mb_y * 8 + coff_y + (cmvy >> 3)
+        fx, fy = cmvx & 7, cmvy & 7
+        part_cb = apply_chroma_prediction(
+            ref_frame.cb, cx, cy, fx, fy, 4, 4
+        )
+        part_cr = apply_chroma_prediction(
+            ref_frame.cr, cx, cy, fx, fy, 4, 4
+        )
+        part_cb, part_cr = apply_weighted_prediction_chroma(
+            part_cb, part_cr,
+            weights_cb[sub_idx], offsets_cb[sub_idx],
+            weights_cr[sub_idx], offsets_cr[sub_idx],
+            log2_denom_chroma,
+        )
+        pred_cb[coff_y:coff_y+4, coff_x:coff_x+4] = part_cb
+        pred_cr[coff_y:coff_y+4, coff_x:coff_x+4] = part_cr
+
+    if residual_cb is not None:
+        cb = np.clip(pred_cb.astype(np.int32) + residual_cb, 0, 255).astype(np.uint8)
+    else:
+        cb = pred_cb
+    if residual_cr is not None:
+        cr = np.clip(pred_cr.astype(np.int32) + residual_cr, 0, 255).astype(np.uint8)
+    else:
+        cr = pred_cr
 
     logger.debug(f"P_8x8_weighted MB({mb_x},{mb_y})")
 
