@@ -3162,6 +3162,17 @@ class H264Decoder:
         self.state.frame_cb[cy:cy + 8, cx:cx + 8] = cb
         self.state.frame_cr[cy:cy + 8, cx:cx + 8] = cr
 
+        # Store deblocking metadata for B_Skip
+        mb_width = self.state.frame_luma.shape[1] // 16
+        mb_idx_skip = mb_y * mb_width + mb_x
+        self.state.nz_counts[mb_idx_skip] = 0
+        if self.state.mb_types is not None:
+            self.state.mb_types[mb_idx_skip] = 99  # Non-intra sentinel
+        if self.state.mb_qps is not None:
+            self.state.mb_qps[mb_idx_skip] = self.state.current_mb_qp
+        if self.state.mb_coeffs is not None:
+            self.state.mb_coeffs[mb_idx_skip] = 0
+
         logger.debug(f"B_Skip MB ({mb_x}, {mb_y})")
 
     def _calculate_poc(
