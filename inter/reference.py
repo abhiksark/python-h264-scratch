@@ -34,28 +34,58 @@ class ReferenceFrame:
     frame_num: int
     poc: int = 0
     mv_field: Optional[np.ndarray] = None
+    ref_idx_field: Optional[np.ndarray] = None
 
-    def store_mv(self, mb_x: int, mb_y: int, mvx: int, mvy: int) -> None:
-        """Store MV for a macroblock (for temporal direct mode).
+    def _ensure_fields(self) -> None:
+        """Lazily allocate MV and ref_idx fields at 8x8 block granularity."""
+        if self.mv_field is None:
+            # Store per-8x8-block: 2 entries per MB in each dimension
+            blk_h = (self.luma.shape[0] // 16) * 2
+            blk_w = (self.luma.shape[1] // 16) * 2
+            self.mv_field = np.zeros((blk_h, blk_w, 2), dtype=np.int16)
+            self.ref_idx_field = np.full(
+                (blk_h, blk_w), -1, dtype=np.int8
+            )
+
+    def store_mv(
+        self, mb_x: int, mb_y: int, mvx: int, mvy: int, ref_idx: int = 0,
+        sub_idx: int = -1,
+    ) -> None:
+        """Store MV and ref_idx for a macroblock or sub-block.
 
         Args:
             mb_x, mb_y: Macroblock position
             mvx, mvy: Motion vector
+            ref_idx: L0 reference index
+            sub_idx: Sub-block index (0-3). If -1, store for all 4 sub-blocks.
         """
-        if self.mv_field is None:
-            # Lazily allocate MV field based on frame size
-            mb_height = self.luma.shape[0] // 16
-            mb_width = self.luma.shape[1] // 16
-            self.mv_field = np.zeros((mb_height, mb_width, 2), dtype=np.int16)
+        self._ensure_fields()
 
-        if 0 <= mb_y < self.mv_field.shape[0] and 0 <= mb_x < self.mv_field.shape[1]:
-            self.mv_field[mb_y, mb_x] = [mvx, mvy]
+        if sub_idx == -1:
+            # Store same value for all 4 sub-blocks of the MB
+            for si in range(4):
+                by = mb_y * 2 + si // 2
+                bx = mb_x * 2 + si % 2
+                if (0 <= by < self.mv_field.shape[0] and
+                        0 <= bx < self.mv_field.shape[1]):
+                    self.mv_field[by, bx] = [mvx, mvy]
+                    self.ref_idx_field[by, bx] = ref_idx
+        else:
+            by = mb_y * 2 + sub_idx // 2
+            bx = mb_x * 2 + sub_idx % 2
+            if (0 <= by < self.mv_field.shape[0] and
+                    0 <= bx < self.mv_field.shape[1]):
+                self.mv_field[by, bx] = [mvx, mvy]
+                self.ref_idx_field[by, bx] = ref_idx
 
-    def get_colocated_mv(self, mb_x: int, mb_y: int) -> tuple:
-        """Get co-located MV for temporal direct mode.
+    def get_colocated_mv(
+        self, mb_x: int, mb_y: int, sub_idx: int = 0,
+    ) -> tuple:
+        """Get co-located MV for direct mode.
 
         Args:
             mb_x, mb_y: Macroblock position
+            sub_idx: Sub-block index (0-3) for 8x8 granularity
 
         Returns:
             Tuple of (mvx, mvy), or (0, 0) if not available
@@ -63,9 +93,35 @@ class ReferenceFrame:
         if self.mv_field is None:
             return (0, 0)
 
-        if 0 <= mb_y < self.mv_field.shape[0] and 0 <= mb_x < self.mv_field.shape[1]:
-            return tuple(self.mv_field[mb_y, mb_x])
+        by = mb_y * 2 + sub_idx // 2
+        bx = mb_x * 2 + sub_idx % 2
+        if 0 <= by < self.mv_field.shape[0] and 0 <= bx < self.mv_field.shape[1]:
+            return int(self.mv_field[by, bx, 0]), int(self.mv_field[by, bx, 1])
         return (0, 0)
+
+    def get_colocated_ref_idx(
+        self, mb_x: int, mb_y: int, sub_idx: int = 0,
+    ) -> int:
+        """Get co-located L0 ref_idx for colZeroFlag check.
+
+        Args:
+            mb_x, mb_y: Macroblock position
+            sub_idx: Sub-block index (0-3) for 8x8 granularity
+
+        Returns:
+            L0 ref_idx, or -1 if not available
+
+        H.264 Spec: Section 8.4.1.2.2 - colZeroFlag requires refIdx check
+        """
+        if self.ref_idx_field is None:
+            return -1
+
+        by = mb_y * 2 + sub_idx // 2
+        bx = mb_x * 2 + sub_idx % 2
+        if (0 <= by < self.ref_idx_field.shape[0] and
+                0 <= bx < self.ref_idx_field.shape[1]):
+            return int(self.ref_idx_field[by, bx])
+        return -1
 
 
 class ReferenceFrameBuffer:
@@ -156,6 +212,61 @@ class ReferenceFrameBuffer:
             if frame.frame_num == frame_num:
                 return frame
         return None
+
+    def build_p_slice_ref_list(
+        self,
+        current_frame_num: int,
+        max_frame_num: int,
+        modification: 'RefPicListModification' = None,
+    ) -> None:
+        """Build L0 reference list for P-slices.
+
+        Default order: descending frame_num (most recent first).
+        Optionally applies ref_pic_list_modification.
+
+        Args:
+            current_frame_num: frame_num of current slice
+            max_frame_num: MaxFrameNum from SPS
+            modification: Parsed ref_pic_list_modification_l0
+
+        H.264 Spec: Section 8.2.4.1, 8.2.4.3.1
+        """
+        # Default: sorted by frame_num descending
+        self._frames.sort(key=lambda f: f.frame_num, reverse=True)
+
+        if modification is None or not modification.modification_of_pic_nums_idc:
+            return
+
+        # Apply reference list reordering (H.264 8.2.4.3.1)
+        pic_num_no_wrap = current_frame_num
+        ref_list = list(self._frames)
+
+        for i, idc in enumerate(modification.modification_of_pic_nums_idc):
+            if idc == 0 or idc == 1:
+                abs_diff = modification.abs_diff_pic_num_minus1[i] + 1
+                if idc == 0:
+                    pic_num_no_wrap -= abs_diff
+                    if pic_num_no_wrap < 0:
+                        pic_num_no_wrap += max_frame_num
+                else:
+                    pic_num_no_wrap += abs_diff
+                    if pic_num_no_wrap >= max_frame_num:
+                        pic_num_no_wrap -= max_frame_num
+
+                # Find frame with this frame_num and move to position i
+                target = None
+                target_idx = -1
+                for j, f in enumerate(ref_list):
+                    if f.frame_num == pic_num_no_wrap:
+                        target = f
+                        target_idx = j
+                        break
+
+                if target is not None and target_idx != i:
+                    ref_list.pop(target_idx)
+                    ref_list.insert(i, target)
+
+        self._frames[:] = ref_list
 
     def clear(self) -> None:
         """Remove all frames from buffer."""

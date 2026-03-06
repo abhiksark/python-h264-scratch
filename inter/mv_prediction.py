@@ -141,9 +141,10 @@ class MVCache:
         block_x: int,
         block_y: int,
         mvx: int,
-        mvy: int
+        mvy: int,
+        ref_idx: int = 0,
     ) -> None:
-        """Set MV for a 4x4 block (inter MB, ref_idx=0).
+        """Set MV for a 4x4 block.
 
         Args:
             mb_x: Macroblock X position
@@ -152,15 +153,18 @@ class MVCache:
             block_y: 4x4 block Y within MB (0-3)
             mvx: Horizontal motion vector component
             mvy: Vertical motion vector component
+            ref_idx: Reference index for this block
         """
         abs_x, abs_y = self._to_4x4_coords(mb_x, mb_y, block_x, block_y)
 
         self._mvs[abs_y, abs_x, 0] = mvx
         self._mvs[abs_y, abs_x, 1] = mvy
         self._available[abs_y, abs_x] = True
-        self._ref_idx[abs_y, abs_x] = 0
+        self._ref_idx[abs_y, abs_x] = ref_idx
 
-    def set_mv_16x16(self, mb_x: int, mb_y: int, mvx: int, mvy: int) -> None:
+    def set_mv_16x16(
+        self, mb_x: int, mb_y: int, mvx: int, mvy: int, ref_idx: int = 0,
+    ) -> None:
         """Set same MV for all 16 4x4 blocks in a macroblock.
 
         Used for P_L0_16x16 and P_Skip macroblocks.
@@ -170,13 +174,15 @@ class MVCache:
             mb_y: Macroblock Y position
             mvx: Horizontal motion vector
             mvy: Vertical motion vector
+            ref_idx: Reference index
         """
         for by in range(4):
             for bx in range(4):
-                self.set_mv(mb_x, mb_y, bx, by, mvx, mvy)
+                self.set_mv(mb_x, mb_y, bx, by, mvx, mvy, ref_idx=ref_idx)
 
     def set_mv_16x8(
-        self, mb_x: int, mb_y: int, partition: int, mvx: int, mvy: int
+        self, mb_x: int, mb_y: int, partition: int, mvx: int, mvy: int,
+        ref_idx: int = 0,
     ) -> None:
         """Set MV for 16x8 partition.
 
@@ -186,14 +192,16 @@ class MVCache:
             partition: 0 for top, 1 for bottom
             mvx: Horizontal motion vector
             mvy: Vertical motion vector
+            ref_idx: Reference index
         """
         start_y = 0 if partition == 0 else 2
         for by in range(start_y, start_y + 2):
             for bx in range(4):
-                self.set_mv(mb_x, mb_y, bx, by, mvx, mvy)
+                self.set_mv(mb_x, mb_y, bx, by, mvx, mvy, ref_idx=ref_idx)
 
     def set_mv_8x16(
-        self, mb_x: int, mb_y: int, partition: int, mvx: int, mvy: int
+        self, mb_x: int, mb_y: int, partition: int, mvx: int, mvy: int,
+        ref_idx: int = 0,
     ) -> None:
         """Set MV for 8x16 partition.
 
@@ -203,14 +211,16 @@ class MVCache:
             partition: 0 for left, 1 for right
             mvx: Horizontal motion vector
             mvy: Vertical motion vector
+            ref_idx: Reference index
         """
         start_x = 0 if partition == 0 else 2
         for by in range(4):
             for bx in range(start_x, start_x + 2):
-                self.set_mv(mb_x, mb_y, bx, by, mvx, mvy)
+                self.set_mv(mb_x, mb_y, bx, by, mvx, mvy, ref_idx=ref_idx)
 
     def set_mv_8x8(
-        self, mb_x: int, mb_y: int, sub_mb_idx: int, mvx: int, mvy: int
+        self, mb_x: int, mb_y: int, sub_mb_idx: int, mvx: int, mvy: int,
+        ref_idx: int = 0,
     ) -> None:
         """Set MV for 8x8 sub-macroblock partition.
 
@@ -220,6 +230,7 @@ class MVCache:
             sub_mb_idx: Sub-macroblock index (0=TL, 1=TR, 2=BL, 3=BR)
             mvx: Horizontal motion vector
             mvy: Vertical motion vector
+            ref_idx: Reference index
         """
         # Sub-MB layout:
         # 0 1
@@ -229,7 +240,57 @@ class MVCache:
 
         for by in range(start_y, start_y + 2):
             for bx in range(start_x, start_x + 2):
-                self.set_mv(mb_x, mb_y, bx, by, mvx, mvy)
+                self.set_mv(mb_x, mb_y, bx, by, mvx, mvy, ref_idx=ref_idx)
+
+    def mark_intra_16x8(
+        self, mb_x: int, mb_y: int, partition: int
+    ) -> None:
+        """Mark 16x8 partition as intra: MV=(0,0), ref_idx=-1, available=True.
+
+        Args:
+            mb_x, mb_y: Macroblock position
+            partition: 0 for top, 1 for bottom
+        """
+        start_y = 0 if partition == 0 else 2
+        for by in range(start_y, start_y + 2):
+            for bx in range(4):
+                abs_x, abs_y = self._to_4x4_coords(mb_x, mb_y, bx, by)
+                self._mvs[abs_y, abs_x] = 0
+                self._available[abs_y, abs_x] = True
+                self._ref_idx[abs_y, abs_x] = -1
+
+    def mark_intra_8x16(
+        self, mb_x: int, mb_y: int, partition: int
+    ) -> None:
+        """Mark 8x16 partition as intra: MV=(0,0), ref_idx=-1, available=True.
+
+        Args:
+            mb_x, mb_y: Macroblock position
+            partition: 0 for left, 1 for right
+        """
+        start_x = 0 if partition == 0 else 2
+        for by in range(4):
+            for bx in range(start_x, start_x + 2):
+                abs_x, abs_y = self._to_4x4_coords(mb_x, mb_y, bx, by)
+                self._mvs[abs_y, abs_x] = 0
+                self._available[abs_y, abs_x] = True
+                self._ref_idx[abs_y, abs_x] = -1
+
+    def mark_intra_8x8(self, mb_x: int, mb_y: int, sub_mb_idx: int) -> None:
+        """Mark 8x8 sub-block as intra: MV=(0,0), ref_idx=-1, available=True.
+
+        Args:
+            mb_x, mb_y: Macroblock position
+            sub_mb_idx: Sub-macroblock index (0=TL, 1=TR, 2=BL, 3=BR)
+        """
+        start_x = (sub_mb_idx % 2) * 2
+        start_y = (sub_mb_idx // 2) * 2
+        for by in range(start_y, start_y + 2):
+            for bx in range(start_x, start_x + 2):
+                abs_x, abs_y = self._to_4x4_coords(mb_x, mb_y, bx, by)
+                self._mvs[abs_y, abs_x] = 0
+                self._available[abs_y, abs_x] = True
+                self._ref_idx[abs_y, abs_x] = -1
 
 
 def _median(a: int, b: int, c: int) -> int:
@@ -343,6 +404,7 @@ def _predict_mv_median(
     block_x: int,
     block_y: int,
     part_width_blocks: int = 1,
+    target_ref: int = 0,
 ) -> Tuple[int, int]:
     """Standard median prediction from A, B, C neighbors.
 
@@ -354,6 +416,7 @@ def _predict_mv_median(
         mb_x, mb_y: Macroblock position
         block_x, block_y: 4x4 block position within MB
         part_width_blocks: Partition width in 4x4 blocks (1=4px, 2=8px, 4=16px)
+        target_ref: Reference index for current partition
 
     Returns:
         Predicted (mvx, mvy)
@@ -378,12 +441,11 @@ def _predict_mv_median(
 
     # H.264 8.4.1.3.1: If exactly one neighbor has matching ref_idx,
     # use that neighbor's MV directly instead of median.
-    curr_ref = 0  # Baseline profile single reference
-    match_count = (refA == curr_ref) + (refB == curr_ref) + (refC == curr_ref)
+    match_count = (refA == target_ref) + (refB == target_ref) + (refC == target_ref)
     if match_count == 1:
-        if refA == curr_ref:
+        if refA == target_ref:
             return mvA
-        if refB == curr_ref:
+        if refB == target_ref:
             return mvB
         return mvC
 
@@ -443,7 +505,9 @@ def predict_mv_skip(cache: MVCache, mb_x: int, mb_y: int) -> Tuple[int, int]:
     return predict_mv_16x16(cache, mb_x, mb_y)
 
 
-def predict_mv_16x16(cache: MVCache, mb_x: int, mb_y: int) -> Tuple[int, int]:
+def predict_mv_16x16(
+    cache: MVCache, mb_x: int, mb_y: int, target_ref: int = 0
+) -> Tuple[int, int]:
     """Predict MV for 16x16 partition (P_L0_16x16).
 
     Uses standard median prediction from neighboring macroblocks.
@@ -456,6 +520,7 @@ def predict_mv_16x16(cache: MVCache, mb_x: int, mb_y: int) -> Tuple[int, int]:
         cache: MV cache with decoded neighbor MVs
         mb_x: Current macroblock X position
         mb_y: Current macroblock Y position
+        target_ref: Target reference index for single-match shortcut
 
     Returns:
         Predicted (mvx, mvy) for the macroblock
@@ -500,7 +565,7 @@ def predict_mv_16x16(cache: MVCache, mb_x: int, mb_y: int) -> Tuple[int, int]:
 
     # H.264 8.4.1.3.1: If exactly one neighbor has matching ref_idx,
     # use that neighbor's MV directly instead of median.
-    curr_ref = 0  # Baseline profile single reference
+    curr_ref = target_ref
     match_count = (refA == curr_ref) + (refB == curr_ref) + (refC == curr_ref)
     if match_count == 1:
         if refA == curr_ref:
@@ -518,19 +583,20 @@ def predict_mv_16x16(cache: MVCache, mb_x: int, mb_y: int) -> Tuple[int, int]:
 
 
 def predict_mv_16x8(
-    cache: MVCache, mb_x: int, mb_y: int, partition: int
+    cache: MVCache, mb_x: int, mb_y: int, partition: int,
+    target_ref: int = 0,
 ) -> Tuple[int, int]:
     """Predict MV for 16x8 partition.
 
     H.264 Spec Section 8.4.1.3.1 directional shortcuts:
       partition 0 (top):    if refIdxB == refIdx, use mvB directly
       partition 1 (bottom): if refIdxA == refIdx, use mvA directly
-    With single reference (Baseline), the shortcut always applies.
 
     Args:
         cache: MV cache
         mb_x, mb_y: Macroblock position
         partition: 0 for top, 1 for bottom
+        target_ref: Reference index for this partition
 
     Returns:
         Predicted (mvx, mvy)
@@ -540,26 +606,27 @@ def predict_mv_16x8(
     if partition == 0:
         # Top partition: B (top neighbor) is preferred when refIdxB matches
         b_avail = cache.is_available(mb_x, mb_y - 1, 0, 3)
-        if b_avail and cache.get_ref_idx(mb_x, mb_y - 1, 0, 3) == 0:
+        if b_avail and cache.get_ref_idx(mb_x, mb_y - 1, 0, 3) == target_ref:
             return cache.get_mv(mb_x, mb_y - 1, 0, 3)
 
         # B unavailable or intra — fall back to standard median
         return _predict_mv_median(cache, mb_x, mb_y, block_x=0, block_y=0,
-                                  part_width_blocks=4)
+                                  part_width_blocks=4, target_ref=target_ref)
     else:
         # Bottom partition: A (left neighbor) is preferred when refIdxA matches
         # A for bottom partition is at block (3, 2) of left MB
         a_avail = cache.is_available(mb_x - 1, mb_y, 3, 2)
-        if a_avail and cache.get_ref_idx(mb_x - 1, mb_y, 3, 2) == 0:
+        if a_avail and cache.get_ref_idx(mb_x - 1, mb_y, 3, 2) == target_ref:
             return cache.get_mv(mb_x - 1, mb_y, 3, 2)
 
         # A unavailable or intra — fall back to standard median
         return _predict_mv_median(cache, mb_x, mb_y, block_x=0, block_y=2,
-                                  part_width_blocks=4)
+                                  part_width_blocks=4, target_ref=target_ref)
 
 
 def predict_mv_8x16(
-    cache: MVCache, mb_x: int, mb_y: int, partition: int
+    cache: MVCache, mb_x: int, mb_y: int, partition: int,
+    target_ref: int = 0,
 ) -> Tuple[int, int]:
     """Predict MV for 8x16 partition.
 
@@ -570,6 +637,7 @@ def predict_mv_8x16(
         cache: MV cache
         mb_x, mb_y: Macroblock position
         partition: 0 for left, 1 for right
+        target_ref: Reference index for this partition
 
     Returns:
         Predicted (mvx, mvy)
@@ -579,34 +647,35 @@ def predict_mv_8x16(
     if partition == 0:
         # Left partition - prefer A when refIdxA matches
         a_avail = cache.is_available(mb_x - 1, mb_y, 3, 0)
-        if a_avail and cache.get_ref_idx(mb_x - 1, mb_y, 3, 0) == 0:
+        if a_avail and cache.get_ref_idx(mb_x - 1, mb_y, 3, 0) == target_ref:
             return cache.get_mv(mb_x - 1, mb_y, 3, 0)
 
         # Fall back to median
         return _predict_mv_median(cache, mb_x, mb_y, block_x=0, block_y=0,
-                                  part_width_blocks=2)
+                                  part_width_blocks=2, target_ref=target_ref)
     else:
         # Right partition - prefer C when refIdxC matches
         # C = upper-right of partition = (mb_x+1, mb_y-1, 0, 3)
         # Per H.264 8.4.1.3.1, "neighboring partition C" includes D
         # substitution when C is unavailable.
         c_avail = cache.is_available(mb_x + 1, mb_y - 1, 0, 3)
-        if c_avail and cache.get_ref_idx(mb_x + 1, mb_y - 1, 0, 3) == 0:
+        if c_avail and cache.get_ref_idx(mb_x + 1, mb_y - 1, 0, 3) == target_ref:
             return cache.get_mv(mb_x + 1, mb_y - 1, 0, 3)
 
         if not c_avail:
             # D = top-left of partition at (block_x-1, block_y-1) = (1, -1)
             d_avail = cache.is_available(mb_x, mb_y - 1, 1, 3)
-            if d_avail and cache.get_ref_idx(mb_x, mb_y - 1, 1, 3) == 0:
+            if d_avail and cache.get_ref_idx(mb_x, mb_y - 1, 1, 3) == target_ref:
                 return cache.get_mv(mb_x, mb_y - 1, 1, 3)
 
         # Fall back to standard median
         return _predict_mv_median(cache, mb_x, mb_y, block_x=2, block_y=0,
-                                  part_width_blocks=2)
+                                  part_width_blocks=2, target_ref=target_ref)
 
 
 def predict_mv_8x8(
-    cache: MVCache, mb_x: int, mb_y: int, sub_mb_idx: int
+    cache: MVCache, mb_x: int, mb_y: int, sub_mb_idx: int,
+    target_ref: int = 0
 ) -> Tuple[int, int]:
     """Predict MV for 8x8 sub-macroblock partition.
 
@@ -722,7 +791,7 @@ def predict_mv_8x8(
 
     # H.264 8.4.1.3.1: If exactly one neighbor has matching ref_idx,
     # use that neighbor's MV directly instead of median.
-    curr_ref = 0  # Baseline profile single reference
+    curr_ref = target_ref
     match_count = (refA == curr_ref) + (refB == curr_ref) + (refC == curr_ref)
     if match_count == 1:
         if refA == curr_ref:

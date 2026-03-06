@@ -555,6 +555,12 @@ class H264Decoder:
                 logger.warning(f"{'P' if is_p_slice else 'B'}-slice but no reference frames available")
                 return None
 
+        # Clear reference buffer on IDR (H.264 8.2.5.1)
+        if nal.nal_unit_type == NALUnitType.SLICE_IDR:
+            if self.state.ref_buffer is not None:
+                self.state.ref_buffer.clear()
+                logger.debug("Cleared reference buffer on IDR")
+
         # Update current parameter sets
         self.state.current_sps = sps
         self.state.current_pps = pps
@@ -710,6 +716,7 @@ class H264Decoder:
                 frame_num=slice_header.frame_num,
                 poc=getattr(slice_header, "pic_order_cnt_lsb", 0),
             )
+            self._store_mvs_in_ref(ref_frame)
             self.state.ref_buffer.add_frame(ref_frame)
             logger.debug(f"Added frame {slice_header.frame_num} to reference buffer")
 
@@ -882,6 +889,13 @@ class H264Decoder:
         total_mbs = mb_width * mb_height
 
         logger.debug(f"Decoding P-slice: {total_mbs} macroblocks")
+
+        # Apply reference list reordering for P-slices (H.264 8.2.4)
+        max_frame_num = getattr(sps, 'max_frame_num', 256)
+        mod_l0 = getattr(slice_header, 'ref_pic_list_modification_l0', None)
+        self.state.ref_buffer.build_p_slice_ref_list(
+            slice_header.frame_num, max_frame_num, mod_l0
+        )
 
         current_qp = slice_qp
         mb_idx = slice_header.first_mb_in_slice
@@ -1147,7 +1161,9 @@ class H264Decoder:
 
             mvd_x = reader.read_se()
             mvd_y = reader.read_se()
-            mvp_x, mvp_y = predict_mv_16x16(self.state.mv_cache, mb_x, mb_y)
+            mvp_x, mvp_y = predict_mv_16x16(
+                self.state.mv_cache, mb_x, mb_y, target_ref=ref_idx,
+            )
             mvx = mvp_x + mvd_x
             mvy = mvp_y + mvd_y
 
@@ -1165,7 +1181,9 @@ class H264Decoder:
 
             # Store MV for this MB so neighbors can predict correctly.
             if self.state.mv_cache is not None:
-                self.state.mv_cache.set_mv_16x16(mb_x, mb_y, mvx, mvy)
+                self.state.mv_cache.set_mv_16x16(
+                    mb_x, mb_y, mvx, mvy, ref_idx=ref_idx,
+                )
 
             if use_weighted:
                 w_luma, o_luma, w_cb, o_cb, w_cr, o_cr = _weights_for_ref(ref_idx)
@@ -1212,7 +1230,10 @@ class H264Decoder:
             for part in range(2):
                 mvd_x = reader.read_se()
                 mvd_y = reader.read_se()
-                mvp_x, mvp_y = predict_mv_16x8(self.state.mv_cache, mb_x, mb_y, part)
+                mvp_x, mvp_y = predict_mv_16x8(
+                    self.state.mv_cache, mb_x, mb_y, part,
+                    target_ref=ref_idx[part],
+                )
                 mvx[part] = mvp_x + mvd_x
                 mvy[part] = mvp_y + mvd_y
                 if trace:
@@ -1234,7 +1255,8 @@ class H264Decoder:
                     for by in range(by_start, by_start + 2):
                         self.state.mv_cache.set_mv(
                             mb_x, mb_y, bx, by,
-                            mvx[part], mvy[part]
+                            mvx[part], mvy[part],
+                            ref_idx=ref_idx[part],
                         )
 
             if use_weighted:
@@ -1292,7 +1314,10 @@ class H264Decoder:
             for part in range(2):
                 mvd_x = reader.read_se()
                 mvd_y = reader.read_se()
-                mvp_x, mvp_y = predict_mv_8x16(self.state.mv_cache, mb_x, mb_y, part)
+                mvp_x, mvp_y = predict_mv_8x16(
+                    self.state.mv_cache, mb_x, mb_y, part,
+                    target_ref=ref_idx[part],
+                )
                 mvx[part] = mvp_x + mvd_x
                 mvy[part] = mvp_y + mvd_y
                 if trace:
@@ -1314,7 +1339,8 @@ class H264Decoder:
                     for bx in range(bx_start, bx_start + 2):
                         self.state.mv_cache.set_mv(
                             mb_x, mb_y, bx, by,
-                            mvx[part], mvy[part]
+                            mvx[part], mvy[part],
+                            ref_idx=ref_idx[part],
                         )
 
             if use_weighted:
@@ -1364,32 +1390,43 @@ class H264Decoder:
 
         elif mb_type.name in ("P_8x8", "P_8x8ref0"):
             sub_mb_types = []
+            sub_mb_num_parts = []
             ref_idx = [0, 0, 0, 0]
             mvx = [0, 0, 0, 0]
             mvy = [0, 0, 0, 0]
             for i in range(4):
-                sub_mb_types.append(reader.read_ue())
+                raw_sub_type = reader.read_ue()
+                sub_mb_types.append(raw_sub_type)
+                # P sub-MB: 0=8x8(1 part), 1=8x4(2), 2=4x8(2), 3=4x4(4)
+                num_parts = [1, 2, 2, 4][min(raw_sub_type, 3)]
+                sub_mb_num_parts.append(num_parts)
             if mb_type.name == "P_8x8" and num_refs > 1:
                 for i in range(4):
                     ref_idx[i] = reader.read_te(num_refs - 1)
             for sub_idx in range(4):
-                mvd_x = reader.read_se()
-                mvd_y = reader.read_se()
-                mvp_x, mvp_y = predict_mv_8x8(self.state.mv_cache, mb_x, mb_y, sub_idx)
-                mvx[sub_idx] = mvp_x + mvd_x
-                mvy[sub_idx] = mvp_y + mvd_y
-                if trace:
-                    logger.warning(
-                        "TRACE P_8x8 sub=%s ref_idx=%s mvd=(%s,%s) mvp=(%s,%s) mv=(%s,%s)",
-                        sub_idx,
-                        ref_idx[sub_idx],
-                        mvd_x,
-                        mvd_y,
-                        mvp_x,
-                        mvp_y,
-                        mvx[sub_idx],
-                        mvy[sub_idx],
-                    )
+                num_sub_parts = sub_mb_num_parts[sub_idx]
+                for j in range(num_sub_parts):
+                    mvd_x = reader.read_se()
+                    mvd_y = reader.read_se()
+                    if j == 0:
+                        mvp_x, mvp_y = predict_mv_8x8(
+                            self.state.mv_cache, mb_x, mb_y, sub_idx,
+                            target_ref=ref_idx[sub_idx],
+                        )
+                        mvx[sub_idx] = mvp_x + mvd_x
+                        mvy[sub_idx] = mvp_y + mvd_y
+                        if trace:
+                            logger.warning(
+                                "TRACE P_8x8 sub=%s ref_idx=%s mvd=(%s,%s) mvp=(%s,%s) mv=(%s,%s)",
+                                sub_idx,
+                                ref_idx[sub_idx],
+                                mvd_x,
+                                mvd_y,
+                                mvp_x,
+                                mvp_y,
+                                mvx[sub_idx],
+                                mvy[sub_idx],
+                            )
                 # Store MV in cache immediately so subsequent sub-MBs
                 # can use it as a neighbor (H.264 8.4.1.3.1)
                 bx_start = (sub_idx % 2) * 2
@@ -1398,7 +1435,8 @@ class H264Decoder:
                     for bx in range(bx_start, bx_start + 2):
                         self.state.mv_cache.set_mv(
                             mb_x, mb_y, bx, by,
-                            mvx[sub_idx], mvy[sub_idx]
+                            mvx[sub_idx], mvy[sub_idx],
+                            ref_idx=ref_idx[sub_idx],
                         )
 
             if use_weighted:
@@ -1518,6 +1556,13 @@ class H264Decoder:
             block = decode_residual_block(reader, nC, max_coeffs=16)
             nz_counts[block_idx] = block.total_coeff
 
+            if trace:
+                logger.warning(
+                    "TRACE block=%d nA=%s nB=%s nC=%d tc=%d coeffs=%s",
+                    block_idx, nA, nB, nC, block.total_coeff,
+                    [block.coefficients[j] for j in range(16) if block.coefficients[j] != 0][:8]
+                )
+
             if block.total_coeff > 0:
                 coeffs_2d = np.zeros((4, 4), dtype=np.int32)
                 for scan_idx in range(16):
@@ -1631,6 +1676,7 @@ class H264Decoder:
             mb_slice_ids=self.state.mb_slice_ids,
             chroma_qp_index_offset=chroma_qp_offset,
             mv_cache=self.state.mv_cache,
+            mv_cache_l1=self.state.mv_cache_l1,
         )
 
     def _get_deblock_params(self, slice_header: 'SliceHeader') -> dict:
@@ -2817,9 +2863,8 @@ class H264Decoder:
                 else:
                     ref_idx_l1.append(0)
 
-            # mvd_l0 for each sub-MB
-            # Must read all sub-partition MVDs for correct bit consumption
-            mvx_l0, mvy_l0 = [0] * 4, [0] * 4
+            # Read all L0 MVDs first (bitstream syntax sends all L0 before L1)
+            mvd_l0_list = [(0, 0)] * 4
             for i in range(4):
                 if not sub_mb_infos[i].is_direct and sub_pred_modes[i] in ("L0", "Bi"):
                     num_sub_parts = sub_mb_infos[i].num_partitions
@@ -2827,14 +2872,10 @@ class H264Decoder:
                         mvd_x = reader.read_se()
                         mvd_y = reader.read_se()
                         if j == 0:
-                            mvp_x, mvp_y = predict_mv_8x8(
-                                self.state.mv_cache, mb_x, mb_y, i
-                            )
-                            mvx_l0[i] = mvp_x + mvd_x
-                            mvy_l0[i] = mvp_y + mvd_y
+                            mvd_l0_list[i] = (mvd_x, mvd_y)
 
-            # mvd_l1 for each sub-MB
-            mvx_l1, mvy_l1 = [0] * 4, [0] * 4
+            # Read all L1 MVDs
+            mvd_l1_list = [(0, 0)] * 4
             for i in range(4):
                 if not sub_mb_infos[i].is_direct and sub_pred_modes[i] in ("L1", "Bi"):
                     num_sub_parts = sub_mb_infos[i].num_partitions
@@ -2842,38 +2883,103 @@ class H264Decoder:
                         mvd_x = reader.read_se()
                         mvd_y = reader.read_se()
                         if j == 0:
-                            mvp_x, mvp_y = predict_mv_8x8(
-                                self.state.mv_cache_l1, mb_x, mb_y, i
-                            )
-                            mvx_l1[i] = mvp_x + mvd_x
-                            mvy_l1[i] = mvp_y + mvd_y
+                            mvd_l1_list[i] = (mvd_x, mvd_y)
 
-            # Derive direct-mode MVs for Direct sub-blocks
-            has_direct = any(s.is_direct for s in sub_mb_infos)
-            if has_direct:
-                from inter.direct_mode import derive_direct_mv
-                d_mvx_l0, d_mvy_l0, d_mvx_l1, d_mvy_l1, d_pred_l0, d_pred_l1 = derive_direct_mv(
-                    self.state.mv_cache, self.state.ref_buffer,
-                    current_poc, mb_x, mb_y, use_spatial,
-                    self.state.mv_cache_l1
-                )
-                for i in range(4):
-                    if sub_mb_infos[i].is_direct:
-                        mvx_l0[i] = d_mvx_l0
-                        mvy_l0[i] = d_mvy_l0
-                        mvx_l1[i] = d_mvx_l1
-                        mvy_l1[i] = d_mvy_l1
+            # Unified MV derivation loop: process sub-blocks sequentially
+            # so each sub-block sees previously decoded neighbors in BOTH
+            # L0 and L1 caches (H.264 8.4.1.2.2, 8.4.1.3.1)
+            from inter.direct_mode import (
+                derive_direct_spatial_sub8x8, derive_direct_temporal,
+            )
+            mvx_l0, mvy_l0 = [0] * 4, [0] * 4
+            mvx_l1, mvy_l1 = [0] * 4, [0] * 4
 
-            # Update MV caches with L0 and L1 MVs
             for i in range(4):
-                self.state.mv_cache.set_mv_8x8(
-                    mb_x, mb_y, i, mvx_l0[i], mvy_l0[i]
-                )
-                if self.state.mv_cache_l1 is not None:
-                    self.state.mv_cache_l1.set_mv_8x8(
-                        mb_x, mb_y, i, mvx_l1[i], mvy_l1[i]
-                    )
+                if sub_mb_infos[i].is_direct:
+                    # Per-sub-block direct MV derivation
+                    if use_spatial:
+                        (d_l0x, d_l0y, d_l1x, d_l1y,
+                         pf_l0, pf_l1,
+                         d_ri_l0, d_ri_l1) = derive_direct_spatial_sub8x8(
+                            self.state.mv_cache, self.state.mv_cache_l1,
+                            mb_x, mb_y, i, self.state.ref_buffer,
+                        )
+                    else:
+                        d_l0x, d_l0y, d_l1x, d_l1y = derive_direct_temporal(
+                            self.state.ref_buffer, current_poc, mb_x, mb_y,
+                        )
+                        pf_l0, pf_l1 = True, True
+                        d_ri_l0, d_ri_l1 = 0, 0
+                    mvx_l0[i], mvy_l0[i] = d_l0x, d_l0y
+                    mvx_l1[i], mvy_l1[i] = d_l1x, d_l1y
+                    ref_idx_l0[i] = max(d_ri_l0, 0)
+                    ref_idx_l1[i] = max(d_ri_l1, 0)
+                    # Update pred mode based on actual direct derivation flags
+                    if pf_l0 and pf_l1:
+                        sub_pred_modes[i] = "Bi"
+                    elif pf_l0:
+                        sub_pred_modes[i] = "L0"
+                    else:
+                        sub_pred_modes[i] = "L1"
+                    # Update MV caches with derived ref_idx
+                    if pf_l0:
+                        self.state.mv_cache.set_mv_8x8(
+                            mb_x, mb_y, i, mvx_l0[i], mvy_l0[i],
+                            ref_idx=ref_idx_l0[i],
+                        )
+                    else:
+                        self.state.mv_cache.mark_intra_8x8(mb_x, mb_y, i)
+                    if self.state.mv_cache_l1 is not None:
+                        if pf_l1:
+                            self.state.mv_cache_l1.set_mv_8x8(
+                                mb_x, mb_y, i, mvx_l1[i], mvy_l1[i],
+                                ref_idx=ref_idx_l1[i],
+                            )
+                        else:
+                            self.state.mv_cache_l1.mark_intra_8x8(
+                                mb_x, mb_y, i
+                            )
+                else:
+                    # L0 MV
+                    if sub_pred_modes[i] in ("L0", "Bi"):
+                        mvp_x, mvp_y = predict_mv_8x8(
+                            self.state.mv_cache, mb_x, mb_y, i,
+                            target_ref=ref_idx_l0[i],
+                        )
+                        mvx_l0[i] = mvp_x + mvd_l0_list[i][0]
+                        mvy_l0[i] = mvp_y + mvd_l0_list[i][1]
+                        self.state.mv_cache.set_mv_8x8(
+                            mb_x, mb_y, i, mvx_l0[i], mvy_l0[i],
+                            ref_idx=ref_idx_l0[i],
+                        )
+                    else:
+                        self.state.mv_cache.mark_intra_8x8(mb_x, mb_y, i)
 
+                    # L1 MV
+                    if sub_pred_modes[i] in ("L1", "Bi"):
+                        mvp_x, mvp_y = predict_mv_8x8(
+                            self.state.mv_cache_l1, mb_x, mb_y, i,
+                            target_ref=ref_idx_l1[i],
+                        )
+                        mvx_l1[i] = mvp_x + mvd_l1_list[i][0]
+                        mvy_l1[i] = mvp_y + mvd_l1_list[i][1]
+                        if self.state.mv_cache_l1 is not None:
+                            self.state.mv_cache_l1.set_mv_8x8(
+                                mb_x, mb_y, i, mvx_l1[i], mvy_l1[i],
+                                ref_idx=ref_idx_l1[i],
+                            )
+                    else:
+                        if self.state.mv_cache_l1 is not None:
+                            self.state.mv_cache_l1.mark_intra_8x8(mb_x, mb_y, i)
+
+            logger.debug(
+                f"B_8x8 MB({mb_x},{mb_y}): "
+                f"sub_types={[s.sub_mb_type for s in sub_mb_infos]} "
+                f"modes={sub_pred_modes} "
+                f"mvL0={list(zip(mvx_l0, mvy_l0))} "
+                f"mvL1={list(zip(mvx_l1, mvy_l1))} "
+                f"refL0={ref_idx_l0} refL1={ref_idx_l1}"
+            )
             luma_pred, cb_pred, cr_pred = reconstruct_b_8x8(
                 ref_buffer=self.state.ref_buffer,
                 mv_cache=self.state.mv_cache,
@@ -2917,6 +3023,8 @@ class H264Decoder:
                 )
                 mvx_l0[0] = mvp_x + mvd_x
                 mvy_l0[0] = mvp_y + mvd_y
+                if hasattr(self, '_trace_b_mvd'):
+                    logger.warning(f"B16x16 L0 MB({mb_x},{mb_y}) poc={current_poc}: mvd=({mvd_x},{mvd_y}) mvp=({mvp_x},{mvp_y}) final=({mvx_l0[0]},{mvy_l0[0]})")
 
             if part_modes[0] in ("L1", "Bi"):
                 mvd_x = reader.read_se()
@@ -2926,6 +3034,8 @@ class H264Decoder:
                 )
                 mvx_l1[0] = mvp_x + mvd_x
                 mvy_l1[0] = mvp_y + mvd_y
+                if hasattr(self, '_trace_b_mvd'):
+                    logger.warning(f"B16x16 L1 MB({mb_x},{mb_y}) poc={current_poc}: mvd=({mvd_x},{mvd_y}) mvp=({mvp_x},{mvp_y}) final=({mvx_l1[0]},{mvy_l1[0]})")
 
             # Store MVs in caches
             if part_modes[0] in ("L0", "Bi"):
@@ -3016,6 +3126,16 @@ class H264Decoder:
                         self.state.mv_cache.set_mv_8x16(
                             mb_x, mb_y, part, mvx_l0[part], mvy_l0[part]
                         )
+                else:
+                    # L1-only: mark L0 as unavailable for this partition
+                    if part_size == (16, 8):
+                        self.state.mv_cache.mark_intra_16x8(
+                            mb_x, mb_y, part
+                        )
+                    else:
+                        self.state.mv_cache.mark_intra_8x16(
+                            mb_x, mb_y, part
+                        )
 
             for part in range(2):
                 if part_modes[part] in ("L1", "Bi"):
@@ -3041,6 +3161,17 @@ class H264Decoder:
                         else:
                             self.state.mv_cache_l1.set_mv_8x16(
                                 mb_x, mb_y, part, mvx_l1[part], mvy_l1[part]
+                            )
+                else:
+                    # L0-only: mark L1 as unavailable for this partition
+                    if self.state.mv_cache_l1 is not None:
+                        if part_size == (16, 8):
+                            self.state.mv_cache_l1.mark_intra_16x8(
+                                mb_x, mb_y, part
+                            )
+                        else:
+                            self.state.mv_cache_l1.mark_intra_8x16(
+                                mb_x, mb_y, part
                             )
 
             if part_size == (16, 8):
@@ -3360,7 +3491,10 @@ class H264Decoder:
         self,
         ref_frame: 'ReferenceFrame',
     ) -> None:
-        """Store MVs in reference frame for temporal direct mode.
+        """Store MVs in reference frame for temporal/spatial direct mode.
+
+        Stores the L0 MV at block (0,0) of each macroblock. Used by the
+        colZeroFlag check in spatial direct mode (H.264 8.4.1.2.2).
 
         Args:
             ref_frame: Reference frame to store MVs in
@@ -3372,11 +3506,18 @@ class H264Decoder:
         if sps is None:
             return
 
+        # Store per-8x8-block MV and ref_idx for co-located lookups.
+        # Map sub-block index to representative 4x4 block position.
+        sub_to_4x4 = [(0, 0), (2, 0), (0, 2), (2, 2)]
         for mb_y in range(sps.frame_height_in_mbs):
             for mb_x in range(sps.pic_width_in_mbs):
-                mv = self.state.mv_cache.get_mv(mb_x, mb_y, 0, 0)
-                if mv != (0, 0):
-                    ref_frame.store_mv(mb_x, mb_y, mv[0], mv[1])
+                for si, (bx, by) in enumerate(sub_to_4x4):
+                    mv = self.state.mv_cache.get_mv(mb_x, mb_y, bx, by)
+                    ri = self.state.mv_cache.get_ref_idx(mb_x, mb_y, bx, by)
+                    ref_frame.store_mv(
+                        mb_x, mb_y, mv[0], mv[1],
+                        ref_idx=ri, sub_idx=si,
+                    )
 
     def _combine_partitions(
         self,

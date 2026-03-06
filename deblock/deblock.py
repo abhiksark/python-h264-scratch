@@ -1183,22 +1183,70 @@ def _get_bs_for_edge(
     mv_q: tuple = None,
     ref_p: int = -1,
     ref_q: int = -1,
+    mv_l1_p: tuple = None,
+    mv_l1_q: tuple = None,
+    ref_l1_p: int = -1,
+    ref_l1_q: int = -1,
 ) -> int:
     """Compute boundary strength for one 4x4 block pair.
 
-    Section 8.7.2.1.
+    H.264 Section 8.7.2.1. For B-frames, both L0 and L1 prediction
+    modes must be compared. If blocks differ in number of prediction
+    directions or reference frames/MVs, bS >= 1.
     """
     if is_intra_p or is_intra_q:
         return 4 if is_mb_edge else 3
     if has_coeff_p or has_coeff_q:
         return 2
-    # bS=1: different ref frames or MV difference >= 4 quarter-pels
-    if ref_p != ref_q:
+
+    # Determine prediction directions for p and q
+    p_has_l0 = ref_p >= 0
+    p_has_l1 = ref_l1_p >= 0
+    q_has_l0 = ref_q >= 0
+    q_has_l1 = ref_l1_q >= 0
+    p_dirs = int(p_has_l0) + int(p_has_l1)
+    q_dirs = int(q_has_l0) + int(q_has_l1)
+
+    # Different number of prediction directions → bS=1
+    if p_dirs != q_dirs:
         return 1
-    if mv_p is not None and mv_q is not None:
-        if abs(mv_p[0] - mv_q[0]) >= 4 or abs(mv_p[1] - mv_q[1]) >= 4:
+
+    def _mv_same(a, b):
+        if a is None or b is None:
+            return True
+        return abs(a[0] - b[0]) < 4 and abs(a[1] - b[1]) < 4
+
+    if p_dirs <= 1 and q_dirs <= 1:
+        # Both unipred (or skip with single ref)
+        if ref_p != ref_q:
             return 1
-    return 0
+        if not _mv_same(mv_p, mv_q):
+            return 1
+        # Also check if one uses L1 and other uses L0
+        if p_has_l0 != q_has_l0:
+            return 1
+        return 0
+
+    # Both bipred: check both direct match and cross match
+    # Direct: L0p==L0q and L1p==L1q
+    direct_match = (
+        ref_p == ref_q
+        and ref_l1_p == ref_l1_q
+        and _mv_same(mv_p, mv_q)
+        and _mv_same(mv_l1_p, mv_l1_q)
+    )
+    if direct_match:
+        return 0
+    # Cross: L0p==L1q and L1p==L0q
+    cross_match = (
+        ref_p == ref_l1_q
+        and ref_l1_p == ref_q
+        and _mv_same(mv_p, mv_l1_q)
+        and _mv_same(mv_l1_p, mv_q)
+    )
+    if cross_match:
+        return 0
+    return 1
 
 
 def deblock_frame_inplace(
@@ -1216,6 +1264,7 @@ def deblock_frame_inplace(
     mb_slice_ids: Optional[np.ndarray] = None,
     chroma_qp_index_offset: int = 0,
     mv_cache=None,
+    mv_cache_l1=None,
 ) -> None:
     """Apply H.264 deblocking filter to entire frame in-place.
 
@@ -1273,12 +1322,19 @@ def deblock_frame_inplace(
         return False
 
     def _get_mv_ref(mb_x, mb_y, block_row, block_col):
-        """Get MV and ref_idx for a 4x4 block. Returns ((mvx, mvy), ref_idx)."""
-        if mv_cache is None:
-            return None, -1
-        mv = mv_cache.get_mv(mb_x, mb_y, block_col, block_row)
-        ref = mv_cache.get_ref_idx(mb_x, mb_y, block_col, block_row)
-        return mv, ref
+        """Get L0 and L1 MV/ref_idx for a 4x4 block.
+
+        Returns ((mvx, mvy), ref_idx, (mvx_l1, mvy_l1), ref_idx_l1).
+        """
+        mv, ref = None, -1
+        mv_l1, ref_l1 = None, -1
+        if mv_cache is not None:
+            mv = mv_cache.get_mv(mb_x, mb_y, block_col, block_row)
+            ref = mv_cache.get_ref_idx(mb_x, mb_y, block_col, block_row)
+        if mv_cache_l1 is not None:
+            mv_l1 = mv_cache_l1.get_mv(mb_x, mb_y, block_col, block_row)
+            ref_l1 = mv_cache_l1.get_ref_idx(mb_x, mb_y, block_col, block_row)
+        return mv, ref, mv_l1, ref_l1
 
     for mb_y in range(mb_height):
         for mb_x in range(mb_width):
@@ -1327,23 +1383,25 @@ def deblock_frame_inplace(
 
                     if is_mb_edge:
                         p_col = 3  # rightmost column of left MB
-                        mv_p, ref_p = _get_mv_ref(mb_x - 1, mb_y, block_row, p_col)
-                        mv_q, ref_q = _get_mv_ref(mb_x, mb_y, block_row, q_col)
+                        mv_p, ref_p, mv_l1_p, ref_l1_p = _get_mv_ref(mb_x - 1, mb_y, block_row, p_col)
+                        mv_q, ref_q, mv_l1_q, ref_l1_q = _get_mv_ref(mb_x, mb_y, block_row, q_col)
                         bs = _get_bs_for_edge(
                             True, intra_p, intra_q,
                             _has_coeff(left_mb_idx, block_row, p_col),
                             _has_coeff(mb_idx, block_row, q_col),
                             mv_p, mv_q, ref_p, ref_q,
+                            mv_l1_p, mv_l1_q, ref_l1_p, ref_l1_q,
                         )
                     else:
                         p_col = edge_i - 1
-                        mv_p, ref_p = _get_mv_ref(mb_x, mb_y, block_row, p_col)
-                        mv_q, ref_q = _get_mv_ref(mb_x, mb_y, block_row, q_col)
+                        mv_p, ref_p, mv_l1_p, ref_l1_p = _get_mv_ref(mb_x, mb_y, block_row, p_col)
+                        mv_q, ref_q, mv_l1_q, ref_l1_q = _get_mv_ref(mb_x, mb_y, block_row, q_col)
                         bs = _get_bs_for_edge(
                             False, intra_p, intra_q,
                             _has_coeff(mb_idx, block_row, p_col),
                             _has_coeff(mb_idx, block_row, q_col),
                             mv_p, mv_q, ref_p, ref_q,
+                            mv_l1_p, mv_l1_q, ref_l1_p, ref_l1_q,
                         )
 
                     if bs == 0:
@@ -1425,23 +1483,25 @@ def deblock_frame_inplace(
 
                     if is_mb_edge:
                         p_row = 3
-                        mv_p, ref_p = _get_mv_ref(mb_x, mb_y - 1, p_row, block_col)
-                        mv_q, ref_q = _get_mv_ref(mb_x, mb_y, q_row, block_col)
+                        mv_p, ref_p, mv_l1_p, ref_l1_p = _get_mv_ref(mb_x, mb_y - 1, p_row, block_col)
+                        mv_q, ref_q, mv_l1_q, ref_l1_q = _get_mv_ref(mb_x, mb_y, q_row, block_col)
                         bs = _get_bs_for_edge(
                             True, intra_p, intra_q,
                             _has_coeff(top_mb_idx, p_row, block_col),
                             _has_coeff(mb_idx, q_row, block_col),
                             mv_p, mv_q, ref_p, ref_q,
+                            mv_l1_p, mv_l1_q, ref_l1_p, ref_l1_q,
                         )
                     else:
                         p_row = edge_i - 1
-                        mv_p, ref_p = _get_mv_ref(mb_x, mb_y, p_row, block_col)
-                        mv_q, ref_q = _get_mv_ref(mb_x, mb_y, q_row, block_col)
+                        mv_p, ref_p, mv_l1_p, ref_l1_p = _get_mv_ref(mb_x, mb_y, p_row, block_col)
+                        mv_q, ref_q, mv_l1_q, ref_l1_q = _get_mv_ref(mb_x, mb_y, q_row, block_col)
                         bs = _get_bs_for_edge(
                             False, intra_p, intra_q,
                             _has_coeff(mb_idx, p_row, block_col),
                             _has_coeff(mb_idx, q_row, block_col),
                             mv_p, mv_q, ref_p, ref_q,
+                            mv_l1_p, mv_l1_q, ref_l1_p, ref_l1_q,
                         )
 
                     if bs == 0:
@@ -1527,20 +1587,22 @@ def deblock_frame_inplace(
 
                         if is_mb_edge:
                             luma_p_col = 3
-                            mv_p, ref_p = _get_mv_ref(mb_x - 1, mb_y, luma_row, luma_p_col)
-                            mv_q, ref_q = _get_mv_ref(mb_x, mb_y, luma_row, luma_q_col)
+                            mv_p, ref_p, mv_l1_p, ref_l1_p = _get_mv_ref(mb_x - 1, mb_y, luma_row, luma_p_col)
+                            mv_q, ref_q, mv_l1_q, ref_l1_q = _get_mv_ref(mb_x, mb_y, luma_row, luma_q_col)
                             bs = _get_bs_for_edge(True, intra_p_c, intra_q,
                                 _has_coeff(left_mb_idx, luma_row, luma_p_col),
                                 _has_coeff(mb_idx, luma_row, luma_q_col),
-                                mv_p, mv_q, ref_p, ref_q)
+                                mv_p, mv_q, ref_p, ref_q,
+                                mv_l1_p, mv_l1_q, ref_l1_p, ref_l1_q)
                         else:
                             luma_p_col = edge_i * 2 - 1
-                            mv_p, ref_p = _get_mv_ref(mb_x, mb_y, luma_row, luma_p_col)
-                            mv_q, ref_q = _get_mv_ref(mb_x, mb_y, luma_row, luma_q_col)
+                            mv_p, ref_p, mv_l1_p, ref_l1_p = _get_mv_ref(mb_x, mb_y, luma_row, luma_p_col)
+                            mv_q, ref_q, mv_l1_q, ref_l1_q = _get_mv_ref(mb_x, mb_y, luma_row, luma_q_col)
                             bs = _get_bs_for_edge(False, intra_p_c, intra_q,
                                 _has_coeff(mb_idx, luma_row, luma_p_col),
                                 _has_coeff(mb_idx, luma_row, luma_q_col),
-                                mv_p, mv_q, ref_p, ref_q)
+                                mv_p, mv_q, ref_p, ref_q,
+                                mv_l1_p, mv_l1_q, ref_l1_p, ref_l1_q)
 
                         if bs == 0:
                             continue
@@ -1604,20 +1666,22 @@ def deblock_frame_inplace(
 
                         if is_mb_edge:
                             luma_p_row = 3
-                            mv_p, ref_p = _get_mv_ref(mb_x, mb_y - 1, luma_p_row, luma_col)
-                            mv_q, ref_q = _get_mv_ref(mb_x, mb_y, luma_q_row, luma_col)
+                            mv_p, ref_p, mv_l1_p, ref_l1_p = _get_mv_ref(mb_x, mb_y - 1, luma_p_row, luma_col)
+                            mv_q, ref_q, mv_l1_q, ref_l1_q = _get_mv_ref(mb_x, mb_y, luma_q_row, luma_col)
                             bs = _get_bs_for_edge(True, intra_p_c, intra_q,
                                 _has_coeff(top_mb_idx, luma_p_row, luma_col),
                                 _has_coeff(mb_idx, luma_q_row, luma_col),
-                                mv_p, mv_q, ref_p, ref_q)
+                                mv_p, mv_q, ref_p, ref_q,
+                                mv_l1_p, mv_l1_q, ref_l1_p, ref_l1_q)
                         else:
                             luma_p_row = edge_i * 2 - 1
-                            mv_p, ref_p = _get_mv_ref(mb_x, mb_y, luma_p_row, luma_col)
-                            mv_q, ref_q = _get_mv_ref(mb_x, mb_y, luma_q_row, luma_col)
+                            mv_p, ref_p, mv_l1_p, ref_l1_p = _get_mv_ref(mb_x, mb_y, luma_p_row, luma_col)
+                            mv_q, ref_q, mv_l1_q, ref_l1_q = _get_mv_ref(mb_x, mb_y, luma_q_row, luma_col)
                             bs = _get_bs_for_edge(False, intra_p_c, intra_q,
                                 _has_coeff(mb_idx, luma_p_row, luma_col),
                                 _has_coeff(mb_idx, luma_q_row, luma_col),
-                                mv_p, mv_q, ref_p, ref_q)
+                                mv_p, mv_q, ref_p, ref_q,
+                                mv_l1_p, mv_l1_q, ref_l1_p, ref_l1_q)
 
                         if bs == 0:
                             continue

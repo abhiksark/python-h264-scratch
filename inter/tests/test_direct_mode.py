@@ -36,7 +36,8 @@ class TestSpatialDirectMode:
         mv_cache.set_mv(0, 0, 3, 3, 4, 8)  # Left neighbor
         mv_cache.set_mv(0, 0, 0, 3, 8, 4)  # Top neighbor
 
-        mvx_l0, mvy_l0, mvx_l1, mvy_l1, pred_l0, pred_l1 = derive_direct_spatial(
+        (mvx_l0, mvy_l0, mvx_l1, mvy_l1, pred_l0, pred_l1,
+         _ri_l0, _ri_l1) = derive_direct_spatial(
             mv_cache, mb_x=1, mb_y=1
         )
 
@@ -55,7 +56,8 @@ class TestSpatialDirectMode:
         # Set a forward MV in neighbor
         mv_cache.set_mv(0, 0, 3, 3, 8, 8)
 
-        mvx_l0, mvy_l0, mvx_l1, mvy_l1, pred_l0, pred_l1 = derive_direct_spatial(
+        (mvx_l0, mvy_l0, mvx_l1, mvy_l1, pred_l0, pred_l1,
+         _ri_l0, _ri_l1) = derive_direct_spatial(
             mv_cache, mb_x=1, mb_y=1
         )
 
@@ -70,7 +72,8 @@ class TestSpatialDirectMode:
         mv_cache = MVCache(width_in_mbs=2, height_in_mbs=2)
 
         # No neighbors set - first MB
-        mvx_l0, mvy_l0, mvx_l1, mvy_l1, pred_l0, pred_l1 = derive_direct_spatial(
+        (mvx_l0, mvy_l0, mvx_l1, mvy_l1, pred_l0, pred_l1,
+         _ri_l0, _ri_l1) = derive_direct_spatial(
             mv_cache, mb_x=0, mb_y=0
         )
 
@@ -104,8 +107,11 @@ class TestTemporalDirectMode:
             poc=4,
         )
         # L1 frame has MV pointing to its reference (poc=0)
-        l1_frame.mv_field = np.zeros((2, 2, 2), dtype=np.int16)
-        l1_frame.mv_field[0, 0] = [8, 4]  # MB(0,0) MV
+        # Per-8x8-block storage: 4x4 grid for 2x2 MB frame
+        l1_frame.mv_field = np.zeros((4, 4, 2), dtype=np.int16)
+        l1_frame.ref_idx_field = np.zeros((4, 4), dtype=np.int8)
+        # MB(0,0) sub 0 = block (0,0)
+        l1_frame.mv_field[0, 0] = [8, 4]
 
         buffer.add_frame(l1_frame)
 
@@ -136,7 +142,8 @@ class TestTemporalDirectMode:
             frame_num=1,
             poc=4,
         )
-        l1_frame.mv_field = np.zeros((2, 2, 2), dtype=np.int16)  # All zero MVs
+        l1_frame.mv_field = np.zeros((4, 4, 2), dtype=np.int16)  # All zero MVs
+        l1_frame.ref_idx_field = np.zeros((4, 4), dtype=np.int8)
 
         buffer.add_frame(l1_frame)
 
@@ -192,7 +199,7 @@ class TestBSkipMV:
         mv_cache = MVCache(width_in_mbs=2, height_in_mbs=2)
         mv_cache.set_mv(0, 0, 3, 3, 4, 4)
 
-        mvx_l0, mvy_l0, mvx_l1, mvy_l1, pred_l0, pred_l1 = derive_b_skip_mv(
+        result = derive_b_skip_mv(
             mv_cache=mv_cache,
             ref_buffer=None,
             current_poc=2,
@@ -200,5 +207,6 @@ class TestBSkipMV:
             mb_y=1,
             use_spatial=True,
         )
+        mvx_l0 = result[0]
 
         assert isinstance(mvx_l0, int)

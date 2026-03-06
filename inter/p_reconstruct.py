@@ -354,18 +354,11 @@ def reconstruct_p_16x8(
     )
     luma[8:16, :] = part1
 
-    # Update MV cache: top partition covers rows 0-1, bottom covers rows 2-3
-    for bx in range(4):
-        for by in range(2):
-            mv_cache.set_mv(mb_x, mb_y, bx, by, mvx[0], mvy[0])
-        for by in range(2, 4):
-            mv_cache.set_mv(mb_x, mb_y, bx, by, mvx[1], mvy[1])
-
     # Chroma reconstruction: per-partition MVs (top 4 rows / bottom 4 rows)
-    ref_frame = ref_buffer.get_frame(ref_idx[0])
     pred_cb = np.zeros((8, 8), dtype=np.uint8)
     pred_cr = np.zeros((8, 8), dtype=np.uint8)
     for part in range(2):
+        ref_frame = ref_buffer.get_frame(ref_idx[part])
         cmvx = mvx[part]
         cmvy = mvy[part]
         cx = mb_x * 8 + (cmvx >> 3)
@@ -451,13 +444,6 @@ def reconstruct_p_8x16(
         residual_luma=residual_luma[1] if residual_luma else None,
     )
     luma[:, 8:16] = part1
-
-    # Update MV cache: left partition covers cols 0-1, right covers cols 2-3
-    for by in range(4):
-        for bx in range(2):
-            mv_cache.set_mv(mb_x, mb_y, bx, by, mvx[0], mvy[0])
-        for bx in range(2, 4):
-            mv_cache.set_mv(mb_x, mb_y, bx, by, mvx[1], mvy[1])
 
     # Chroma reconstruction: per-partition MVs (left 4 cols / right 4 cols)
     pred_cb = np.zeros((8, 8), dtype=np.uint8)
@@ -547,20 +533,13 @@ def reconstruct_p_8x8(
         )
         luma[part_y:part_y+8, part_x:part_x+8] = part
 
-        # Update MV cache for this 8x8 sub-MB (covers 2x2 4x4 blocks)
-        bx_start = part_x // 4
-        by_start = part_y // 4
-        for by in range(by_start, by_start + 2):
-            for bx in range(bx_start, bx_start + 2):
-                mv_cache.set_mv(mb_x, mb_y, bx, by, mvx[sub_idx], mvy[sub_idx])
-
     # Chroma reconstruction: per-sub-MB MVs (each sub-MB → 4x4 chroma quadrant)
-    ref_frame = ref_buffer.get_frame(ref_idx[0])
     pred_cb = np.zeros((8, 8), dtype=np.uint8)
     pred_cr = np.zeros((8, 8), dtype=np.uint8)
     # Sub-MB chroma offsets: (cx_off, cy_off) within 8x8 chroma
     chroma_offsets = [(0, 0), (4, 0), (0, 4), (4, 4)]
     for sub_idx in range(4):
+        ref_frame = ref_buffer.get_frame(ref_idx[sub_idx])
         cx_off, cy_off = chroma_offsets[sub_idx]
         cmvx = mvx[sub_idx]
         cmvy = mvy[sub_idx]
@@ -1102,13 +1081,6 @@ def reconstruct_p_16x8_weighted(
 
         luma[part_y:part_y + 8, :] = weighted
 
-    # Update MV cache
-    for bx in range(4):
-        for by in range(2):
-            mv_cache.set_mv(mb_x, mb_y, bx, by, mvx[0], mvy[0])
-        for by in range(2, 4):
-            mv_cache.set_mv(mb_x, mb_y, bx, by, mvx[1], mvy[1])
-
     # Chroma reconstruction: per-partition MVs (top 4 rows / bottom 4 rows)
     from inter.weighted_pred import apply_weighted_prediction_chroma
 
@@ -1228,13 +1200,6 @@ def reconstruct_p_8x16_weighted(
             ).astype(np.uint8)
 
         luma[:, part_x:part_x + 8] = weighted
-
-    # Update MV cache
-    for by in range(4):
-        for bx in range(2):
-            mv_cache.set_mv(mb_x, mb_y, bx, by, mvx[0], mvy[0])
-        for bx in range(2, 4):
-            mv_cache.set_mv(mb_x, mb_y, bx, by, mvx[1], mvy[1])
 
     # Chroma reconstruction: per-partition MVs (left 4 cols / right 4 cols)
     from inter.weighted_pred import apply_weighted_prediction_chroma
@@ -1360,13 +1325,6 @@ def reconstruct_p_8x8_weighted(
             ).astype(np.uint8)
 
         luma[part_y:part_y + 8, part_x:part_x + 8] = weighted
-
-        # Update MV cache for this 8x8 sub-MB
-        bx_start = part_x // 4
-        by_start = part_y // 4
-        for by in range(by_start, by_start + 2):
-            for bx in range(bx_start, bx_start + 2):
-                mv_cache.set_mv(mb_x, mb_y, bx, by, mvx[sub_idx], mvy[sub_idx])
 
     # Chroma reconstruction: per-sub-MB MVs (4 quadrants of 4x4 chroma)
     from inter.weighted_pred import apply_weighted_prediction_chroma

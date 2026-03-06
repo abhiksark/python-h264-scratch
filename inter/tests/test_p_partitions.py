@@ -100,9 +100,9 @@ class TestP16x8Reconstruction:
         np.testing.assert_array_equal(luma[0:8, :], 120)  # 100 + 20
         np.testing.assert_array_equal(luma[8:16, :], 80)  # 100 - 20
 
-    def test_16x8_updates_mv_cache(self, ref_buffer, mv_cache):
-        """MV cache updated for both partitions."""
-        reconstruct_p_16x8(
+    def test_16x8_returns_valid_blocks(self, ref_buffer, mv_cache):
+        """Reconstruction returns valid luma/cb/cr blocks."""
+        luma, cb, cr = reconstruct_p_16x8(
             ref_buffer=ref_buffer,
             mv_cache=mv_cache,
             ref_idx=[0, 0],
@@ -115,12 +115,9 @@ class TestP16x8Reconstruction:
             mb_y=0,
         )
 
-        # Top partition blocks (rows 0-1) should have MV (10, 5)
-        assert mv_cache.get_mv(0, 0, 0, 0) == (10, 5)
-        assert mv_cache.get_mv(0, 0, 0, 1) == (10, 5)
-        # Bottom partition blocks (rows 2-3) should have MV (20, 15)
-        assert mv_cache.get_mv(0, 0, 0, 2) == (20, 15)
-        assert mv_cache.get_mv(0, 0, 0, 3) == (20, 15)
+        assert luma.shape == (16, 16)
+        assert cb.shape == (8, 8)
+        assert cr.shape == (8, 8)
 
 
 class TestP8x16Reconstruction:
@@ -207,9 +204,9 @@ class TestP8x16Reconstruction:
         np.testing.assert_array_equal(luma[:, 0:8], 130)   # 100 + 30
         np.testing.assert_array_equal(luma[:, 8:16], 70)   # 100 - 30
 
-    def test_8x16_updates_mv_cache(self, ref_buffer, mv_cache):
-        """MV cache updated for both partitions."""
-        reconstruct_p_8x16(
+    def test_8x16_returns_valid_blocks(self, ref_buffer, mv_cache):
+        """Reconstruction returns valid luma/cb/cr blocks."""
+        luma, cb, cr = reconstruct_p_8x16(
             ref_buffer=ref_buffer,
             mv_cache=mv_cache,
             ref_idx=[0, 0],
@@ -222,12 +219,9 @@ class TestP8x16Reconstruction:
             mb_y=0,
         )
 
-        # Left partition blocks (cols 0-1) should have MV (10, 5)
-        assert mv_cache.get_mv(0, 0, 0, 0) == (10, 5)
-        assert mv_cache.get_mv(0, 0, 1, 0) == (10, 5)
-        # Right partition blocks (cols 2-3) should have MV (20, 15)
-        assert mv_cache.get_mv(0, 0, 2, 0) == (20, 15)
-        assert mv_cache.get_mv(0, 0, 3, 0) == (20, 15)
+        assert luma.shape == (16, 16)
+        assert cb.shape == (8, 8)
+        assert cr.shape == (8, 8)
 
 
 class TestP8x8Reconstruction:
@@ -325,9 +319,9 @@ class TestP8x8Reconstruction:
         np.testing.assert_array_equal(luma[8:16, 0:8], 80)    # 50 + 30
         np.testing.assert_array_equal(luma[8:16, 8:16], 90)   # 50 + 40
 
-    def test_8x8_updates_mv_cache(self, ref_buffer, mv_cache):
-        """MV cache updated for all four sub-MBs."""
-        reconstruct_p_8x8(
+    def test_8x8_returns_valid_blocks(self, ref_buffer, mv_cache):
+        """Reconstruction returns valid luma/cb/cr blocks."""
+        luma, cb, cr = reconstruct_p_8x8(
             ref_buffer=ref_buffer,
             mv_cache=mv_cache,
             ref_idx=[0, 0, 0, 0],
@@ -341,18 +335,9 @@ class TestP8x8Reconstruction:
             mb_y=0,
         )
 
-        # Sub-MB 0 (TL): blocks (0,0), (1,0), (0,1), (1,1)
-        assert mv_cache.get_mv(0, 0, 0, 0) == (10, 1)
-        assert mv_cache.get_mv(0, 0, 1, 1) == (10, 1)
-
-        # Sub-MB 1 (TR): blocks (2,0), (3,0), (2,1), (3,1)
-        assert mv_cache.get_mv(0, 0, 2, 0) == (20, 2)
-
-        # Sub-MB 2 (BL): blocks (0,2), (1,2), (0,3), (1,3)
-        assert mv_cache.get_mv(0, 0, 0, 2) == (30, 3)
-
-        # Sub-MB 3 (BR): blocks (2,2), (3,2), (2,3), (3,3)
-        assert mv_cache.get_mv(0, 0, 2, 2) == (40, 4)
+        assert luma.shape == (16, 16)
+        assert cb.shape == (8, 8)
+        assert cr.shape == (8, 8)
 
     def test_8x8_different_ref_idx(self, mv_cache):
         """P_8x8 with different reference frames."""
