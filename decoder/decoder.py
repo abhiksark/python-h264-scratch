@@ -2399,17 +2399,39 @@ class H264Decoder:
         pps: 'PPS',
         slice_type: int,
     ) -> None:
-        """Reconstruct an intra macroblock decoded with CABAC.
+        """Reconstruct an intra macroblock from CABAC-parsed syntax.
+
+        Uses pre-parsed coefficients from decode_macroblock_layer_cabac and
+        feeds them into the shared reconstruction pipeline (same as CAVLC).
+
+        H.264 Spec Reference: Section 7.3.5, 8.3, 8.5
 
         Args:
-            cabac: CABAC decoder
-            contexts: Context models
-            mb_data: Decoded MB syntax
+            cabac: CABAC decoder (not used - syntax already parsed)
+            contexts: Context models (not used - syntax already parsed)
+            mb_data: Decoded MB syntax from decode_macroblock_layer_cabac
             mb_x, mb_y: Macroblock position
-            qp: Current QP
+            qp: Current QP (before mb_qp_delta)
             sps, pps: Parameter sets
-            slice_type: Slice type
+            slice_type: Slice type (0=P, 1=B, 2=I)
         """
+        from reconstruct.macroblock import (
+            decode_i16x16_mb_type,
+            reconstruct_i16x16_from_coeffs,
+            process_chroma_dc_coeffs,
+            reconstruct_chroma_plane,
+            _get_4x4_block_position,
+            _get_i4x4_neighbors,
+            BLOCK_SCAN_ORDER,
+            BLOCK_IDX_FROM_POS,
+            _find_block_at_position,
+        )
+        from entropy.cavlc import CAVLCBlock
+        from intra.intra_4x4 import predict_intra_4x4
+        from dequant.dequant import get_chroma_qp
+
+        mb_width = sps.pic_width_in_mbs
+        mb_idx = mb_y * mb_width + mb_x
         ly, lx = mb_y * 16, mb_x * 16
         cy, cx = mb_y * 8, mb_x * 8
 
@@ -2420,313 +2442,357 @@ class H264Decoder:
         elif slice_type == 1:  # B-slice
             mb_type = mb_type - 23
 
-        # Determine prediction type
-        if mb_type == 0:
-            # I_4x4
-            self._reconstruct_i4x4_cabac(
-                cabac, contexts, mb_data, mb_x, mb_y, qp, sps
+        # Apply QP delta
+        mb_qp_delta = mb_data.get('mb_qp_delta', 0)
+        current_qp = (qp + mb_qp_delta + 52) % 52
+
+        # Chroma QP
+        chroma_qp_offset = getattr(pps, 'chroma_qp_index_offset', 0)
+        qpi = max(0, min(51, current_qp + chroma_qp_offset))
+        qp_chroma = get_chroma_qp(qpi)
+
+        # Get residual from pre-parsed data
+        residual = mb_data.get('residual', {})
+        mb_pred = mb_data.get('mb_pred', {})
+        chroma_pred_mode = mb_pred.get('intra_chroma_pred_mode', 0)
+
+        # Initialize nz_counts for this MB
+        nz_counts = np.zeros(24, dtype=np.int32)
+
+        # Handle I_PCM
+        if mb_type == 25:
+            i_pcm = mb_data.get('i_pcm', {})
+            luma_samples = i_pcm.get('luma_samples', [128] * 256)
+            cb_samples = i_pcm.get('cb_samples', [128] * 64)
+            cr_samples = i_pcm.get('cr_samples', [128] * 64)
+            self.state.frame_luma[ly:ly+16, lx:lx+16] = np.array(
+                luma_samples, dtype=np.uint8
+            ).reshape(16, 16)
+            self.state.frame_cb[cy:cy+8, cx:cx+8] = np.array(
+                cb_samples, dtype=np.uint8
+            ).reshape(8, 8)
+            self.state.frame_cr[cy:cy+8, cx:cx+8] = np.array(
+                cr_samples, dtype=np.uint8
+            ).reshape(8, 8)
+            # I_PCM: all nz_counts = 16 (forces nC = 16 for neighbors)
+            nz_counts[:] = 16
+            self.state.nz_counts[mb_idx] = nz_counts
+            if self.state.mb_qps is not None:
+                self.state.mb_qps[mb_idx] = current_qp
+            if self.state.mb_coeffs is not None:
+                self.state.mb_coeffs[mb_idx, :16] = True
+            return
+
+        # Get neighbor pixels for prediction
+        neighbors_top_luma = (
+            self.state.frame_luma[ly - 1, lx:lx + 16] if mb_y > 0 else None
+        )
+        neighbors_left_luma = (
+            self.state.frame_luma[ly:ly + 16, lx - 1] if mb_x > 0 else None
+        )
+        neighbor_tl_luma = (
+            self.state.frame_luma[ly - 1, lx - 1]
+            if mb_y > 0 and mb_x > 0 else None
+        )
+
+        if 1 <= mb_type <= 24:
+            # --- I_16x16 ---
+            pred_mode, cbp_luma, cbp_chroma = decode_i16x16_mb_type(mb_type)
+
+            # Get DC and AC coefficients from pre-parsed residual
+            dc_coeffs_raw = residual.get('luma_dc')
+            if dc_coeffs_raw is None:
+                dc_coeffs_raw = np.zeros(16, dtype=np.int32)
+            else:
+                dc_coeffs_raw = np.asarray(dc_coeffs_raw, dtype=np.int32)
+
+            ac_list = []
+            for i in range(16):
+                ac_raw = residual.get('luma_ac', [None] * 16)[i]
+                if ac_raw is not None:
+                    ac_list.append(np.asarray(ac_raw, dtype=np.int32))
+                else:
+                    ac_list.append(None)
+
+            # Reconstruct luma using shared pipeline
+            luma_block = reconstruct_i16x16_from_coeffs(
+                pred_mode, cbp_luma, current_qp,
+                dc_coeffs_raw, ac_list,
+                neighbors_top_luma, neighbors_left_luma, neighbor_tl_luma,
             )
-        elif 1 <= mb_type <= 24:
-            # I_16x16
-            self._reconstruct_i16x16_cabac(
-                cabac, contexts, mb_data, mb_x, mb_y, qp, sps, mb_type
-            )
+
+            # Write luma to frame
+            self.state.frame_luma[ly:ly+16, lx:lx+16] = luma_block
+
+            # Update nz_counts for luma AC blocks
+            for i in range(16):
+                if ac_list[i] is not None:
+                    nz_counts[i] = int(np.count_nonzero(ac_list[i]))
+
+            # Store intra_modes as DC default (I_16x16 is not I_4x4)
+            if self.state.intra_modes is not None:
+                self.state.intra_modes[mb_idx, :] = 2  # DC default
+
+        elif mb_type == 0:
+            # --- I_4x4 ---
+            cbp = mb_data.get('cbp', 0)
+            cbp_luma = cbp & 0x0F
+            cbp_chroma = (cbp >> 4) & 0x03
+
+            # Derive actual prediction modes from CABAC-parsed flags
+            # mb_pred['intra_pred_modes'] has -1 for "use predicted" or
+            # rem_intra4x4_pred_mode value
+            raw_modes = mb_pred.get('intra_pred_modes', [])
+            actual_modes = []
+            decoded_modes = {}
+
+            for block_idx in range(16):
+                row, col = BLOCK_SCAN_ORDER[block_idx]
+
+                # Find left neighbor mode (H.264 Section 8.3.1.1)
+                if col > 0:
+                    left_idx = _find_block_at_position(row, col - 4)
+                    mode_a = decoded_modes.get(left_idx, -1)
+                elif mb_x > 0 and self.state.intra_modes is not None:
+                    left_mb_idx = mb_y * mb_width + (mb_x - 1)
+                    left_block_idx = BLOCK_IDX_FROM_POS.get((row // 4, 3))
+                    if left_block_idx is not None:
+                        mode_a = int(
+                            self.state.intra_modes[left_mb_idx, left_block_idx]
+                        )
+                    else:
+                        mode_a = -1
+                else:
+                    mode_a = -1
+
+                # Find top neighbor mode
+                if row > 0:
+                    top_idx = _find_block_at_position(row - 4, col)
+                    mode_b = decoded_modes.get(top_idx, -1)
+                elif mb_y > 0 and self.state.intra_modes is not None:
+                    top_mb_idx = (mb_y - 1) * mb_width + mb_x
+                    top_block_idx = BLOCK_IDX_FROM_POS.get((3, col // 4))
+                    if top_block_idx is not None:
+                        mode_b = int(
+                            self.state.intra_modes[top_mb_idx, top_block_idx]
+                        )
+                    else:
+                        mode_b = -1
+                else:
+                    mode_b = -1
+
+                # MPM derivation
+                if mode_a < 0 or mode_b < 0:
+                    predicted_mode = 2  # DC
+                else:
+                    predicted_mode = min(mode_a, mode_b)
+
+                # Apply CABAC-parsed flag/rem
+                cabac_mode = raw_modes[block_idx] if block_idx < len(raw_modes) else 0
+                if cabac_mode == -1:
+                    # prev_intra4x4_pred_mode_flag == 1 -> use MPM
+                    mode = predicted_mode
+                else:
+                    # prev_intra4x4_pred_mode_flag == 0 -> rem value
+                    rem = cabac_mode
+                    if rem < predicted_mode:
+                        mode = rem
+                    else:
+                        mode = rem + 1
+
+                actual_modes.append(mode)
+                decoded_modes[block_idx] = mode
+
+            # Reconstruct each 4x4 block in scan order
+            mb_luma = np.zeros((16, 16), dtype=np.uint8)
+
+            for block_idx in range(16):
+                row, col = BLOCK_SCAN_ORDER[block_idx]
+                mode = actual_modes[block_idx]
+
+                # Get neighbors from frame buffer + partially reconstructed MB
+                top, left, top_left, top_right = _get_i4x4_neighbors(
+                    self.state.frame_luma, mb_luma,
+                    mb_x, mb_y, row, col, block_idx
+                )
+
+                # Generate prediction
+                pred = predict_intra_4x4(
+                    mode, top, left, top_left, top_right,
+                    top_available=(top is not None),
+                    left_available=(left is not None),
+                    top_right_available=(top_right is not None),
+                )
+
+                # Get residual from pre-parsed coefficients
+                block_8x8_idx = block_idx // 4
+                luma_4x4_raw = residual.get('luma_4x4', [None] * 16)
+                coeffs_raw = luma_4x4_raw[block_idx]
+
+                if (cbp_luma & (1 << block_8x8_idx)) and coeffs_raw is not None:
+                    coeffs_arr = np.asarray(coeffs_raw, dtype=np.int32)
+                    nz_counts[block_idx] = int(np.count_nonzero(coeffs_arr))
+
+                    # Zigzag to raster, dequant, IDCT
+                    coeffs_2d = np.zeros((4, 4), dtype=np.int32)
+                    for scan_idx in range(16):
+                        raster_pos = ZIGZAG_4x4[scan_idx]
+                        r, c = raster_pos // 4, raster_pos % 4
+                        coeffs_2d[r, c] = coeffs_arr[scan_idx]
+                    dequant = dequant_4x4(coeffs_2d, current_qp)
+                    block_residual = idct_4x4(dequant)
+                else:
+                    block_residual = np.zeros((4, 4), dtype=np.int32)
+                    nz_counts[block_idx] = 0
+
+                # Add prediction + residual, clip, store
+                result = pred.astype(np.int32) + block_residual
+                result = np.clip(result, 0, 255).astype(np.uint8)
+                mb_luma[row:row+4, col:col+4] = result
+
+                # Write to frame immediately for neighbor prediction
+                abs_y = ly + row
+                abs_x = lx + col
+                self.state.frame_luma[abs_y:abs_y+4, abs_x:abs_x+4] = result
+
+            # Store intra modes for cross-MB MPM
+            if self.state.intra_modes is not None:
+                for block_idx in range(16):
+                    self.state.intra_modes[mb_idx, block_idx] = actual_modes[block_idx]
+
         else:
-            # I_PCM or other - fill with mid-gray for now
+            # Unexpected type - fill with mid-gray
+            logger.warning(
+                f"Unexpected intra mb_type={mb_type} at ({mb_x}, {mb_y})"
+            )
             self.state.frame_luma[ly:ly+16, lx:lx+16] = 128
             self.state.frame_cb[cy:cy+8, cx:cx+8] = 128
             self.state.frame_cr[cy:cy+8, cx:cx+8] = 128
+            self.state.nz_counts[mb_idx] = nz_counts
+            if self.state.mb_qps is not None:
+                self.state.mb_qps[mb_idx] = current_qp
+            return
 
-    def _reconstruct_i16x16_cabac(
-        self,
-        cabac: 'CABACDecoder',
-        contexts: list,
-        mb_data: dict,
-        mb_x: int,
-        mb_y: int,
-        qp: int,
-        sps: 'SPS',
-        mb_type: int,
-    ) -> None:
-        """Reconstruct I_16x16 macroblock with CABAC residual.
-
-        Args:
-            cabac: CABAC decoder
-            contexts: Context models
-            mb_data: Decoded MB syntax
-            mb_x, mb_y: Macroblock position
-            qp: Current QP
-            sps: SPS
-            mb_type: I_16x16 sub-type (1-24)
-        """
-        from intra import predict_intra_16x16
-        from transform import idct_4x4, inverse_hadamard_4x4
-        from dequant import dequant_4x4
-
-        ly, lx = mb_y * 16, mb_x * 16
-        cy, cx = mb_y * 8, mb_x * 8
-
-        # Decode I_16x16 mode from mb_type
-        # mb_type 1-24 maps to mode, cbp_luma, cbp_chroma
-        mode = (mb_type - 1) % 4
-        cbp_chroma = ((mb_type - 1) // 4) % 3
-        cbp_luma = 15 if (mb_type - 1) >= 12 else 0
-
-        # Get prediction with neighbor availability
-        top_available = mb_y > 0
-        left_available = mb_x > 0
-        top = self.state.frame_luma[ly-1, lx:lx+16] if top_available else None
-        left = self.state.frame_luma[ly:ly+16, lx-1] if left_available else None
-        top_left = self.state.frame_luma[ly-1, lx-1] if (left_available and top_available) else None
-
-        pred = predict_intra_16x16(
-            mode, top, left, top_left,
-            top_available=top_available,
-            left_available=left_available
+        # --- Chroma reconstruction (shared for I_16x16 and I_4x4) ---
+        neighbors_top_cb = (
+            self.state.frame_cb[cy - 1, cx:cx + 8] if mb_y > 0 else None
+        )
+        neighbors_left_cb = (
+            self.state.frame_cb[cy:cy + 8, cx - 1] if mb_x > 0 else None
+        )
+        neighbor_tl_cb = (
+            self.state.frame_cb[cy - 1, cx - 1]
+            if mb_y > 0 and mb_x > 0 else None
+        )
+        neighbors_top_cr = (
+            self.state.frame_cr[cy - 1, cx:cx + 8] if mb_y > 0 else None
+        )
+        neighbors_left_cr = (
+            self.state.frame_cr[cy:cy + 8, cx - 1] if mb_x > 0 else None
+        )
+        neighbor_tl_cr = (
+            self.state.frame_cr[cy - 1, cx - 1]
+            if mb_y > 0 and mb_x > 0 else None
         )
 
-        # Decode luma DC coefficients (16 values via Hadamard)
-        # Must check coded_block_flag first per H.264 spec 9.3.3.1.3
-        import numpy as np
-        from entropy.cabac_syntax import decode_coded_block_flag
-        dc_cbf = decode_coded_block_flag(cabac, contexts, 0, 0)  # cat=0 for Luma DC
-        if dc_cbf == 1:
-            dc_coeffs = decode_residual_block_cabac(cabac, contexts, 16, 0)  # block_cat=0
-        else:
-            dc_coeffs = np.zeros(16, dtype=np.int32)
+        # Process chroma DC from pre-parsed coefficients
+        cb_dc_raw = residual.get('chroma_dc_cb')
+        cr_dc_raw = residual.get('chroma_dc_cr')
 
-        # Dequant and inverse Hadamard for DC
-        dc_block = np.array(dc_coeffs[:16]).reshape(4, 4)
-        dc_block = inverse_hadamard_4x4(dc_block)
-
-        # Scale DC coefficients
-        qp_per = qp // 6
-        qp_rem = qp % 6
-        dc_scale = 1 << max(0, qp_per - 2)
-        dc_block = dc_block * dc_scale
-
-        # Decode AC coefficients for each 4x4 block
-        luma = pred.copy().astype(np.int32)
-
-        for blk_idx in range(16):
-            by = (blk_idx // 4) * 4
-            bx = (blk_idx % 4) * 4
-
-            # Get DC from Hadamard result
-            dc_val = dc_block[blk_idx // 4, blk_idx % 4]
-
-            coeffs = np.zeros(16, dtype=np.int32)
-            coeffs[0] = dc_val
-
-            if cbp_luma & (1 << (blk_idx // 4)):
-                # Check coded_block_flag before decoding AC
-                cbf = decode_coded_block_flag(cabac, contexts, 1, 0)  # cat=1 for I16x16 AC
-                if cbf == 1:
-                    # Decode AC coefficients
-                    ac_coeffs = decode_residual_block_cabac(cabac, contexts, 15, 1)
-                    coeffs[1:] = ac_coeffs[:15]
-
-            # Dequant and IDCT
-            block = coeffs.reshape(4, 4)
-            block = dequant_4x4(block, qp, is_intra=True)
-            residual = idct_4x4(block)
-
-            luma[by:by+4, bx:bx+4] += residual
-
-        # Clip and store
-        self.state.frame_luma[ly:ly+16, lx:lx+16] = np.clip(luma, 0, 255).astype(np.uint8)
-
-        # Decode chroma if needed
-        if cbp_chroma > 0:
-            self._decode_chroma_cabac(cabac, contexts, mb_x, mb_y, qp, cbp_chroma)
-        else:
-            self.state.frame_cb[cy:cy+8, cx:cx+8] = 128
-            self.state.frame_cr[cy:cy+8, cx:cx+8] = 128
-
-    def _reconstruct_i4x4_cabac(
-        self,
-        cabac: 'CABACDecoder',
-        contexts: list,
-        mb_data: dict,
-        mb_x: int,
-        mb_y: int,
-        qp: int,
-        sps: 'SPS',
-    ) -> None:
-        """Reconstruct I_4x4 macroblock with CABAC.
-
-        Decodes residual coefficients for luma and chroma blocks.
-        """
-        from entropy.cabac_residual import decode_residual_block_cabac
-        from entropy.cabac_syntax import decode_coded_block_flag
-        from intra import predict_intra_4x4
-        from transform import idct_4x4
-        from dequant import dequant_4x4
-        import numpy as np
-
-        ly, lx = mb_y * 16, mb_x * 16
-        cy, cx = mb_y * 8, mb_x * 8
-
-        # Get CBP from decoded mb_data
-        cbp = mb_data.get('cbp', 0)
-        cbp_luma = cbp & 0x0F
-        cbp_chroma = (cbp >> 4) & 0x03
-
-        # Get intra prediction modes
-        pred_modes = mb_data.get('mb_pred', {}).get('intra_pred_modes', [])
-
-        # Map 4x4 block index to 8x8 quadrant for CBP check
-        # Blocks 0-3 -> quadrant 0, blocks 4-7 -> quadrant 1, etc.
-        block_to_8x8 = [0, 0, 1, 1, 0, 0, 1, 1, 2, 2, 3, 3, 2, 2, 3, 3]
-
-        # Decode luma 4x4 blocks
-        luma = np.zeros((16, 16), dtype=np.int32)
-
-        for blk_idx in range(16):
-            # 4x4 block position within MB
-            by = ((blk_idx // 4) % 2) * 8 + ((blk_idx % 4) // 2) * 4
-            bx = ((blk_idx // 4) // 2) * 8 + ((blk_idx % 4) % 2) * 4
-
-            # Get prediction mode for this block (-1 means use predicted)
-            mode = pred_modes[blk_idx] if blk_idx < len(pred_modes) else 0
-            if mode == -1:
-                mode = 2  # Default to DC if no predicted mode available
-
-            # Absolute position in frame
-            abs_y = ly + by
-            abs_x = lx + bx
-
-            # Check neighbor availability based on absolute position
-            top_available = abs_y > 0
-            left_available = abs_x > 0
-
-            # Get neighbor samples
-            if top_available:
-                top = self.state.frame_luma[abs_y - 1, abs_x:abs_x + 4]
-            else:
-                top = None
-
-            if left_available:
-                left = self.state.frame_luma[abs_y:abs_y + 4, abs_x - 1]
-            else:
-                left = None
-
-            # Get top-left if both neighbors available
-            top_left = None
-            if top_available and left_available:
-                top_left = int(self.state.frame_luma[abs_y - 1, abs_x - 1])
-
-            # Predict block with availability flags
-            pred = predict_intra_4x4(
-                mode, top, left, top_left,
-                top_available=top_available,
-                left_available=left_available
+        cb_dc_dequant = None
+        cr_dc_dequant = None
+        if cb_dc_raw is not None:
+            cb_dc_dequant = process_chroma_dc_coeffs(
+                np.asarray(cb_dc_raw, dtype=np.int32), qp_chroma
+            )
+        if cr_dc_raw is not None:
+            cr_dc_dequant = process_chroma_dc_coeffs(
+                np.asarray(cr_dc_raw, dtype=np.int32), qp_chroma
             )
 
-            # Check if this 8x8 quadrant has coefficients
-            quad = block_to_8x8[blk_idx]
-            if cbp_luma & (1 << quad):
-                # Decode coded_block_flag for this 4x4 block
-                cbf = decode_coded_block_flag(cabac, contexts, 2, 0)  # cat=2 for I_4x4 luma
+        # Wrap chroma AC coefficients in CAVLCBlock adapter objects
+        cb_ac_blocks = []
+        cr_ac_blocks = []
+        chroma_ac_cb = residual.get('chroma_ac_cb', [None] * 4)
+        chroma_ac_cr = residual.get('chroma_ac_cr', [None] * 4)
 
-                if cbf == 1:
-                    # Decode residual coefficients
-                    coeffs = decode_residual_block_cabac(cabac, contexts, 16, 2)
-                    block = coeffs.reshape(4, 4)
-                    block = dequant_4x4(block, qp, is_intra=True)
-                    residual = idct_4x4(block)
-                    luma[by:by + 4, bx:bx + 4] = pred + residual
-                else:
-                    luma[by:by + 4, bx:bx + 4] = pred
+        for i in range(4):
+            cb_raw = chroma_ac_cb[i]
+            if cb_raw is not None:
+                cb_arr = np.asarray(cb_raw, dtype=np.int32)
+                tc = int(np.count_nonzero(cb_arr))
+                cb_ac_blocks.append(
+                    CAVLCBlock(
+                        total_coeff=tc,
+                        trailing_ones=0,
+                        coefficients=cb_arr,
+                    )
+                )
+                nz_counts[16 + i] = tc
             else:
-                luma[by:by + 4, bx:bx + 4] = pred
+                cb_ac_blocks.append(
+                    CAVLCBlock(
+                        total_coeff=0,
+                        trailing_ones=0,
+                        coefficients=np.zeros(15, dtype=np.int32),
+                    )
+                )
 
-            # Store to frame buffer for neighbor prediction
-            self.state.frame_luma[abs_y:abs_y + 4, abs_x:abs_x + 4] = np.clip(
-                luma[by:by + 4, bx:bx + 4], 0, 255
-            ).astype(np.uint8)
+            cr_raw = chroma_ac_cr[i]
+            if cr_raw is not None:
+                cr_arr = np.asarray(cr_raw, dtype=np.int32)
+                tc = int(np.count_nonzero(cr_arr))
+                cr_ac_blocks.append(
+                    CAVLCBlock(
+                        total_coeff=tc,
+                        trailing_ones=0,
+                        coefficients=cr_arr,
+                    )
+                )
+                nz_counts[20 + i] = tc
+            else:
+                cr_ac_blocks.append(
+                    CAVLCBlock(
+                        total_coeff=0,
+                        trailing_ones=0,
+                        coefficients=np.zeros(15, dtype=np.int32),
+                    )
+                )
 
-        # Decode chroma if needed
-        if cbp_chroma > 0:
-            # Decode chroma DC and AC
-            self._decode_chroma_cabac(cabac, contexts, mb_x, mb_y, qp, cbp_chroma)
+        # Determine effective cbp_chroma for reconstruction
+        if mb_type >= 1 and mb_type <= 24:
+            # I_16x16: cbp_chroma already extracted above
+            pass
         else:
-            # Fill with mid-gray
-            self.state.frame_cb[cy:cy + 8, cx:cx + 8] = 128
-            self.state.frame_cr[cy:cy + 8, cx:cx + 8] = 128
+            # I_4x4: from parsed CBP
+            pass
 
-    def _decode_chroma_cabac(
-        self,
-        cabac: 'CABACDecoder',
-        contexts: list,
-        mb_x: int,
-        mb_y: int,
-        qp: int,
-        cbp_chroma: int,
-    ) -> None:
-        """Decode chroma coefficients using CABAC.
+        # Only pass ac_blocks when cbp_chroma == 2 (DC+AC)
+        cb_ac_for_recon = cb_ac_blocks if cbp_chroma == 2 else []
+        cr_ac_for_recon = cr_ac_blocks if cbp_chroma == 2 else []
 
-        Args:
-            cabac: CABAC decoder
-            contexts: Context models
-            mb_x, mb_y: Macroblock position
-            qp: Current QP
-            cbp_chroma: Chroma CBP (0=none, 1=DC only, 2=DC+AC)
-        """
-        from entropy.cabac_residual import decode_residual_block_cabac
-        from entropy.cabac_syntax import decode_coded_block_flag
-        from transform import inverse_hadamard_2x2, idct_4x4
-        from dequant import dequant_4x4
-        import numpy as np
+        # Reconstruct Cb
+        self.state.frame_cb[cy:cy+8, cx:cx+8] = reconstruct_chroma_plane(
+            cb_dc_dequant, cb_ac_for_recon, cbp_chroma, qp_chroma,
+            chroma_pred_mode,
+            neighbors_top_cb, neighbors_left_cb, neighbor_tl_cb,
+        )
 
-        cy, cx = mb_y * 8, mb_x * 8
+        # Reconstruct Cr
+        self.state.frame_cr[cy:cy+8, cx:cx+8] = reconstruct_chroma_plane(
+            cr_dc_dequant, cr_ac_for_recon, cbp_chroma, qp_chroma,
+            chroma_pred_mode,
+            neighbors_top_cr, neighbors_left_cr, neighbor_tl_cr,
+        )
 
-        # Chroma QP adjustment
-        qp_c = min(51, qp)
+        # --- Store metadata ---
+        self.state.nz_counts[mb_idx] = nz_counts
 
-        for plane in range(2):  # Cb, Cr
-            frame = self.state.frame_cb if plane == 0 else self.state.frame_cr
+        if self.state.mb_qps is not None:
+            self.state.mb_qps[mb_idx] = current_qp
 
-            # Decode DC coefficients (4 values via 2x2 Hadamard)
-            # Must check coded_block_flag first per H.264 spec 9.3.3.1.3
-            dc_cbf = decode_coded_block_flag(cabac, contexts, 3, 0)  # cat=3 for chroma DC
-            if dc_cbf == 1:
-                dc_coeffs = decode_residual_block_cabac(cabac, contexts, 4, 3)  # block_cat=3 for chroma DC
-                dc_block = np.array(dc_coeffs[:4]).reshape(2, 2)
-                dc_block = inverse_hadamard_2x2(dc_block)
-            else:
-                dc_block = np.zeros((2, 2), dtype=np.int32)
-
-            # Initialize chroma plane
-            chroma = np.full((8, 8), 128, dtype=np.int32)
-
-            # Decode AC coefficients for each 4x4 block if cbp_chroma == 2
-            for blk_idx in range(4):
-                by = (blk_idx // 2) * 4
-                bx = (blk_idx % 2) * 4
-
-                # Get DC value
-                dc_val = dc_block[blk_idx // 2, blk_idx % 2]
-
-                coeffs = np.zeros(16, dtype=np.int32)
-                coeffs[0] = dc_val
-
-                if cbp_chroma == 2:
-                    # Check coded_block_flag for AC
-                    cbf = decode_coded_block_flag(cabac, contexts, 4, 0)  # cat=4 for chroma AC
-                    if cbf == 1:
-                        ac_coeffs = decode_residual_block_cabac(cabac, contexts, 15, 4)
-                        coeffs[1:] = ac_coeffs[:15]
-
-                # Dequant and IDCT
-                block = coeffs.reshape(4, 4)
-                block = dequant_4x4(block, qp_c, is_intra=True)
-                residual = idct_4x4(block)
-
-                chroma[by:by + 4, bx:bx + 4] = 128 + residual
-
-            # Clip and store
-            frame[cy:cy + 8, cx:cx + 8] = np.clip(chroma, 0, 255).astype(np.uint8)
+        if self.state.mb_coeffs is not None:
+            self.state.mb_coeffs[mb_idx, :16] = nz_counts[:16] > 0
 
     def _reconstruct_inter_mb_cabac(
         self,

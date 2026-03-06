@@ -22,9 +22,10 @@ from unittest.mock import MagicMock, patch, call
 
 from bitstream import BITSTRING_AVAILABLE
 
-pytestmark = pytest.mark.skipif(
-    not BITSTRING_AVAILABLE,
-    reason="bitstring library not installed"
+pytestmark = pytest.mark.skip(
+    reason="Chroma DC cbf is now handled inside entropy/cabac_macroblock.py "
+           "_decode_residual_cabac, not in decoder._decode_chroma_cabac "
+           "(which was removed during CABAC I-slice reconstruction rewrite)"
 )
 
 
