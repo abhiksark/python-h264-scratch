@@ -83,6 +83,9 @@ def decode_mb_type_cabac(
 ) -> int:
     """Decode mb_type with neighbor context.
 
+    H.264 Section 9.3.3.1.1.3: condTermFlagN = 1 if neighbor available
+    and NOT I_NxN (I_4x4/I_8x8), 0 otherwise.
+
     Args:
         decoder: CABAC decoder
         contexts: Context models
@@ -93,7 +96,18 @@ def decode_mb_type_cabac(
         mb_type value
     """
     if slice_type == 2:  # I-slice
-        return decode_mb_type_i(decoder, contexts)
+        # Compute condTermFlagA + condTermFlagB for mb_type context
+        left_available = mb_info.get('left_available', False)
+        top_available = mb_info.get('top_available', False)
+        left_mb_type = mb_info.get('left_mb_type', None)
+        top_mb_type = mb_info.get('top_mb_type', None)
+
+        # condTermFlag = 1 if neighbor available AND NOT I_NxN (type 0)
+        cond_a = 1 if (left_available and left_mb_type is not None and left_mb_type != 0) else 0
+        cond_b = 1 if (top_available and top_mb_type is not None and top_mb_type != 0) else 0
+        ctx_inc = cond_a + cond_b
+
+        return decode_mb_type_i(decoder, contexts, ctx_inc=ctx_inc)
     elif slice_type == 0:  # P-slice
         return decode_mb_type_p(decoder, contexts)
     else:  # B-slice
@@ -130,6 +144,10 @@ def decode_intra_chroma_pred_mode_cabac(
 ) -> int:
     """Decode intra_chroma_pred_mode with neighbor context.
 
+    H.264 Section 9.3.3.1.1.8:
+    ctxIdxInc = condTermFlagA + condTermFlagB
+    condTermFlagN = 0 if N unavailable, else (chroma_pred_mode_N != 0 ? 1 : 0)
+
     Args:
         decoder: CABAC decoder
         contexts: Context models
@@ -138,21 +156,20 @@ def decode_intra_chroma_pred_mode_cabac(
     Returns:
         Chroma prediction mode (0=DC, 1=Horizontal, 2=Vertical, 3=Plane)
     """
-    # Note: Context depends on neighbors, but the base function handles
-    # the context selection internally using truncated unary
-    # Accept both field name variants for compatibility
     left_available = mb_info.get('left_available', False)
     top_available = mb_info.get('top_available', False)
 
-    # Support both naming conventions
     left_mode = mb_info.get('left_intra_chroma_pred_mode',
                            mb_info.get('left_chroma_mode', 0)) if left_available else 0
     top_mode = mb_info.get('top_intra_chroma_pred_mode',
                           mb_info.get('top_chroma_mode', 0)) if top_available else 0
 
-    # The decode_intra_chroma_pred_mode function uses fixed context base
-    # For proper spec compliance, context increment would be used
-    return decode_intra_chroma_pred_mode(decoder, contexts)
+    # condTermFlag = 1 if neighbor available AND chroma_pred_mode != 0
+    cond_a = 1 if (left_available and left_mode != 0) else 0
+    cond_b = 1 if (top_available and top_mode != 0) else 0
+    ctx_inc = cond_a + cond_b
+
+    return decode_intra_chroma_pred_mode(decoder, contexts, ctx_inc=ctx_inc)
 
 
 def decode_cbp_cabac(
@@ -358,24 +375,30 @@ def decode_macroblock_layer_cabac(
         result['cbp_chroma'] = cbp_chroma
         result['cbp'] = cbp_luma | (cbp_chroma << 4)
 
-    # Decode mb_qp_delta (if any coded blocks)
-    # For I_16x16: check embedded CBP; for others: check decoded CBP
+    # Decode mb_qp_delta: H.264 Section 7.3.5.1
+    # Condition: CBP_luma > 0 OR CBP_chroma > 0 OR MbPartPredMode == Intra_16x16
+    is_16x16 = _is_i_16x16(result['mb_type'], slice_type)
     has_coded_blocks = False
-    if _is_i_16x16(result['mb_type'], slice_type):
-        cbp_luma = result.get('cbp_luma', 0)
-        cbp_chroma = result.get('cbp_chroma', 0)
-        has_coded_blocks = cbp_luma != 0 or cbp_chroma != 0
+    if is_16x16:
+        # I_16x16 always decodes mb_qp_delta (spec: MbPartPredMode == Intra_16x16)
+        has_coded_blocks = True
     else:
         has_coded_blocks = result['cbp'] != 0
 
     if has_coded_blocks:
-        result['mb_qp_delta'] = decode_mb_qp_delta(decoder, contexts)
+        # Context for first bin depends on whether prev MB had nonzero qp_delta
+        prev_qp_delta = mb_info.get('prev_mb_qp_delta', 0)
+        ctx_inc_first = 1 if prev_qp_delta != 0 else 0
+        result['mb_qp_delta'] = decode_mb_qp_delta(
+            decoder, contexts, ctx_inc_first=ctx_inc_first
+        )
 
     # Decode residual blocks
     if has_coded_blocks:
         result['residual'] = _decode_residual_cabac(
             decoder, contexts, result['mb_type'], slice_type, result['cbp'],
             result.get('transform_size_8x8_flag', 0),
+            mb_info=mb_info,
         )
     else:
         result['residual'] = _empty_residual()
@@ -470,10 +493,160 @@ def decode_mb_field_decoding_flag_cabac(
 
 
 # Coded block flag context base indices (H.264 Table 9-39)
-CTX_CBF_LUMA_DC_BASE = 85
-CTX_CBF_LUMA_AC_BASE = 89
-CTX_CBF_CHROMA_DC_BASE = 93
-CTX_CBF_CHROMA_AC_BASE = 97
+# ctxIdx = 85 + ctxBlockCatOffset + ctxIdxInc
+# ctxBlockCatOffset = 4 * blockCatIdx
+CTX_CBF_LUMA_DC_BASE = 85     # block_cat=0: 85 + 0
+CTX_CBF_LUMA_AC_BASE = 89     # block_cat=1: 85 + 4
+CTX_CBF_LUMA_4X4_BASE = 93    # block_cat=2: 85 + 8
+CTX_CBF_CHROMA_DC_BASE = 97   # block_cat=3: 85 + 12
+CTX_CBF_CHROMA_AC_BASE = 101  # block_cat=4: 85 + 16
+
+# Luma 4x4 block neighbor mapping for coded_block_flag context
+# Block positions (row, col) from scan order:
+#  0:(0,0)   1:(0,4)   4:(0,8)   5:(0,12)
+#  2:(4,0)   3:(4,4)   6:(4,8)   7:(4,12)
+#  8:(8,0)   9:(8,4)  12:(8,8)  13:(8,12)
+# 10:(12,0) 11:(12,4) 14:(12,8) 15:(12,12)
+#
+# For each block: (left_within_mb_idx or None, top_within_mb_idx or None)
+# None means cross-MB neighbor needed
+_LUMA_LEFT_NEIGHBOR = [
+    None, 0, None, 2, 1, 4, 3, 6,
+    None, 8, None, 10, 9, 12, 11, 14,
+]
+_LUMA_TOP_NEIGHBOR = [
+    None, None, 0, 1, None, None, 4, 5,
+    2, 3, 8, 9, 6, 7, 12, 13,
+]
+# For cross-MB: which block index in the left/top MB provides the neighbor
+_LUMA_LEFT_MB_BLOCK = [5, None, 7, None, None, None, None, None,
+                       13, None, 15, None, None, None, None, None]
+_LUMA_TOP_MB_BLOCK = [10, 11, None, None, 14, 15, None, None,
+                      None, None, None, None, None, None, None, None]
+
+# Chroma 4x4 block neighbor mapping (2x2 blocks per plane)
+# Block positions: 0:(0,0), 1:(0,4), 2:(4,0), 3:(4,4)
+_CHROMA_LEFT_NEIGHBOR = [None, 0, None, 2]
+_CHROMA_TOP_NEIGHBOR = [None, None, 0, 1]
+_CHROMA_LEFT_MB_BLOCK = [1, None, 3, None]
+_CHROMA_TOP_MB_BLOCK = [2, 3, None, None]
+
+
+def _get_cbf_ctx_idx(
+    block_cat: int,
+    blk_idx: int,
+    mb_cbf: list,
+    left_mb_cbf: Optional[list],
+    top_mb_cbf: Optional[list],
+    left_available: bool,
+    top_available: bool,
+    is_intra: bool = True,
+    chroma_ac_offset: int = 0,
+) -> int:
+    """Compute coded_block_flag context index.
+
+    H.264 Section 9.3.3.1.1.9:
+    ctxIdx = ctxIdxBase + condTermFlagA + 2*condTermFlagB
+
+    condTermFlag derivation when neighbor is NOT available:
+    - Current MB is intra → condTermFlag = 1
+    - Current MB is inter → condTermFlag = 0
+
+    Args:
+        block_cat: Block category (0-4)
+        blk_idx: Block index (0-15 for luma AC/4x4, 0-3 for chroma AC,
+                 0=Cb/1=Cr for chroma DC)
+        mb_cbf: Current MB's per-block CBF [0-15: luma, 16-19: Cb AC,
+                20-23: Cr AC, 24: luma DC, 25: Cb DC, 26: Cr DC]
+        left_mb_cbf: Left MB's per-block CBF list[27] (None if unavailable)
+        top_mb_cbf: Top MB's per-block CBF list[27] (None if unavailable)
+        left_available: Whether left MB exists
+        top_available: Whether top MB exists
+        is_intra: Whether current MB is intra (affects unavailable default)
+
+    Returns:
+        Context index for coded_block_flag
+    """
+    CBF_BASE = {0: 85, 1: 89, 2: 93, 3: 97, 4: 101}
+    ctx_base = CBF_BASE[block_cat]
+
+    # Default condTermFlag when neighbor is unavailable (H.264 9.3.3.1.1.9)
+    unavail_default = 1 if is_intra else 0
+
+    # DC blocks (block_cat 0 or 3): only cross-MB neighbors
+    if block_cat == 0:
+        # Luma DC (I_16x16): neighbor is left/top MB's luma DC (index 24)
+        if left_available and left_mb_cbf is not None and len(left_mb_cbf) > 24:
+            cond_a = 1 if left_mb_cbf[24] else 0
+        else:
+            cond_a = unavail_default
+        if top_available and top_mb_cbf is not None and len(top_mb_cbf) > 24:
+            cond_b = 1 if top_mb_cbf[24] else 0
+        else:
+            cond_b = unavail_default
+        return ctx_base + cond_a + 2 * cond_b
+
+    if block_cat == 3:
+        # Chroma DC: neighbor is left/top MB's same-plane DC
+        # blk_idx: 0=Cb, 1=Cr → mb_cbf index 25 or 26
+        dc_idx = 25 + blk_idx
+        if left_available and left_mb_cbf is not None and len(left_mb_cbf) > dc_idx:
+            cond_a = 1 if left_mb_cbf[dc_idx] else 0
+        else:
+            cond_a = unavail_default
+        if top_available and top_mb_cbf is not None and len(top_mb_cbf) > dc_idx:
+            cond_b = 1 if top_mb_cbf[dc_idx] else 0
+        else:
+            cond_b = unavail_default
+        return ctx_base + cond_a + 2 * cond_b
+
+    # Luma blocks (block_cat 1 or 2)
+    if block_cat in (1, 2):
+        left_within = _LUMA_LEFT_NEIGHBOR[blk_idx]
+        top_within = _LUMA_TOP_NEIGHBOR[blk_idx]
+
+        # condTermFlagA
+        if left_within is not None:
+            cond_a = 1 if mb_cbf[left_within] else 0
+        elif left_available and left_mb_cbf is not None:
+            cross_idx = _LUMA_LEFT_MB_BLOCK[blk_idx]
+            cond_a = 1 if left_mb_cbf[cross_idx] else 0
+        else:
+            cond_a = unavail_default
+
+        # condTermFlagB
+        if top_within is not None:
+            cond_b = 1 if mb_cbf[top_within] else 0
+        elif top_available and top_mb_cbf is not None:
+            cross_idx = _LUMA_TOP_MB_BLOCK[blk_idx]
+            cond_b = 1 if top_mb_cbf[cross_idx] else 0
+        else:
+            cond_b = unavail_default
+
+        return ctx_base + cond_a + 2 * cond_b
+
+    # Chroma AC blocks (block_cat 4): indices 16-19 in mb_cbf for within-MB
+    # For cross-MB: Cb uses 16-19, Cr uses 20-23 (controlled by chroma_ac_offset)
+    left_within = _CHROMA_LEFT_NEIGHBOR[blk_idx]
+    top_within = _CHROMA_TOP_NEIGHBOR[blk_idx]
+
+    if left_within is not None:
+        cond_a = 1 if mb_cbf[16 + left_within] else 0
+    elif left_available and left_mb_cbf is not None:
+        cross_idx = _CHROMA_LEFT_MB_BLOCK[blk_idx]
+        cond_a = 1 if left_mb_cbf[16 + chroma_ac_offset + cross_idx] else 0
+    else:
+        cond_a = unavail_default
+
+    if top_within is not None:
+        cond_b = 1 if mb_cbf[16 + top_within] else 0
+    elif top_available and top_mb_cbf is not None:
+        cross_idx = _CHROMA_TOP_MB_BLOCK[blk_idx]
+        cond_b = 1 if top_mb_cbf[16 + chroma_ac_offset + cross_idx] else 0
+    else:
+        cond_b = unavail_default
+
+    return ctx_base + cond_a + 2 * cond_b
 
 
 def _decode_residual_cabac(
@@ -483,6 +656,7 @@ def _decode_residual_cabac(
     slice_type: int,
     cbp: int,
     transform_size_8x8_flag: int,
+    mb_info: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Decode residual coefficient blocks using CABAC.
 
@@ -502,6 +676,7 @@ def _decode_residual_cabac(
         slice_type: Slice type (0=P, 1=B, 2=I).
         cbp: Coded block pattern (bits 0-3: luma, bits 4-5: chroma).
         transform_size_8x8_flag: 1 for 8x8 transform (High profile).
+        mb_info: Neighbor information for CBF context derivation.
 
     Returns:
         Dict with residual block arrays keyed by block type.
@@ -509,24 +684,49 @@ def _decode_residual_cabac(
     residual = _empty_residual()
 
     is_16x16 = _is_i_16x16(mb_type, slice_type)
+    is_intra = _is_intra_mb_type(mb_type, slice_type)
+
+    # Track per-block CBF for within-MB neighbor context
+    # Indices 0-15: luma blocks, 16-19: Cb AC, 20-23: Cr AC,
+    # 24: luma DC, 25: Cb DC, 26: Cr DC
+    mb_cbf = [0] * 27
+
+    # Get neighbor CBF data
+    left_available = mb_info.get('left_available', False) if mb_info else False
+    top_available = mb_info.get('top_available', False) if mb_info else False
+    left_mb_cbf = mb_info.get('left_mb_cbf', None) if mb_info else None
+    top_mb_cbf = mb_info.get('top_mb_cbf', None) if mb_info else None
 
     if is_16x16:
         cbp_luma = cbp & 0x0F
         cbp_chroma = (cbp >> 4) & 0x03
 
-        # Luma DC: block_cat=0, 16 coefficients, always decoded (no cbf)
-        residual['luma_dc'] = decode_residual_block_cabac(
-            decoder, contexts, max_coeff=16, block_cat=0,
+        # Luma DC: block_cat=0, 16 coefficients, with coded_block_flag
+        luma_dc_ctx = _get_cbf_ctx_idx(
+            0, 0, mb_cbf, left_mb_cbf, top_mb_cbf,
+            left_available, top_available, is_intra,
         )
+        residual['luma_dc'] = decode_residual_block_cabac_with_cbf(
+            decoder, contexts, max_coeff=16, block_cat=0,
+            coded_block_flag_ctx_idx=luma_dc_ctx,
+        )
+        mb_cbf[24] = 1 if (residual['luma_dc'] is not None
+                           and np.any(residual['luma_dc'] != 0)) else 0
 
         # Luma AC: block_cat=1, 15 coefficients per 4x4 block
-        # Only decoded if cbp_luma indicates AC coefficients present
         if cbp_luma != 0:
             for i in range(16):
+                ctx_idx = _get_cbf_ctx_idx(
+                    1, i, mb_cbf, left_mb_cbf, top_mb_cbf,
+                    left_available, top_available,
+                )
                 residual['luma_ac'][i] = decode_residual_block_cabac_with_cbf(
                     decoder, contexts, max_coeff=15, block_cat=1,
-                    coded_block_flag_ctx_idx=CTX_CBF_LUMA_AC_BASE,
+                    coded_block_flag_ctx_idx=ctx_idx,
                 )
+                # Track CBF for subsequent blocks
+                if residual['luma_ac'][i] is not None:
+                    mb_cbf[i] = 1 if np.any(residual['luma_ac'][i] != 0) else 0
     else:
         # I_4x4 or inter: block_cat=2, 16 coefficients per 4x4 block
         cbp_luma = cbp & 0x0F
@@ -536,36 +736,83 @@ def _decode_residual_cabac(
             if cbp_luma & (1 << i8x8):
                 for i4x4 in range(4):
                     blk_idx = i8x8 * 4 + i4x4
+                    ctx_idx = _get_cbf_ctx_idx(
+                        2, blk_idx, mb_cbf, left_mb_cbf, top_mb_cbf,
+                        left_available, top_available,
+                    )
                     residual['luma_4x4'][blk_idx] = (
                         decode_residual_block_cabac_with_cbf(
                             decoder, contexts, max_coeff=16, block_cat=2,
-                            coded_block_flag_ctx_idx=CTX_CBF_LUMA_AC_BASE,
+                            coded_block_flag_ctx_idx=ctx_idx,
                         )
                     )
+                    if residual['luma_4x4'][blk_idx] is not None:
+                        mb_cbf[blk_idx] = 1 if np.any(
+                            residual['luma_4x4'][blk_idx] != 0
+                        ) else 0
 
-    # Chroma DC: block_cat=3, 4 coefficients, no cbf (always decoded
-    # when cbp_chroma >= 1)
+    # Chroma DC: block_cat=3, 4 coefficients, with coded_block_flag
     if cbp_chroma >= 1:
-        residual['chroma_dc_cb'] = decode_residual_block_cabac(
-            decoder, contexts, max_coeff=4, block_cat=3,
+        cb_dc_ctx = _get_cbf_ctx_idx(
+            3, 0, mb_cbf, left_mb_cbf, top_mb_cbf,
+            left_available, top_available, is_intra,
         )
-        residual['chroma_dc_cr'] = decode_residual_block_cabac(
+        residual['chroma_dc_cb'] = decode_residual_block_cabac_with_cbf(
             decoder, contexts, max_coeff=4, block_cat=3,
+            coded_block_flag_ctx_idx=cb_dc_ctx,
         )
+        mb_cbf[25] = 1 if (residual['chroma_dc_cb'] is not None
+                           and np.any(residual['chroma_dc_cb'] != 0)) else 0
 
-    # Chroma AC: block_cat=4, 15 coefficients, with cbf (only when
-    # cbp_chroma == 2)
+        cr_dc_ctx = _get_cbf_ctx_idx(
+            3, 1, mb_cbf, left_mb_cbf, top_mb_cbf,
+            left_available, top_available, is_intra,
+        )
+        residual['chroma_dc_cr'] = decode_residual_block_cabac_with_cbf(
+            decoder, contexts, max_coeff=4, block_cat=3,
+            coded_block_flag_ctx_idx=cr_dc_ctx,
+        )
+        mb_cbf[26] = 1 if (residual['chroma_dc_cr'] is not None
+                           and np.any(residual['chroma_dc_cr'] != 0)) else 0
+
+    # Chroma AC: block_cat=4, 15 coefficients, with cbf
     if cbp_chroma == 2:
         for i in range(4):
+            ctx_idx = _get_cbf_ctx_idx(
+                4, i, mb_cbf, left_mb_cbf, top_mb_cbf,
+                left_available, top_available,
+            )
             residual['chroma_ac_cb'][i] = decode_residual_block_cabac_with_cbf(
                 decoder, contexts, max_coeff=15, block_cat=4,
-                coded_block_flag_ctx_idx=CTX_CBF_CHROMA_AC_BASE,
+                coded_block_flag_ctx_idx=ctx_idx,
             )
+            if residual['chroma_ac_cb'][i] is not None:
+                mb_cbf[16 + i] = 1 if np.any(
+                    residual['chroma_ac_cb'][i] != 0
+                ) else 0
+
+        # For Cr AC: use Cr-specific CBF tracking (indices 20-23)
+        # Within-MB neighbors stored at 16-19 in cr_cbf (same positions as Cb)
+        # Cross-MB neighbors need chroma_ac_offset=4 to read from 20-23
+        cr_cbf = [0] * 24
         for i in range(4):
+            ctx_idx = _get_cbf_ctx_idx(
+                4, i, cr_cbf, left_mb_cbf, top_mb_cbf,
+                left_available, top_available,
+                chroma_ac_offset=4,
+            )
             residual['chroma_ac_cr'][i] = decode_residual_block_cabac_with_cbf(
                 decoder, contexts, max_coeff=15, block_cat=4,
-                coded_block_flag_ctx_idx=CTX_CBF_CHROMA_AC_BASE,
+                coded_block_flag_ctx_idx=ctx_idx,
             )
+            if residual['chroma_ac_cr'][i] is not None:
+                cr_cbf[16 + i] = 1 if np.any(
+                    residual['chroma_ac_cr'][i] != 0
+                ) else 0
+                mb_cbf[20 + i] = cr_cbf[16 + i]
+
+    # Store CBF tracking data in residual for decoder state
+    residual['_mb_cbf'] = mb_cbf
 
     return residual
 

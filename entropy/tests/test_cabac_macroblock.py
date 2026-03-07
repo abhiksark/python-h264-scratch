@@ -962,7 +962,7 @@ class TestEndOfSliceFlagCABAC:
         from entropy.cabac_context import init_context_models
         from entropy.cabac_macroblock import decode_slice_data_cabac
 
-        data = bytes([0x80, 0x40, 0xFF, 0xFE] * 50)
+        data = bytes([0x80, 0x40, 0xFF, 0xFE] * 200)
         reader = BitReader(data)
         decoder = CABACDecoder(reader)
         contexts = init_context_models(slice_type=2, slice_qp=26)

@@ -73,24 +73,33 @@ def decode_mb_skip_flag(
 def decode_mb_type_i(
     decoder: 'CABACDecoder',
     contexts: List['CABACContext'],
+    ctx_inc: int = 0,
 ) -> int:
     """Decode mb_type for I-slice.
 
     Binarization (H.264 Table 9-26):
     - 0: I_4x4 = "0"
-    - 1-24: I_16x16 = "1" + prefix + suffix
+    - 1-24: I_16x16 sub-type
     - 25: I_PCM = "1" + terminate
+
+    Context indices (H.264 Table 9-32, ctxIdxOffset=3):
+    - binIdx 0: ctxIdx = 3 + ctx_inc (neighbor-dependent, 0-2)
+    - binIdx 1: decode_terminate (I_PCM check)
+    - binIdx 2: ctxIdx = 3 + 3 = 6 (cbp_luma flag)
+    - binIdx 3: ctxIdx = 3 + 4 = 7 (chroma CBP first)
+    - binIdx 4: ctxIdx = 3 + 5 = 8 (chroma CBP second, if needed)
+    - binIdx 5-6: bypass (pred mode, 2 bits)
 
     Args:
         decoder: CABAC decoder
         contexts: Context models
+        ctx_inc: Context increment for first bin (condTermFlagA + condTermFlagB)
 
     Returns:
         mb_type value (0-25)
     """
-    ctx_idx = CTX_MB_TYPE_I_START
-
     # First bin: 0=I_4x4, 1=I_16x16 or I_PCM
+    ctx_idx = CTX_MB_TYPE_I_START + ctx_inc
     if decoder.decode_decision(contexts[ctx_idx]) == 0:
         return 0  # I_4x4
 
@@ -98,33 +107,26 @@ def decode_mb_type_i(
     if decoder.decode_terminate() == 1:
         return 25  # I_PCM
 
-    # Decode I_16x16 sub-type (1-24)
-    # Prefix: cbp_luma (4 values)
-    ctx_idx = CTX_MB_TYPE_I_START + 1
-    prefix = 0
-    if decoder.decode_decision(contexts[ctx_idx]) == 1:
-        prefix += 12
-    ctx_idx = CTX_MB_TYPE_I_START + 2
-    if decoder.decode_decision(contexts[ctx_idx]) == 1:
-        prefix += 1
-        if decoder.decode_decision(contexts[ctx_idx]) == 1:
-            prefix += 1
+    # Decode I_16x16 sub-type (mb_type 1-24)
+    # mb_type = 1 + pred_mode + 4*cbp_chroma + 12*(cbp_luma!=0)
 
-    # Suffix: pred mode (4 values) - fixed length 2 bits bypass
-    suffix = decoder.decode_bypass() * 2 + decoder.decode_bypass()
+    # cbp_luma flag (ctxIdx = 3 + 3 = 6)
+    cbp_luma = decoder.decode_decision(contexts[CTX_MB_TYPE_I_START + 3])
 
-    # Chroma CBP (2 bits)
-    ctx_idx = CTX_MB_TYPE_I_START + 3
-    chroma = 0
-    if decoder.decode_decision(contexts[ctx_idx]) == 1:
-        ctx_idx = CTX_MB_TYPE_I_START + 4
-        if decoder.decode_decision(contexts[ctx_idx]) == 1:
-            chroma = 2
+    # cbp_chroma: truncated unary max 2 (ctxIdx 7 for first, 8 for second)
+    cbp_chroma = 0
+    if decoder.decode_decision(contexts[CTX_MB_TYPE_I_START + 4]) == 1:
+        if decoder.decode_decision(contexts[CTX_MB_TYPE_I_START + 5]) == 1:
+            cbp_chroma = 2
         else:
-            chroma = 1
+            cbp_chroma = 1
 
-    # H.264 Table 7-11: mb_type = 1 + pred_mode + 4*cbp_chroma + 12*(cbp_luma!=0)
-    return 1 + suffix + chroma * 4 + prefix
+    # pred_mode: 2 context-based bins (ctxIdx 9 and 10)
+    pred_mode_bit0 = decoder.decode_decision(contexts[CTX_MB_TYPE_I_START + 6])
+    pred_mode_bit1 = decoder.decode_decision(contexts[CTX_MB_TYPE_I_START + 7])
+    pred_mode = pred_mode_bit0 * 2 + pred_mode_bit1
+
+    return 1 + pred_mode + 4 * cbp_chroma + 12 * cbp_luma
 
 
 def decode_mb_type_p(
@@ -311,25 +313,42 @@ def decode_mvd_lx(
 def decode_mb_qp_delta(
     decoder: 'CABACDecoder',
     contexts: List['CABACContext'],
+    ctx_inc_first: int = 0,
 ) -> int:
     """Decode mb_qp_delta.
 
-    Uses unary binarization with sign mapping.
+    Unary binarization with spec-correct context assignment:
+    - binIdx 0: ctxIdx = 60 + ctx_inc_first (0 or 1, from 9.3.3.1.1.10)
+    - binIdx 1: ctxIdx = 60 + 2 = 62
+    - binIdx >= 2: ctxIdx = 60 + 3 = 63
+
+    H.264 Spec Reference: Table 9-32, Section 9.3.3.1.1.10
 
     Args:
         decoder: CABAC decoder
         contexts: Context models
+        ctx_inc_first: Context increment for first bin (0 if prev qp_delta==0, 1 otherwise)
 
     Returns:
         Signed QP delta
     """
-    ctx_base = CTX_MB_QP_DELTA_START
-
-    # Decode absolute value
-    abs_val = decode_unary(decoder, ctx_base=ctx_base, contexts=contexts, max_ctx_inc=2)
-
-    if abs_val == 0:
+    # First bin
+    ctx_idx = CTX_MB_QP_DELTA_START + ctx_inc_first
+    if decoder.decode_decision(contexts[ctx_idx]) == 0:
         return 0
+
+    # Second bin (binIdx=1): ctxIdxInc = 2
+    ctx_idx = CTX_MB_QP_DELTA_START + 2
+    abs_val = 1
+    if decoder.decode_decision(contexts[ctx_idx]) == 0:
+        # abs_val = 1
+        pass
+    else:
+        # Subsequent bins (binIdx >= 2): ctxIdxInc = 3
+        abs_val = 2
+        ctx_idx = CTX_MB_QP_DELTA_START + 3
+        while decoder.decode_decision(contexts[ctx_idx]) == 1:
+            abs_val += 1
 
     # Map to signed: 1->1, 2->-1, 3->2, 4->-2, ...
     if abs_val % 2 == 1:
@@ -371,36 +390,38 @@ def decode_cbp_luma(
     ctx_base = CTX_CODED_BLOCK_PATTERN_START
 
     # Decode 4 bits, one per 8x8 block
+    # condTermFlagN = !(neighbor_cbp & bit_mask)
+    # When unavailable: treat as -1 (all bits set) → !(set) = 0
+    # Matches ffmpeg: ctx = !(cbp_a & bit) + 2 * !(cbp_b & bit)
     cbp = 0
     for i in range(4):
         # Derive condTermFlagA (left adjacent block)
-        # condTermFlag = 1 if block has NO coded coeffs or unavailable, else 0
         if i == 0:  # Top-left: left neighbor is block 1 of left MB
-            if left_cbp < 0:  # Unavailable
-                cond_a = 1
+            if left_cbp < 0:  # Unavailable → treat as all-set
+                cond_a = 0
             else:
-                cond_a = 0 if (left_cbp & 0x02) else 1  # Block 1 = bit 1
+                cond_a = 0 if (left_cbp & 0x02) else 1
         elif i == 1:  # Top-right: left neighbor is block 0 in same MB
             cond_a = 0 if (cbp & 0x01) else 1
         elif i == 2:  # Bottom-left: left neighbor is block 3 of left MB
             if left_cbp < 0:
-                cond_a = 1
+                cond_a = 0
             else:
-                cond_a = 0 if (left_cbp & 0x08) else 1  # Block 3 = bit 3
+                cond_a = 0 if (left_cbp & 0x08) else 1
         else:  # Bottom-right (i=3): left neighbor is block 2 in same MB
             cond_a = 0 if (cbp & 0x04) else 1
 
         # Derive condTermFlagB (top adjacent block)
         if i == 0:  # Top-left: top neighbor is block 2 of top MB
             if top_cbp < 0:
-                cond_b = 1
+                cond_b = 0
             else:
-                cond_b = 0 if (top_cbp & 0x04) else 1  # Block 2 = bit 2
+                cond_b = 0 if (top_cbp & 0x04) else 1
         elif i == 1:  # Top-right: top neighbor is block 3 of top MB
             if top_cbp < 0:
-                cond_b = 1
+                cond_b = 0
             else:
-                cond_b = 0 if (top_cbp & 0x08) else 1  # Block 3 = bit 3
+                cond_b = 0 if (top_cbp & 0x08) else 1
         elif i == 2:  # Bottom-left: top neighbor is block 0 in same MB
             cond_b = 0 if (cbp & 0x01) else 1
         else:  # Bottom-right (i=3): top neighbor is block 1 in same MB
@@ -443,16 +464,17 @@ def decode_cbp_chroma(
     ctx_base = CTX_CODED_BLOCK_PATTERN_START + 4
 
     # First bin: distinguishes 0 vs non-zero
-    # condTermFlag = 1 if neighbor chroma CBP is 0 or unavailable, else 0
+    # condTermFlag = 1 if neighbor chroma CBP > 0, 0 otherwise
+    # When unavailable: condTermFlag = 0 (H.264 Section 9.3.3.1.1.3)
     if left_cbp_chroma < 0:
-        cond_a = 1
+        cond_a = 0  # unavailable → 0
     else:
-        cond_a = 0 if left_cbp_chroma > 0 else 1
+        cond_a = 1 if left_cbp_chroma > 0 else 0
 
     if top_cbp_chroma < 0:
-        cond_b = 1
+        cond_b = 0  # unavailable → 0
     else:
-        cond_b = 0 if top_cbp_chroma > 0 else 1
+        cond_b = 1 if top_cbp_chroma > 0 else 0
 
     ctx_inc = cond_a + 2 * cond_b
     ctx_idx = ctx_base + ctx_inc
@@ -461,16 +483,17 @@ def decode_cbp_chroma(
         return 0
 
     # Second bin: distinguishes 1 (DC only) vs 2 (DC+AC)
-    # Similar context derivation for second bin
+    # condTermFlag = 1 if neighbor chroma CBP == 2, 0 otherwise
+    # When unavailable: condTermFlag = 0 (H.264 Section 9.3.3.1.1.3)
     if left_cbp_chroma < 0:
-        cond_a = 1
+        cond_a = 0  # unavailable → 0
     else:
-        cond_a = 0 if left_cbp_chroma > 1 else 1
+        cond_a = 1 if left_cbp_chroma == 2 else 0
 
     if top_cbp_chroma < 0:
-        cond_b = 1
+        cond_b = 0  # unavailable → 0
     else:
-        cond_b = 0 if top_cbp_chroma > 1 else 1
+        cond_b = 1 if top_cbp_chroma == 2 else 0
 
     ctx_inc = cond_a + 2 * cond_b
     ctx_idx = ctx_base + 4 + ctx_inc  # Second set of contexts
@@ -504,7 +527,10 @@ def decode_rem_intra4x4_pred_mode(
 ) -> int:
     """Decode rem_intra4x4_pred_mode.
 
-    3-bit fixed length (0-7).
+    3-bit fixed length using regular context-based decode at ctxIdx 69.
+    All 3 bins use the same context. Value assembled LSB-first.
+
+    H.264 Spec Reference: Table 9-34, ctxIdxOffset=69
 
     Args:
         decoder: CABAC decoder
@@ -513,29 +539,49 @@ def decode_rem_intra4x4_pred_mode(
     Returns:
         Remaining prediction mode (0-7)
     """
-    from entropy.cabac_binarize import decode_fixed_length
-
-    return decode_fixed_length(decoder, num_bits=3)
+    ctx_idx = CTX_PREV_INTRA_PRED_FLAG_START + 1  # ctxIdx 69
+    value = 0
+    value |= decoder.decode_decision(contexts[ctx_idx])
+    value |= decoder.decode_decision(contexts[ctx_idx]) << 1
+    value |= decoder.decode_decision(contexts[ctx_idx]) << 2
+    return value
 
 
 def decode_intra_chroma_pred_mode(
     decoder: 'CABACDecoder',
     contexts: List['CABACContext'],
+    ctx_inc: int = 0,
 ) -> int:
     """Decode intra_chroma_pred_mode.
 
-    Uses truncated unary (0-3).
+    Truncated unary (0-3) with spec-correct context assignment:
+    - binIdx 0: ctxIdx = 64 + ctx_inc (neighbor-dependent, 0-2)
+    - binIdx 1,2: ctxIdx = 64 + 3 = 67
+
+    H.264 Spec Reference: Table 9-32, Section 9.3.3.1.1.8
 
     Args:
         decoder: CABAC decoder
         contexts: Context models
+        ctx_inc: Context increment for first bin (condTermFlagA + condTermFlagB)
 
     Returns:
         Chroma prediction mode (0-3)
     """
-    return decode_truncated_unary(
-        decoder, max_val=3, ctx_base=CTX_INTRA_CHROMA_PRED_START, contexts=contexts
-    )
+    # First bin: neighbor-dependent context
+    ctx_idx = CTX_INTRA_CHROMA_PRED_START + ctx_inc
+    if decoder.decode_decision(contexts[ctx_idx]) == 0:
+        return 0
+
+    # Subsequent bins use fixed ctxIdxInc = 3
+    ctx_idx = CTX_INTRA_CHROMA_PRED_START + 3
+    if decoder.decode_decision(contexts[ctx_idx]) == 0:
+        return 1
+
+    if decoder.decode_decision(contexts[ctx_idx]) == 0:
+        return 2
+
+    return 3
 
 
 def decode_coded_block_flag(

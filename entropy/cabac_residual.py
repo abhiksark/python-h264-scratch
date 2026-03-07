@@ -153,11 +153,10 @@ def decode_coeff_abs_level_minus1(
             break
         prefix += 1
 
-        # Update context for subsequent bins
-        if prefix == 1:
-            ctx_idx_inc = 5 if num_decode_abs_level_gt1 > 0 else 4
-        else:
-            ctx_idx_inc = min(4, 5 + num_decode_abs_level_gt1)
+        # All subsequent bins use same context (H.264 Table 9-34)
+        # Chroma DC (blockCat 3) has only 4 abs contexts (max_c2=3 per JM)
+        max_c2 = 3 if block_cat == 3 else 4
+        ctx_idx_inc = 5 + min(max_c2, num_decode_abs_level_gt1)
         ctx_idx = ctx_base + ctx_idx_inc
 
     if prefix < 14:
@@ -227,13 +226,9 @@ def decode_residual_block_cabac(
             if last == 1:
                 break
     else:
-        # Reached last position - check if significant
-        if len(sig_positions) == 0 or sig_positions[-1] < max_coeff - 1:
-            sig = decode_significant_coeff_flag(
-                decoder, contexts, block_cat, max_coeff - 1
-            )
-            if sig == 1:
-                sig_positions.append(max_coeff - 1)
+        # Loop completed without finding last=1.
+        # Last position is implicitly significant (H.264 Section 9.3.3.1.3).
+        sig_positions.append(max_coeff - 1)
 
     # Decode coefficient levels (in reverse scan order)
     num_eq1 = 0
@@ -358,42 +353,30 @@ def get_coded_block_flag_ctx_idx(
 
     H.264 Spec Reference: Section 9.3.3.1.1.9
     """
-    # Base context indices for coded_block_flag
-    # Table 9-39 in H.264 spec
-    CBF_LUMA_DC_BASE = 85
-    CBF_LUMA_AC_BASE = 89
-    CBF_CHROMA_DC_BASE = 93
-    CBF_CHROMA_AC_BASE = 97
+    # Base context indices for coded_block_flag (H.264 Table 9-12)
+    # ctxIdx = 85 + 4 * blockCat + ctxIdxInc
+    CBF_BASE = {
+        0: 85,   # Luma DC (I_16x16)
+        1: 89,   # Luma AC (I_16x16)
+        2: 93,   # Luma 4x4
+        3: 97,   # Chroma DC
+        4: 101,  # Chroma AC
+    }
 
-    # Select base context based on block_cat or block_type
+    # Select base context
     if block_type is not None:
-        if block_type == 'luma_dc':
-            ctx_base = CBF_LUMA_DC_BASE
-        elif block_type == 'luma_ac':
-            ctx_base = CBF_LUMA_AC_BASE
-        elif block_type == 'chroma_dc':
-            ctx_base = CBF_CHROMA_DC_BASE
-        elif block_type == 'chroma_ac':
-            ctx_base = CBF_CHROMA_AC_BASE
-        else:
-            ctx_base = CBF_LUMA_AC_BASE
+        block_type_to_cat = {
+            'luma_dc': 0, 'luma_ac': 1, 'luma_4x4': 2,
+            'chroma_dc': 3, 'chroma_ac': 4,
+        }
+        cat = block_type_to_cat.get(block_type, block_cat)
+        ctx_base = CBF_BASE.get(cat, 89)
     else:
-        # Derive from block_cat
-        # 0=Luma DC (I_16x16), 1=Luma AC, 2=Luma 4x4
-        # 3=Chroma DC, 4=Chroma AC
-        if block_cat == 0:
-            ctx_base = CBF_LUMA_DC_BASE
-        elif block_cat in (1, 2):
-            ctx_base = CBF_LUMA_AC_BASE
-        elif block_cat == 3:
-            ctx_base = CBF_CHROMA_DC_BASE
-        else:
-            ctx_base = CBF_CHROMA_AC_BASE
+        ctx_base = CBF_BASE.get(block_cat, 89)
 
-    # Context increment based on neighbors (condTermFlagA + condTermFlagB)
-    # If neighbor unavailable, treat as 0
+    # Context increment: condTermFlagA + 2 * condTermFlagB (H.264 9.3.3.1.1.9)
     cond_a = 1 if (left_available and left_cbf) else 0
     cond_b = 1 if (top_available and top_cbf) else 0
-    ctx_inc = cond_a + cond_b
+    ctx_inc = cond_a + 2 * cond_b
 
     return ctx_base + ctx_inc

@@ -78,11 +78,12 @@ class CABACDecoder:
         reader: BitReader for input stream
     """
 
-    def __init__(self, reader: 'BitReader'):
+    def __init__(self, reader: 'BitReader', trace: bool = False):
         """Initialize decoder from bitstream.
 
         Args:
             reader: BitReader positioned at start of CABAC data
+            trace: If True, record bin decisions for debugging
         """
         self.reader = reader
 
@@ -91,6 +92,11 @@ class CABACDecoder:
 
         # Read initial 9 bits for codIOffset
         self.codIOffset = reader.read_bits(9)
+
+        # Optional bin trace for debugging
+        self._trace_enabled = trace
+        self._trace: list = []
+        self._trace_ctx: list = []
 
     def decode_decision(self, ctx: 'CABACContext') -> int:
         """Decode one bin using context-based arithmetic decoding.
@@ -103,6 +109,9 @@ class CABACDecoder:
         Returns:
             Decoded bin value (0 or 1)
         """
+        old_ps = ctx.pStateIdx
+        old_mps = ctx.valMPS
+
         # Get range index for table lookup
         q_cod_i_range_idx = (self.codIRange >> 6) & 3
 
@@ -134,6 +143,10 @@ class CABACDecoder:
         # Renormalize
         self.renormalize()
 
+        if self._trace_enabled:
+            self._trace.append(f"D {bin_val} ps={old_ps} mps={old_mps} R={self.codIRange}")
+            self._trace_ctx.append(('D', bin_val, old_ps, old_mps, self.codIRange))
+
         return bin_val
 
     def decode_bypass(self) -> int:
@@ -150,9 +163,13 @@ class CABACDecoder:
         if self.codIOffset >= self.codIRange:
             # Decode 1
             self.codIOffset -= self.codIRange
+            if self._trace_enabled:
+                self._trace.append(f"B 1")
             return 1
         else:
             # Decode 0
+            if self._trace_enabled:
+                self._trace.append(f"B 0")
             return 0
 
     def decode_terminate(self) -> int:
@@ -168,10 +185,14 @@ class CABACDecoder:
 
         if self.codIOffset >= self.codIRange:
             # End of slice
+            if self._trace_enabled:
+                self._trace.append(f"T 1")
             return 1
         else:
             # Not end, renormalize
             self.renormalize()
+            if self._trace_enabled:
+                self._trace.append(f"T 0")
             return 0
 
     def renormalize(self) -> None:

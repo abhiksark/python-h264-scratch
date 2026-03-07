@@ -304,13 +304,13 @@ class TestCBPLumaNeighborContext:
     condTermFlag = 0 if neighbor block HAS coded coeffs
     """
 
-    def test_cbp_luma_unavailable_neighbors_use_ctx_inc_3(self):
-        """Block 0 with unavailable neighbors should use ctx_inc=3.
+    def test_cbp_luma_unavailable_neighbors_use_ctx_inc_0(self):
+        """Block 0 with unavailable neighbors should use ctx_inc=0.
 
         When left_cbp=-1 and top_cbp=-1 (unavailable):
-        - condTermFlagA = 1 (unavailable)
-        - condTermFlagB = 1 (unavailable)
-        - ctx_inc = 1 + 2*1 = 3
+        - condTermFlagA = 0 (unavailable, H.264 Section 9.3.3.1.1.3)
+        - condTermFlagB = 0 (unavailable)
+        - ctx_inc = 0 + 2*0 = 0
         """
         from entropy.cabac_context import (
             CTX_CODED_BLOCK_PATTERN_START,
@@ -323,8 +323,8 @@ class TestCBPLumaNeighborContext:
 
         decode_cbp_luma(decoder, contexts, mb_type=0, left_cbp=-1, top_cbp=-1)
 
-        # Block 0: ctx_inc = 1 + 2*1 = 3 (both unavailable)
-        expected_ctx_idx_block0 = CTX_CODED_BLOCK_PATTERN_START + 3
+        # Block 0: ctx_inc = 0 + 2*0 = 0 (both unavailable → condTermFlag=0)
+        expected_ctx_idx_block0 = CTX_CODED_BLOCK_PATTERN_START + 0
         assert decoder.context_indices_used[0] is contexts[expected_ctx_idx_block0]
 
     def test_cbp_luma_left_neighbor_has_coded_coeffs(self):
@@ -333,8 +333,8 @@ class TestCBPLumaNeighborContext:
         left_cbp=0x02 means block 1 of left MB has coded coeffs.
         Block 0's left neighbor is block 1 of left MB.
         - condTermFlagA = 0 (left has coeffs, bit 1 set)
-        - condTermFlagB = 1 (top unavailable)
-        - ctx_inc = 0 + 2*1 = 2
+        - condTermFlagB = 0 (top unavailable, H.264 Section 9.3.3.1.1.3)
+        - ctx_inc = 0 + 2*0 = 0
         """
         from entropy.cabac_context import (
             CTX_CODED_BLOCK_PATTERN_START,
@@ -348,9 +348,9 @@ class TestCBPLumaNeighborContext:
         # left_cbp=0x02: block 1 of left MB has coded coeffs
         decode_cbp_luma(decoder, contexts, mb_type=0, left_cbp=0x02, top_cbp=-1)
 
-        # Block 0: condTermFlagA=0 (left has coeffs), condTermFlagB=1 (unavailable)
-        # ctx_inc = 0 + 2*1 = 2
-        expected_ctx_idx_block0 = CTX_CODED_BLOCK_PATTERN_START + 2
+        # Block 0: condTermFlagA=0 (left has coeffs), condTermFlagB=0 (unavailable)
+        # ctx_inc = 0 + 2*0 = 0
+        expected_ctx_idx_block0 = CTX_CODED_BLOCK_PATTERN_START + 0
         assert decoder.context_indices_used[0] is contexts[expected_ctx_idx_block0]
 
     def test_cbp_luma_left_neighbor_no_coded_coeffs(self):
@@ -358,8 +358,8 @@ class TestCBPLumaNeighborContext:
 
         left_cbp=0x00 means block 1 of left MB has NO coded coeffs.
         - condTermFlagA = 1 (left has no coeffs)
-        - condTermFlagB = 1 (top unavailable)
-        - ctx_inc = 1 + 2*1 = 3
+        - condTermFlagB = 0 (top unavailable, H.264 Section 9.3.3.1.1.3)
+        - ctx_inc = 1 + 2*0 = 1
         """
         from entropy.cabac_context import (
             CTX_CODED_BLOCK_PATTERN_START,
@@ -373,9 +373,9 @@ class TestCBPLumaNeighborContext:
         # left_cbp=0x00: block 1 of left MB has NO coded coeffs (bit 1 not set)
         decode_cbp_luma(decoder, contexts, mb_type=0, left_cbp=0x00, top_cbp=-1)
 
-        # Block 0: condTermFlagA=1 (no coeffs), condTermFlagB=1 (unavailable)
-        # ctx_inc = 1 + 2*1 = 3
-        expected_ctx_idx_block0 = CTX_CODED_BLOCK_PATTERN_START + 3
+        # Block 0: condTermFlagA=1 (no coeffs), condTermFlagB=0 (unavailable)
+        # ctx_inc = 1 + 2*0 = 1
+        expected_ctx_idx_block0 = CTX_CODED_BLOCK_PATTERN_START + 1
         assert decoder.context_indices_used[0] is contexts[expected_ctx_idx_block0]
 
     def test_cbp_luma_top_neighbor_has_coded_coeffs(self):
@@ -383,9 +383,9 @@ class TestCBPLumaNeighborContext:
 
         top_cbp=0x04 means block 2 of top MB has coded coeffs.
         Block 0's top neighbor is block 2 of top MB.
-        - condTermFlagA = 1 (left unavailable)
-        - condTermFlagB = 0 (top has coeffs, bit 2 set)
-        - ctx_inc = 1 + 2*0 = 1
+        cond_a = 0 (left unavailable → 0)
+        cond_b = !(0x04 & 0x04) = 0 (top has coeffs)
+        ctx_inc = 0 + 2*0 = 0
         """
         from entropy.cabac_context import (
             CTX_CODED_BLOCK_PATTERN_START,
@@ -399,9 +399,9 @@ class TestCBPLumaNeighborContext:
         # top_cbp=0x04: block 2 of top MB has coded coeffs
         decode_cbp_luma(decoder, contexts, mb_type=0, left_cbp=-1, top_cbp=0x04)
 
-        # Block 0: condTermFlagA=1 (unavailable), condTermFlagB=0 (top has coeffs)
-        # ctx_inc = 1 + 2*0 = 1
-        expected_ctx_idx_block0 = CTX_CODED_BLOCK_PATTERN_START + 1
+        # Block 0: cond_a=0 (unavailable), cond_b=0 (top bit set)
+        # ctx_inc = 0 + 2*0 = 0
+        expected_ctx_idx_block0 = CTX_CODED_BLOCK_PATTERN_START + 0
         assert decoder.context_indices_used[0] is contexts[expected_ctx_idx_block0]
 
     def test_cbp_luma_both_neighbors_have_coded_coeffs(self):
@@ -527,13 +527,13 @@ class TestCBPChromaNeighborContext:
     Second bin (if first=1): 1 vs 2
     """
 
-    def test_cbp_chroma_unavailable_neighbors_use_ctx_inc_3(self):
-        """Unavailable neighbors should use ctx_inc=3 for first bin.
+    def test_cbp_chroma_unavailable_neighbors_use_ctx_inc_0(self):
+        """Unavailable neighbors should use ctx_inc=0 for first bin.
 
         When left_cbp_chroma=-1 and top_cbp_chroma=-1:
-        - condTermFlagA = 1 (unavailable)
-        - condTermFlagB = 1 (unavailable)
-        - ctx_inc = 1 + 2*1 = 3
+        - condTermFlagA = 0 (unavailable)
+        - condTermFlagB = 0 (unavailable)
+        - ctx_inc = 0 + 2*0 = 0
         """
         from entropy.cabac_context import (
             CTX_CODED_BLOCK_PATTERN_START,
@@ -549,15 +549,15 @@ class TestCBPChromaNeighborContext:
             decoder, contexts, mb_type=0, left_cbp_chroma=-1, top_cbp_chroma=-1
         )
 
-        # First bin: ctx_base + 4 + ctx_inc = 73 + 4 + 3 = 80
-        expected_ctx_idx = CTX_CODED_BLOCK_PATTERN_START + 4 + 3
+        # First bin: ctx_base + 4 + ctx_inc = 73 + 4 + 0 = 77
+        expected_ctx_idx = CTX_CODED_BLOCK_PATTERN_START + 4 + 0
         assert decoder.context_indices_used[0] is contexts[expected_ctx_idx]
 
     def test_cbp_chroma_left_neighbor_has_nonzero_cbp(self):
         """Left neighbor with non-zero chroma CBP.
 
         left_cbp_chroma=1 means left has DC chroma coeffs.
-        - condTermFlagA = 0 (left has non-zero cbp)
+        - condTermFlagA = 1 (left has non-zero cbp)
         """
         from entropy.cabac_context import (
             CTX_CODED_BLOCK_PATTERN_START,
@@ -572,16 +572,16 @@ class TestCBPChromaNeighborContext:
             decoder, contexts, mb_type=0, left_cbp_chroma=1, top_cbp_chroma=-1
         )
 
-        # condTermFlagA = 0 (left > 0), condTermFlagB = 1 (unavailable)
-        # ctx_inc = 0 + 2*1 = 2
-        expected_ctx_idx = CTX_CODED_BLOCK_PATTERN_START + 4 + 2
+        # condTermFlagA = 1 (left > 0), condTermFlagB = 0 (unavailable)
+        # ctx_inc = 1 + 2*0 = 1
+        expected_ctx_idx = CTX_CODED_BLOCK_PATTERN_START + 4 + 1
         assert decoder.context_indices_used[0] is contexts[expected_ctx_idx]
 
     def test_cbp_chroma_top_neighbor_has_nonzero_cbp(self):
         """Top neighbor with non-zero chroma CBP.
 
         top_cbp_chroma=2 means top has DC+AC chroma coeffs.
-        - condTermFlagB = 0 (top has non-zero cbp)
+        - condTermFlagB = 1 (top has non-zero cbp)
         """
         from entropy.cabac_context import (
             CTX_CODED_BLOCK_PATTERN_START,
@@ -596,18 +596,18 @@ class TestCBPChromaNeighborContext:
             decoder, contexts, mb_type=0, left_cbp_chroma=-1, top_cbp_chroma=2
         )
 
-        # condTermFlagA = 1 (unavailable), condTermFlagB = 0 (top > 0)
-        # ctx_inc = 1 + 2*0 = 1
-        expected_ctx_idx = CTX_CODED_BLOCK_PATTERN_START + 4 + 1
+        # condTermFlagA = 0 (unavailable), condTermFlagB = 1 (top > 0)
+        # ctx_inc = 0 + 2*1 = 2
+        expected_ctx_idx = CTX_CODED_BLOCK_PATTERN_START + 4 + 2
         assert decoder.context_indices_used[0] is contexts[expected_ctx_idx]
 
     def test_cbp_chroma_both_neighbors_have_zero_cbp(self):
         """Both neighbors with zero chroma CBP.
 
         left_cbp_chroma=0 and top_cbp_chroma=0.
-        - condTermFlagA = 1 (left == 0)
-        - condTermFlagB = 1 (top == 0)
-        - ctx_inc = 1 + 2*1 = 3
+        - condTermFlagA = 0 (left == 0)
+        - condTermFlagB = 0 (top == 0)
+        - ctx_inc = 0 + 2*0 = 0
         """
         from entropy.cabac_context import (
             CTX_CODED_BLOCK_PATTERN_START,
@@ -623,12 +623,12 @@ class TestCBPChromaNeighborContext:
         )
 
         # Both neighbors have cbp=0
-        # ctx_inc = 1 + 2*1 = 3
-        expected_ctx_idx = CTX_CODED_BLOCK_PATTERN_START + 4 + 3
+        # ctx_inc = 0 + 2*0 = 0
+        expected_ctx_idx = CTX_CODED_BLOCK_PATTERN_START + 4 + 0
         assert decoder.context_indices_used[0] is contexts[expected_ctx_idx]
 
     def test_cbp_chroma_both_neighbors_have_nonzero_cbp(self):
-        """Both neighbors with non-zero chroma CBP uses ctx_inc=0."""
+        """Both neighbors with non-zero chroma CBP uses ctx_inc=3."""
         from entropy.cabac_context import (
             CTX_CODED_BLOCK_PATTERN_START,
             init_context_models,
@@ -643,8 +643,8 @@ class TestCBPChromaNeighborContext:
         )
 
         # Both neighbors have cbp > 0
-        # ctx_inc = 0 + 2*0 = 0
-        expected_ctx_idx = CTX_CODED_BLOCK_PATTERN_START + 4 + 0
+        # ctx_inc = 1 + 2*1 = 3
+        expected_ctx_idx = CTX_CODED_BLOCK_PATTERN_START + 4 + 3
         assert decoder.context_indices_used[0] is contexts[expected_ctx_idx]
 
     def test_cbp_chroma_second_bin_context_derivation(self):
@@ -668,10 +668,10 @@ class TestCBPChromaNeighborContext:
             decoder, contexts, mb_type=0, left_cbp_chroma=2, top_cbp_chroma=1
         )
 
-        # Second bin: condTermFlagA = 0 (left > 1), condTermFlagB = 1 (top not > 1)
-        # ctx_inc = 0 + 2*1 = 2
-        # Second bin uses ctx_base + 4 + 4 + ctx_inc = 73 + 4 + 4 + 2 = 83
-        expected_ctx_idx_bin2 = CTX_CODED_BLOCK_PATTERN_START + 4 + 4 + 2
+        # Second bin: condTermFlagA = 1 (left == 2), condTermFlagB = 0 (top != 2)
+        # ctx_inc = 1 + 2*0 = 1
+        # Second bin uses ctx_base + 4 + 4 + ctx_inc = 73 + 4 + 4 + 1 = 82
+        expected_ctx_idx_bin2 = CTX_CODED_BLOCK_PATTERN_START + 4 + 4 + 1
         assert decoder.context_indices_used[1] is contexts[expected_ctx_idx_bin2]
 
     def test_cbp_chroma_returns_0_when_first_bin_0(self):

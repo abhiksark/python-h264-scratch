@@ -194,6 +194,8 @@ class DecoderState:
     mb_coeffs: Optional[np.ndarray] = None  # Has non-zero coeffs per 4x4 block
     mb_cbps: Optional[np.ndarray] = None  # CBP per MB for CABAC context
     mb_qps: Optional[np.ndarray] = None  # Per-MB QP values
+    mb_chroma_modes: Optional[np.ndarray] = None  # Chroma pred mode per MB for CABAC
+    mb_qp_deltas: Optional[np.ndarray] = None  # QP delta per MB for CABAC context
 
     # Slice tracking for multiple slice support
     mb_slice_ids: Optional[np.ndarray] = None  # Which slice each MB belongs to
@@ -275,6 +277,13 @@ class DecoderState:
         self.mb_qps = np.zeros(mb_count, dtype=np.int32)
         # CBP per MB for CABAC neighbor context
         self.mb_cbps = np.zeros(mb_count, dtype=np.int32)
+        # Chroma pred mode per MB for CABAC neighbor context
+        self.mb_chroma_modes = np.zeros(mb_count, dtype=np.int32)
+        # QP delta per MB for CABAC context
+        self.mb_qp_deltas = np.zeros(mb_count, dtype=np.int32)
+        # DC coded_block_flag per MB for CABAC context
+        # [0]=luma DC, [1]=Cb DC, [2]=Cr DC
+        self.mb_dc_cbf = np.zeros((mb_count, 3), dtype=np.int32)
 
         # Slice tracking
         self.mb_slice_ids = np.zeros(mb_count, dtype=np.int32)
@@ -2243,11 +2252,15 @@ class H264Decoder:
         """
         mb_idx = mb_y * mb_width + mb_x
 
-        # Get neighbor MB types and CBPs
+        # Get neighbor MB types, CBPs, chroma modes, qp deltas
         left_mb_type = None
         top_mb_type = None
         left_cbp = -1  # -1 = unavailable
         top_cbp = -1
+        left_chroma_mode = 0
+        top_chroma_mode = 0
+        left_qp_delta = 0
+        top_qp_delta = 0
 
         if mb_x > 0 and self.state.mb_types is not None:
             left_idx = mb_idx - 1
@@ -2255,6 +2268,10 @@ class H264Decoder:
                 left_mb_type = self.state.mb_types[left_idx]
                 if self.state.mb_cbps is not None:
                     left_cbp = int(self.state.mb_cbps[left_idx])
+                if self.state.mb_chroma_modes is not None:
+                    left_chroma_mode = int(self.state.mb_chroma_modes[left_idx])
+                if self.state.mb_qp_deltas is not None:
+                    left_qp_delta = int(self.state.mb_qp_deltas[left_idx])
 
         if mb_y > 0 and self.state.mb_types is not None:
             top_idx = mb_idx - mb_width
@@ -2262,6 +2279,36 @@ class H264Decoder:
                 top_mb_type = self.state.mb_types[top_idx]
                 if self.state.mb_cbps is not None:
                     top_cbp = int(self.state.mb_cbps[top_idx])
+                if self.state.mb_chroma_modes is not None:
+                    top_chroma_mode = int(self.state.mb_chroma_modes[top_idx])
+                if self.state.mb_qp_deltas is not None:
+                    top_qp_delta = int(self.state.mb_qp_deltas[top_idx])
+
+        # Determine prev_mb_qp_delta for context derivation (H.264 9.3.3.1.1.10)
+        # Use left neighbor if available, otherwise 0
+        prev_mb_qp_delta = left_qp_delta if mb_x > 0 else 0
+
+        # Build per-block CBF lists for coded_block_flag context
+        # CBF = 1 if nz_count > 0, else 0
+        # Format: list[27] = [16 luma, 4 Cb AC, 4 Cr AC, luma DC, Cb DC, Cr DC]
+        left_mb_cbf = None
+        top_mb_cbf = None
+
+        if mb_x > 0 and self.state.nz_counts is not None:
+            left_idx = mb_idx - 1
+            if left_idx >= 0:
+                nz = self.state.nz_counts[left_idx]
+                left_mb_cbf = [1 if nz[i] > 0 else 0 for i in range(24)]
+                dc = self.state.mb_dc_cbf[left_idx]
+                left_mb_cbf.extend([int(dc[0]), int(dc[1]), int(dc[2])])
+
+        if mb_y > 0 and self.state.nz_counts is not None:
+            top_idx = mb_idx - mb_width
+            if top_idx >= 0:
+                nz = self.state.nz_counts[top_idx]
+                top_mb_cbf = [1 if nz[i] > 0 else 0 for i in range(24)]
+                dc = self.state.mb_dc_cbf[top_idx]
+                top_mb_cbf.extend([int(dc[0]), int(dc[1]), int(dc[2])])
 
         return {
             'mb_x': mb_x,
@@ -2273,7 +2320,12 @@ class H264Decoder:
             'top_mb_type': top_mb_type,
             'left_cbp': left_cbp,
             'top_cbp': top_cbp,
+            'left_chroma_mode': left_chroma_mode,
+            'top_chroma_mode': top_chroma_mode,
+            'prev_mb_qp_delta': prev_mb_qp_delta,
             'transform_8x8_mode_flag': getattr(pps, 'transform_8x8_mode_flag', 0),
+            'left_mb_cbf': left_mb_cbf,
+            'top_mb_cbf': top_mb_cbf,
         }
 
     def _process_cabac_macroblock(
@@ -2302,11 +2354,24 @@ class H264Decoder:
         mb_width = sps.pic_width_in_mbs
         mb_idx = mb_y * mb_width + mb_x
 
-        # Store MB type and CBP for neighbor reference
+        # Store MB type, CBP, chroma mode, and qp delta for neighbor reference
         if self.state.mb_types is not None:
             self.state.mb_types[mb_idx] = mb_data.get('mb_type', 0)
         if self.state.mb_cbps is not None:
             self.state.mb_cbps[mb_idx] = mb_data.get('cbp', 0)
+        if self.state.mb_chroma_modes is not None:
+            pred = mb_data.get('mb_pred', {})
+            self.state.mb_chroma_modes[mb_idx] = pred.get('intra_chroma_pred_mode', 0) if pred else 0
+        if self.state.mb_qp_deltas is not None:
+            self.state.mb_qp_deltas[mb_idx] = mb_data.get('mb_qp_delta', 0)
+
+        # Store DC coded_block_flag for CABAC neighbor context
+        residual = mb_data.get('residual', {})
+        mb_cbf = residual.get('_mb_cbf', None) if residual else None
+        if mb_cbf is not None and self.state.mb_dc_cbf is not None and len(mb_cbf) >= 27:
+            self.state.mb_dc_cbf[mb_idx, 0] = mb_cbf[24]  # luma DC
+            self.state.mb_dc_cbf[mb_idx, 1] = mb_cbf[25]  # Cb DC
+            self.state.mb_dc_cbf[mb_idx, 2] = mb_cbf[26]  # Cr DC
 
         ly, lx = mb_y * 16, mb_x * 16
         cy, cx = mb_y * 8, mb_x * 8
