@@ -440,14 +440,21 @@ class H264Decoder:
     def decode_file(self, path: str):
         """Decode H.264 file and yield frames.
 
+        Supports both raw Annex B (.264, .h264) and MP4 container files.
+
         Args:
-            path: Path to Annex B bitstream file (.264, .h264)
+            path: Path to H.264 bitstream or MP4 file.
 
         Yields:
             DecodedFrame objects
         """
         with open(path, "rb") as f:
             data = f.read()
+
+        # Auto-detect MP4: ftyp box signature at offset 4
+        if len(data) >= 8 and data[4:8] == b'ftyp':
+            from container.mp4 import extract_h264_from_mp4
+            data = extract_h264_from_mp4(data)
 
         yield from self.decode_bytes(data)
 
