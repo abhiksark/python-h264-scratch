@@ -805,3 +805,34 @@ def predict_mv_8x8(
     cx, cy = mvC if c_avail else (0, 0)
 
     return _median(ax, bx, cx), _median(ay, by, cy)
+
+
+def predict_mv_partition(
+    cache: MVCache, mb_x: int, mb_y: int,
+    block_x: int, block_y: int,
+    part_width_blocks: int = 1,
+    target_ref: int = 0,
+) -> Tuple[int, int]:
+    """Predict MV for any partition at given block position.
+
+    General-purpose MV prediction using median algorithm. Works for all
+    partition types including sub-partitions within 8x8 sub-MBs (8x4, 4x8,
+    4x4).
+
+    Args:
+        cache: MV cache
+        mb_x, mb_y: Macroblock position
+        block_x, block_y: Top-left 4x4 block within MB (0-3)
+        part_width_blocks: Partition width in 4x4 blocks (1 or 2)
+        target_ref: Reference index
+
+    Returns:
+        Predicted (mvx, mvy)
+
+    H.264 Spec: Section 8.4.1.3.1
+    """
+    return _predict_mv_median(
+        cache, mb_x, mb_y, block_x, block_y,
+        part_width_blocks=part_width_blocks,
+        target_ref=target_ref,
+    )

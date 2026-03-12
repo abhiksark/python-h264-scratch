@@ -186,31 +186,60 @@ def decode_mvd(
     decoder: 'CABACDecoder',
     contexts: List['CABACContext'],
     comp: int,
+    ctx_inc_bin0: int = 0,
 ) -> int:
     """Decode motion vector difference component.
 
-    Uses UEG3 binarization with sign.
+    Uses UEG3 binarization with sign. Context assignment per H.264 Table 9-34:
+    - bin0: ctxBase + ctx_inc_bin0 (neighbor-dependent, 0-2)
+    - bin1: ctxBase + 3
+    - bin2: ctxBase + 4
+    - bin3: ctxBase + 5
+    - bin4+: ctxBase + 6
 
     Args:
         decoder: CABAC arithmetic decoder
         contexts: List of context models
         comp: Component (0=x, 1=y)
+        ctx_inc_bin0: Context increment for bin0 from neighbor MVDs (0-2)
 
     Returns:
         Signed MVD value
     """
-    # Context base depends on component
     ctx_base = CTX_MVD_X_BASE if comp == 0 else CTX_MVD_Y_BASE
 
-    # Decode absolute value using UEGk with k=3
-    abs_val = decode_uegk(decoder, k=3, ctx_base=ctx_base, contexts=contexts, uCoff=9)
-
-    if abs_val == 0:
+    # Bin 0: nonzero check with neighbor-dependent context
+    ctx_idx = ctx_base + ctx_inc_bin0
+    if decoder.decode_decision(contexts[ctx_idx]) == 0:
         return 0
 
-    # Decode sign using bypass
-    sign_flag = decoder.decode_bypass()
+    # Bins 1+: UEGk magnitude decode with spec-correct context offsets
+    # H.264 Table 9-34: binIdx 1→3, 2→4, 3→5, 4+→6
+    abs_val = 1
+    uCoff = 9
 
+    for bin_idx in range(1, uCoff):
+        ctx_inc = 3 + min(bin_idx - 1, 3)  # 3,4,5,6,6,6,...
+        ctx_idx = ctx_base + ctx_inc
+        if decoder.decode_decision(contexts[ctx_idx]) == 0:
+            break
+        abs_val += 1
+    else:
+        # All prefix bins were 1 → decode suffix via bypass (EGk, k=3)
+        suffix = 0
+        suffix_len = 3
+
+        while decoder.decode_bypass() == 1:
+            suffix_len += 1
+
+        for _ in range(suffix_len):
+            suffix = (suffix << 1) | decoder.decode_bypass()
+
+        suffix += (1 << suffix_len) - (1 << 3)
+        abs_val = uCoff + suffix
+
+    # Sign via bypass
+    sign_flag = decoder.decode_bypass()
     return decode_signed_value(abs_val, sign_flag)
 
 

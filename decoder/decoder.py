@@ -58,6 +58,7 @@ from inter.mv_prediction import (
     predict_mv_16x8,
     predict_mv_8x16,
     predict_mv_8x8,
+    predict_mv_partition,
 )
 from inter.p_macroblock import parse_p_mb_type, parse_sub_mb_type, PMacroblockInfo
 from inter.p_reconstruct import (
@@ -71,6 +72,9 @@ from inter.p_reconstruct import (
     reconstruct_p_8x16_weighted,
     reconstruct_p_8x8,
     reconstruct_p_8x8_weighted,
+    reconstruct_p_8x8_sub,
+    apply_chroma_prediction,
+    apply_inter_prediction,
 )
 from inter.b_macroblock import (
     parse_b_mb_type,
@@ -197,6 +201,10 @@ class DecoderState:
     mb_chroma_modes: Optional[np.ndarray] = None  # Chroma pred mode per MB for CABAC
     mb_qp_deltas: Optional[np.ndarray] = None  # QP delta per MB for CABAC context
 
+    # Per-MB MVD values per 4x4 block for CABAC MVD context (H.264 9.3.3.1.1.7)
+    mb_mvds_l0: Optional[np.ndarray] = None  # Shape: (mb_count, 4, 4, 2)
+    mb_mvds_l1: Optional[np.ndarray] = None  # Shape: (mb_count, 4, 4, 2)
+
     # Slice tracking for multiple slice support
     mb_slice_ids: Optional[np.ndarray] = None  # Which slice each MB belongs to
     current_slice_id: int = 0  # Current slice being decoded
@@ -284,6 +292,17 @@ class DecoderState:
         # DC coded_block_flag per MB for CABAC context
         # [0]=luma DC, [1]=Cb DC, [2]=Cr DC
         self.mb_dc_cbf = np.zeros((mb_count, 3), dtype=np.int32)
+        # MB skip flags for CABAC skip context derivation
+        self.mb_skip_flags = np.zeros(mb_count, dtype=np.int32)
+        # Raw CABAC mb_type per MB (preserved for CABAC context derivation).
+        # Unlike mb_types (overwritten to 99 for deblocking), this keeps the
+        # original decoded value so neighbor lookups get correct condTermFlags.
+        self.cabac_mb_types = np.zeros(mb_count, dtype=np.int32)
+
+        # Per-MB MVD values per 4x4 block for CABAC MVD context derivation
+        # Shape: (mb_count, 4, 4, 2) → [mb_idx, blk_row, blk_col, comp]
+        self.mb_mvds_l0 = np.zeros((mb_count, 4, 4, 2), dtype=np.int32)
+        self.mb_mvds_l1 = np.zeros((mb_count, 4, 4, 2), dtype=np.int32)
 
         # Slice tracking
         self.mb_slice_ids = np.zeros(mb_count, dtype=np.int32)
@@ -2162,12 +2181,26 @@ class H264Decoder:
 
         logger.debug(f"Decoding CABAC slice: {total_mbs} MBs, type={slice_type}")
 
+        # Store slice header for B-frame motion compensation access
+        self.state.current_slice_header = slice_header
+
         # Build reference lists for P/B slices
-        if is_b_slice:
+        if is_p_slice:
+            max_frame_num = getattr(sps, 'max_frame_num', 256)
+            mod_l0 = getattr(slice_header, 'ref_pic_list_modification_l0', None)
+            self.state.ref_buffer.build_p_slice_ref_list(
+                slice_header.frame_num, max_frame_num, mod_l0
+            )
+        elif is_b_slice:
             self._build_b_slice_ref_lists(slice_header)
 
         current_qp = slice_qp
         mb_idx = slice_header.first_mb_in_slice
+
+        # Reset intra prediction modes at start of new frame
+        # Prevents stale modes from previous frames influencing MPM
+        if mb_idx == 0 and self.state.intra_modes is not None:
+            self.state.intra_modes[:] = 2
 
         while mb_idx < total_mbs:
             mb_x = mb_idx % mb_width
@@ -2175,6 +2208,16 @@ class H264Decoder:
 
             # Build neighbor info for context derivation
             mb_info = self._build_cabac_mb_info(mb_x, mb_y, mb_width, sps, pps)
+
+            # Add reference count info for P/B slices
+            if is_p_slice or is_b_slice:
+                mb_info['num_ref_idx_l0_active'] = getattr(
+                    slice_header, 'num_ref_idx_l0_active_minus1', 0
+                ) + 1
+            if is_b_slice:
+                mb_info['num_ref_idx_l1_active'] = getattr(
+                    slice_header, 'num_ref_idx_l1_active_minus1', 0
+                ) + 1
 
             # Decode macroblock syntax using CABAC
             try:
@@ -2262,10 +2305,16 @@ class H264Decoder:
         left_qp_delta = 0
         top_qp_delta = 0
 
-        if mb_x > 0 and self.state.mb_types is not None:
+        # Use cabac_mb_types for CABAC context derivation (raw types,
+        # not overwritten to 99 by inter reconstruction).
+        type_array = (self.state.cabac_mb_types
+                      if self.state.cabac_mb_types is not None
+                      else self.state.mb_types)
+
+        if mb_x > 0 and type_array is not None:
             left_idx = mb_idx - 1
             if left_idx >= 0:
-                left_mb_type = self.state.mb_types[left_idx]
+                left_mb_type = int(type_array[left_idx])
                 if self.state.mb_cbps is not None:
                     left_cbp = int(self.state.mb_cbps[left_idx])
                 if self.state.mb_chroma_modes is not None:
@@ -2273,10 +2322,10 @@ class H264Decoder:
                 if self.state.mb_qp_deltas is not None:
                     left_qp_delta = int(self.state.mb_qp_deltas[left_idx])
 
-        if mb_y > 0 and self.state.mb_types is not None:
+        if mb_y > 0 and type_array is not None:
             top_idx = mb_idx - mb_width
             if top_idx >= 0:
-                top_mb_type = self.state.mb_types[top_idx]
+                top_mb_type = int(type_array[top_idx])
                 if self.state.mb_cbps is not None:
                     top_cbp = int(self.state.mb_cbps[top_idx])
                 if self.state.mb_chroma_modes is not None:
@@ -2285,8 +2334,11 @@ class H264Decoder:
                     top_qp_delta = int(self.state.mb_qp_deltas[top_idx])
 
         # Determine prev_mb_qp_delta for context derivation (H.264 9.3.3.1.1.10)
-        # Use left neighbor if available, otherwise 0
-        prev_mb_qp_delta = left_qp_delta if mb_x > 0 else 0
+        # Must be the previously decoded MB in scan order (mb_idx - 1), not just left neighbor.
+        # For first MB of slice, prevMbQpDelta = 0.
+        prev_mb_qp_delta = 0
+        if mb_idx > 0 and self.state.mb_qp_deltas is not None:
+            prev_mb_qp_delta = int(self.state.mb_qp_deltas[mb_idx - 1])
 
         # Build per-block CBF lists for coded_block_flag context
         # CBF = 1 if nz_count > 0, else 0
@@ -2310,6 +2362,34 @@ class H264Decoder:
                 dc = self.state.mb_dc_cbf[top_idx]
                 top_mb_cbf.extend([int(dc[0]), int(dc[1]), int(dc[2])])
 
+        # Get neighbor skip flags for skip context derivation
+        left_skip = False
+        top_skip = False
+        if mb_x > 0 and self.state.mb_skip_flags is not None:
+            left_idx = mb_idx - 1
+            if left_idx >= 0:
+                left_skip = bool(self.state.mb_skip_flags[left_idx])
+        if mb_y > 0 and self.state.mb_skip_flags is not None:
+            top_idx = mb_idx - mb_width
+            if top_idx >= 0:
+                top_skip = bool(self.state.mb_skip_flags[top_idx])
+
+        # Get neighbor MVD arrays for MVD context derivation (H.264 9.3.3.1.1.7)
+        left_mvds_l0 = None
+        top_mvds_l0 = None
+        left_mvds_l1 = None
+        top_mvds_l1 = None
+        if mb_x > 0 and self.state.mb_mvds_l0 is not None:
+            left_idx = mb_idx - 1
+            left_mvds_l0 = self.state.mb_mvds_l0[left_idx]
+            if self.state.mb_mvds_l1 is not None:
+                left_mvds_l1 = self.state.mb_mvds_l1[left_idx]
+        if mb_y > 0 and self.state.mb_mvds_l0 is not None:
+            top_idx = mb_idx - mb_width
+            top_mvds_l0 = self.state.mb_mvds_l0[top_idx]
+            if self.state.mb_mvds_l1 is not None:
+                top_mvds_l1 = self.state.mb_mvds_l1[top_idx]
+
         return {
             'mb_x': mb_x,
             'mb_y': mb_y,
@@ -2326,6 +2406,12 @@ class H264Decoder:
             'transform_8x8_mode_flag': getattr(pps, 'transform_8x8_mode_flag', 0),
             'left_mb_cbf': left_mb_cbf,
             'top_mb_cbf': top_mb_cbf,
+            'left_skip': left_skip,
+            'top_skip': top_skip,
+            'left_mb_mvds_l0': left_mvds_l0,
+            'top_mb_mvds_l0': top_mvds_l0,
+            'left_mb_mvds_l1': left_mvds_l1,
+            'top_mb_mvds_l1': top_mvds_l1,
         }
 
     def _process_cabac_macroblock(
@@ -2354,9 +2440,12 @@ class H264Decoder:
         mb_width = sps.pic_width_in_mbs
         mb_idx = mb_y * mb_width + mb_x
 
-        # Store MB type, CBP, chroma mode, and qp delta for neighbor reference
+        # Store MB type, CBP, chroma mode, qp delta, and skip flag
         if self.state.mb_types is not None:
             self.state.mb_types[mb_idx] = mb_data.get('mb_type', 0)
+        # Preserve raw CABAC mb_type for context derivation (not overwritten)
+        if self.state.cabac_mb_types is not None:
+            self.state.cabac_mb_types[mb_idx] = mb_data.get('mb_type', 0)
         if self.state.mb_cbps is not None:
             self.state.mb_cbps[mb_idx] = mb_data.get('cbp', 0)
         if self.state.mb_chroma_modes is not None:
@@ -2364,8 +2453,13 @@ class H264Decoder:
             self.state.mb_chroma_modes[mb_idx] = pred.get('intra_chroma_pred_mode', 0) if pred else 0
         if self.state.mb_qp_deltas is not None:
             self.state.mb_qp_deltas[mb_idx] = mb_data.get('mb_qp_delta', 0)
+        if self.state.mb_skip_flags is not None:
+            self.state.mb_skip_flags[mb_idx] = mb_data.get('mb_skip_flag', 0)
 
         # Store DC coded_block_flag for CABAC neighbor context
+        # Always clear first to prevent stale values from previous frame
+        if self.state.mb_dc_cbf is not None:
+            self.state.mb_dc_cbf[mb_idx] = 0
         residual = mb_data.get('residual', {})
         mb_cbf = residual.get('_mb_cbf', None) if residual else None
         if mb_cbf is not None and self.state.mb_dc_cbf is not None and len(mb_cbf) >= 27:
@@ -2373,11 +2467,42 @@ class H264Decoder:
             self.state.mb_dc_cbf[mb_idx, 1] = mb_cbf[25]  # Cb DC
             self.state.mb_dc_cbf[mb_idx, 2] = mb_cbf[26]  # Cr DC
 
+        # Store MVD grids for CABAC neighbor context (H.264 9.3.3.1.1.7)
+        pred = mb_data.get('mb_pred', {})
+        if pred:
+            if self.state.mb_mvds_l0 is not None:
+                mvd_grid = pred.get('mvd_grid_l0')
+                if mvd_grid is not None:
+                    self.state.mb_mvds_l0[mb_idx] = mvd_grid
+                else:
+                    self.state.mb_mvds_l0[mb_idx] = 0
+            if self.state.mb_mvds_l1 is not None:
+                mvd_grid = pred.get('mvd_grid_l1')
+                if mvd_grid is not None:
+                    self.state.mb_mvds_l1[mb_idx] = mvd_grid
+                else:
+                    self.state.mb_mvds_l1[mb_idx] = 0
+        else:
+            if self.state.mb_mvds_l0 is not None:
+                self.state.mb_mvds_l0[mb_idx] = 0
+            if self.state.mb_mvds_l1 is not None:
+                self.state.mb_mvds_l1[mb_idx] = 0
+
         ly, lx = mb_y * 16, mb_x * 16
         cy, cx = mb_y * 8, mb_x * 8
 
         # Handle skip macroblock
         if mb_data.get('mb_skip_flag', 0) == 1:
+            if self.state.mb_types is not None:
+                self.state.mb_types[mb_idx] = 99  # inter sentinel for deblocking
+            if self.state.mb_qps is not None:
+                self.state.mb_qps[mb_idx] = qp  # skip uses current QP
+            # Clear nz_counts, dc_cbf, and coeffs for skip MBs (no residual)
+            self.state.nz_counts[mb_idx] = 0
+            if self.state.mb_dc_cbf is not None:
+                self.state.mb_dc_cbf[mb_idx] = 0
+            if self.state.mb_coeffs is not None:
+                self.state.mb_coeffs[mb_idx] = 0
             self._reconstruct_skip_mb_cabac(mb_x, mb_y, slice_type)
             return
 
@@ -2436,11 +2561,13 @@ class H264Decoder:
                 mb_y=mb_y,
             )
         else:  # B-skip
-            use_spatial = True
-            current_poc = 0
+            sh = getattr(self.state, 'current_slice_header', None)
+            use_spatial = getattr(sh, 'direct_spatial_mv_pred_flag', True)
+            current_poc = getattr(sh, 'pic_order_cnt_lsb', 0)
             luma, cb, cr = reconstruct_b_skip(
                 ref_buffer=self.state.ref_buffer,
                 mv_cache=self.state.mv_cache,
+                mv_cache_l1=getattr(self.state, 'mv_cache_l1', None),
                 mb_x=mb_x,
                 mb_y=mb_y,
                 use_spatial=use_spatial,
@@ -2859,6 +2986,12 @@ class H264Decoder:
         if self.state.mb_coeffs is not None:
             self.state.mb_coeffs[mb_idx, :16] = nz_counts[:16] > 0
 
+        # Mark intra in MV cache so neighbors see ref=-1 (not unavailable)
+        if self.state.mv_cache is not None:
+            self.state.mv_cache.mark_intra(mb_x, mb_y)
+        if self.state.mv_cache_l1 is not None:
+            self.state.mv_cache_l1.mark_intra(mb_x, mb_y)
+
     def _reconstruct_inter_mb_cabac(
         self,
         cabac: 'CABACDecoder',
@@ -2873,10 +3006,992 @@ class H264Decoder:
     ) -> None:
         """Reconstruct an inter macroblock decoded with CABAC.
 
-        For now, uses skip reconstruction as placeholder.
+        Uses pre-parsed syntax from decode_macroblock_layer_cabac:
+        mb_data contains mb_type, mb_pred (ref_idx, MVD), cbp, residual.
+
+        Args:
+            cabac: CABAC decoder (not used - syntax already parsed)
+            contexts: Context models (not used)
+            mb_data: Pre-parsed MB syntax
+            mb_x, mb_y: Macroblock position
+            qp: Current QP (before mb_qp_delta)
+            sps, pps: Parameter sets
+            slice_type: 0=P, 1=B
         """
-        # Use skip reconstruction as fallback
-        self._reconstruct_skip_mb_cabac(mb_x, mb_y, slice_type)
+        from dequant.dequant import get_chroma_qp
+
+        mb_width = sps.pic_width_in_mbs
+        mb_idx = mb_y * mb_width + mb_x
+        ly, lx = mb_y * 16, mb_x * 16
+        cy, cx = mb_y * 8, mb_x * 8
+
+        mb_type = mb_data['mb_type']
+        mb_pred = mb_data.get('mb_pred', {})
+        residual = mb_data.get('residual', {})
+        cbp = mb_data.get('cbp', 0)
+        cbp_luma = cbp & 0x0F
+        cbp_chroma = (cbp >> 4) & 0x03
+
+        # Apply QP delta
+        mb_qp_delta = mb_data.get('mb_qp_delta', 0)
+        current_qp = (qp + mb_qp_delta + 52) % 52
+
+        # --- Motion compensation ---
+        if slice_type == 0:
+            luma_pred, cb_pred, cr_pred = self._cabac_p_motion_comp(
+                mb_type, mb_pred, mb_x, mb_y
+            )
+        else:
+            luma_pred, cb_pred, cr_pred = self._cabac_b_motion_comp(
+                mb_type, mb_pred, mb_x, mb_y
+            )
+
+        # --- Luma residual ---
+        nz_counts = np.zeros(24, dtype=np.int32)
+        luma_residual = np.zeros((16, 16), dtype=np.int32)
+
+        luma_4x4_raw = residual.get('luma_4x4', [None] * 16)
+        for block_idx in range(16):
+            block_8x8_idx = block_idx // 4
+            if not (cbp_luma & (1 << block_8x8_idx)):
+                continue
+            coeffs_raw = luma_4x4_raw[block_idx]
+            if coeffs_raw is None:
+                continue
+            coeffs_arr = np.asarray(coeffs_raw, dtype=np.int32)
+            nz_counts[block_idx] = int(np.count_nonzero(coeffs_arr))
+            if nz_counts[block_idx] > 0:
+                coeffs_2d = np.zeros((4, 4), dtype=np.int32)
+                for scan_idx in range(16):
+                    raster_pos = ZIGZAG_4x4[scan_idx]
+                    r, c = raster_pos // 4, raster_pos % 4
+                    coeffs_2d[r, c] = coeffs_arr[scan_idx]
+                dequant = dequant_4x4(coeffs_2d, current_qp)
+                block_residual = idct_4x4(dequant)
+                row, col = BLOCK_SCAN_ORDER[block_idx]
+                luma_residual[row:row+4, col:col+4] = block_residual
+
+        # --- Chroma residual ---
+        chroma_qp_offset = getattr(pps, 'chroma_qp_index_offset', 0)
+        qpi = max(0, min(51, current_qp + chroma_qp_offset))
+        qp_chroma = get_chroma_qp(qpi)
+
+        cb_residual = self._cabac_chroma_residual(
+            residual, 'cb', cbp_chroma, qp_chroma, nz_counts, 16
+        )
+        cr_residual = self._cabac_chroma_residual(
+            residual, 'cr', cbp_chroma, qp_chroma, nz_counts, 20
+        )
+
+        # --- Combine prediction + residual ---
+        luma = np.clip(
+            luma_pred.astype(np.int32) + luma_residual, 0, 255
+        ).astype(np.uint8)
+        cb = np.clip(
+            cb_pred.astype(np.int32) + cb_residual, 0, 255
+        ).astype(np.uint8)
+        cr = np.clip(
+            cr_pred.astype(np.int32) + cr_residual, 0, 255
+        ).astype(np.uint8)
+
+        self.state.frame_luma[ly:ly+16, lx:lx+16] = luma
+        self.state.frame_cb[cy:cy+8, cx:cx+8] = cb
+        self.state.frame_cr[cy:cy+8, cx:cx+8] = cr
+
+        # --- Store metadata ---
+        self.state.nz_counts[mb_idx] = nz_counts
+        if self.state.mb_types is not None:
+            self.state.mb_types[mb_idx] = 99  # Non-intra sentinel
+        if self.state.mb_qps is not None:
+            self.state.mb_qps[mb_idx] = current_qp
+        if self.state.mb_coeffs is not None:
+            self.state.mb_coeffs[mb_idx, :16] = (nz_counts[:16] > 0)
+
+    def _cabac_p_motion_comp(
+        self, mb_type: int, mb_pred: dict, mb_x: int, mb_y: int,
+    ) -> tuple:
+        """P-slice motion compensation from pre-parsed CABAC syntax."""
+        ref_idx_l0 = mb_pred.get('ref_idx_l0', [])
+        mvd_l0 = mb_pred.get('mvd_l0', [])
+        sub_types = mb_pred.get('sub_mb_types', [])
+
+        if mb_type == 0:  # P_L0_16x16
+            ref = ref_idx_l0[0] if ref_idx_l0 else 0
+            mvd = mvd_l0[0] if mvd_l0 else (0, 0)
+            mvp_x, mvp_y = predict_mv_16x16(
+                self.state.mv_cache, mb_x, mb_y, target_ref=ref,
+            )
+            mvx, mvy = mvp_x + mvd[0], mvp_y + mvd[1]
+            if self.state.mv_cache is not None:
+                self.state.mv_cache.set_mv_16x16(mb_x, mb_y, mvx, mvy, ref_idx=ref)
+            return reconstruct_p_16x16(
+                ref_buffer=self.state.ref_buffer, ref_idx=ref,
+                mvx=mvx, mvy=mvy,
+                residual_luma=None, residual_cb=None, residual_cr=None,
+                mb_x=mb_x, mb_y=mb_y,
+            )
+
+        elif mb_type == 1:  # P_L0_L0_16x8
+            refs = [ref_idx_l0[i] if i < len(ref_idx_l0) else 0 for i in range(2)]
+            mvds = [mvd_l0[i] if i < len(mvd_l0) else (0, 0) for i in range(2)]
+            mvxs, mvys = [], []
+            for part in range(2):
+                mvp_x, mvp_y = predict_mv_16x8(
+                    self.state.mv_cache, mb_x, mb_y, part, target_ref=refs[part],
+                )
+                mvxs.append(mvp_x + mvds[part][0])
+                mvys.append(mvp_y + mvds[part][1])
+                self.state.mv_cache.set_mv_16x8(
+                    mb_x, mb_y, part, mvxs[part], mvys[part], ref_idx=refs[part],
+                )
+            return reconstruct_p_16x8(
+                ref_buffer=self.state.ref_buffer,
+                mv_cache=self.state.mv_cache,
+                ref_idx=refs, mvx=mvxs, mvy=mvys,
+                residual_luma=None, residual_cb=None, residual_cr=None,
+                mb_x=mb_x, mb_y=mb_y,
+            )
+
+        elif mb_type == 2:  # P_L0_L0_8x16
+            refs = [ref_idx_l0[i] if i < len(ref_idx_l0) else 0 for i in range(2)]
+            mvds = [mvd_l0[i] if i < len(mvd_l0) else (0, 0) for i in range(2)]
+            mvxs, mvys = [], []
+            for part in range(2):
+                mvp_x, mvp_y = predict_mv_8x16(
+                    self.state.mv_cache, mb_x, mb_y, part, target_ref=refs[part],
+                )
+                mvxs.append(mvp_x + mvds[part][0])
+                mvys.append(mvp_y + mvds[part][1])
+                self.state.mv_cache.set_mv_8x16(
+                    mb_x, mb_y, part, mvxs[part], mvys[part], ref_idx=refs[part],
+                )
+            return reconstruct_p_8x16(
+                ref_buffer=self.state.ref_buffer,
+                mv_cache=self.state.mv_cache,
+                ref_idx=refs, mvx=mvxs, mvy=mvys,
+                residual_luma=None, residual_cb=None, residual_cr=None,
+                mb_x=mb_x, mb_y=mb_y,
+            )
+
+        elif mb_type in (3, 4):  # P_8x8, P_8x8ref0
+            refs = [ref_idx_l0[i] if i < len(ref_idx_l0) else 0 for i in range(4)]
+
+            # Sub-partition definitions: (block_offset, part_width_4x4, coverage)
+            _sp = {
+                0: [((0, 0), 2, [(0,0),(1,0),(0,1),(1,1)])],
+                1: [((0, 0), 2, [(0,0),(1,0)]),
+                    ((0, 1), 2, [(0,1),(1,1)])],
+                2: [((0, 0), 1, [(0,0),(0,1)]),
+                    ((1, 0), 1, [(1,0),(1,1)])],
+                3: [((0, 0), 1, [(0,0)]), ((1, 0), 1, [(1,0)]),
+                    ((0, 1), 1, [(0,1)]), ((1, 1), 1, [(1,1)])],
+            }
+            # Chroma sub-partition geometry: (cx_off, cy_off, cw, ch)
+            _csp = {
+                0: [(0, 0, 4, 4)],
+                1: [(0, 0, 4, 2), (0, 2, 4, 2)],
+                2: [(0, 0, 2, 4), (2, 0, 2, 4)],
+                3: [(0, 0, 2, 2), (2, 0, 2, 2), (0, 2, 2, 2), (2, 2, 2, 2)],
+            }
+
+            luma = np.zeros((16, 16), dtype=np.uint8)
+            pred_cb = np.zeros((8, 8), dtype=np.uint8)
+            pred_cr = np.zeros((8, 8), dtype=np.uint8)
+            sub_mb_offsets = [(0, 0), (8, 0), (0, 8), (8, 8)]
+            chroma_offsets = [(0, 0), (4, 0), (0, 4), (4, 4)]
+
+            mvd_idx = 0
+            for sub_idx in range(4):
+                sub_type = sub_types[sub_idx] if sub_idx < len(sub_types) else 0
+                sub_bx = (sub_idx % 2) * 2
+                sub_by = (sub_idx // 2) * 2
+                parts = _sp[min(sub_type, 3)]
+                chroma_parts = _csp[min(sub_type, 3)]
+
+                sub_mvs = []
+                for j, ((dx, dy), pw, coverage) in enumerate(parts):
+                    mvd = mvd_l0[mvd_idx] if mvd_idx < len(mvd_l0) else (0, 0)
+                    mvd_idx += 1
+
+                    mvp_x, mvp_y = predict_mv_partition(
+                        self.state.mv_cache, mb_x, mb_y,
+                        block_x=sub_bx + dx, block_y=sub_by + dy,
+                        part_width_blocks=pw, target_ref=refs[sub_idx],
+                    )
+                    final_mvx = mvp_x + mvd[0]
+                    final_mvy = mvp_y + mvd[1]
+                    sub_mvs.append((final_mvx, final_mvy))
+
+                    for (bx_off, by_off) in coverage:
+                        self.state.mv_cache.set_mv(
+                            mb_x, mb_y, sub_bx + bx_off, sub_by + by_off,
+                            final_mvx, final_mvy, ref_idx=refs[sub_idx],
+                        )
+
+                # Luma
+                sub_luma = reconstruct_p_8x8_sub(
+                    ref_buffer=self.state.ref_buffer,
+                    mv_cache=self.state.mv_cache,
+                    ref_idx=refs[sub_idx], sub_mb_type=sub_type,
+                    mvs=sub_mvs, mb_x=mb_x, mb_y=mb_y,
+                    sub_idx=sub_idx, residual=None,
+                )
+                sx, sy = sub_mb_offsets[sub_idx]
+                luma[sy:sy+8, sx:sx+8] = sub_luma
+
+                # Chroma per sub-partition
+                ref_frame = self.state.ref_buffer.get_frame(refs[sub_idx])
+                cx_base, cy_base = chroma_offsets[sub_idx]
+                for j, (cx_off, cy_off, cw, ch) in enumerate(chroma_parts):
+                    cmvx, cmvy = sub_mvs[j]
+                    cx = mb_x * 8 + cx_base + cx_off + (cmvx >> 3)
+                    cy = mb_y * 8 + cy_base + cy_off + (cmvy >> 3)
+                    fx, fy = cmvx & 7, cmvy & 7
+                    dst_x, dst_y = cx_base + cx_off, cy_base + cy_off
+                    pred_cb[dst_y:dst_y+ch, dst_x:dst_x+cw] = (
+                        apply_chroma_prediction(ref_frame.cb, cx, cy, fx, fy, cw, ch)
+                    )
+                    pred_cr[dst_y:dst_y+ch, dst_x:dst_x+cw] = (
+                        apply_chroma_prediction(ref_frame.cr, cx, cy, fx, fy, cw, ch)
+                    )
+
+            return luma, pred_cb, pred_cr
+
+        else:
+            # Unexpected P type — use skip
+            logger.warning(f"Unexpected P mb_type={mb_type} at ({mb_x},{mb_y})")
+            return reconstruct_p_skip(
+                ref_buffer=self.state.ref_buffer,
+                mv_cache=self.state.mv_cache,
+                mb_x=mb_x, mb_y=mb_y,
+            )
+
+    def _cabac_b_motion_comp(
+        self, mb_type: int, mb_pred: dict, mb_x: int, mb_y: int,
+    ) -> tuple:
+        """B-slice motion compensation from pre-parsed CABAC syntax.
+
+        Handles all 23 B-MB types (0-22).
+        """
+        from inter.direct_mode import (
+            derive_direct_spatial_sub8x8,
+            derive_direct_temporal,
+        )
+
+        ref_idx_l0 = mb_pred.get('ref_idx_l0', [])
+        ref_idx_l1 = mb_pred.get('ref_idx_l1', [])
+        mvd_l0 = mb_pred.get('mvd_l0', [])
+        mvd_l1 = mb_pred.get('mvd_l1', [])
+        sub_types = mb_pred.get('sub_mb_types', [])
+
+        sh = getattr(self.state, 'current_slice_header', None)
+        use_spatial = getattr(sh, 'direct_spatial_mv_pred_flag', True)
+        current_poc = getattr(sh, 'pic_order_cnt_lsb', 0)
+        pps = self.state.current_pps
+        weighted_bipred_idc = getattr(pps, 'weighted_bipred_idc', 0) if pps else 0
+
+        if mb_type == 0:  # B_Direct_16x16
+            luma, cb, cr = reconstruct_b_direct_16x16(
+                ref_buffer=self.state.ref_buffer,
+                mv_cache=self.state.mv_cache,
+                mv_cache_l1=getattr(self.state, 'mv_cache_l1', None),
+                mb_x=mb_x, mb_y=mb_y,
+                use_spatial=use_spatial,
+                current_poc=current_poc,
+                residual_luma=None, residual_cb=None, residual_cr=None,
+                weighted_bipred_idc=weighted_bipred_idc,
+            )
+            return luma, cb, cr
+
+        # For types 1-21: extract partition info
+        if 1 <= mb_type <= 21:
+            return self._cabac_b_partitioned_mc(
+                mb_type, ref_idx_l0, ref_idx_l1, mvd_l0, mvd_l1,
+                mb_x, mb_y,
+            )
+
+        if mb_type == 22:  # B_8x8
+            return self._cabac_b_8x8_mc(
+                sub_types, ref_idx_l0, ref_idx_l1, mvd_l0, mvd_l1,
+                mb_x, mb_y,
+            )
+
+        logger.warning(f"Unexpected B mb_type={mb_type} at ({mb_x},{mb_y})")
+        return reconstruct_b_skip(
+            ref_buffer=self.state.ref_buffer,
+            mv_cache=self.state.mv_cache,
+            mv_cache_l1=getattr(self.state, 'mv_cache_l1', None),
+            mb_x=mb_x, mb_y=mb_y,
+            use_spatial=use_spatial, current_poc=current_poc,
+        )
+
+    def _cabac_b_partitioned_mc(
+        self, mb_type: int,
+        ref_idx_l0: list, ref_idx_l1: list,
+        mvd_l0: list, mvd_l1: list,
+        mb_x: int, mb_y: int,
+    ) -> tuple:
+        """B-slice partitioned MC (types 1-21)."""
+        from entropy.cabac_macroblock import _get_b_pred_flags
+
+        sh = getattr(self.state, 'current_slice_header', None)
+        weighted_bipred_idc = getattr(self.state.current_pps, 'weighted_bipred_idc', 0) if self.state.current_pps else 0
+        current_poc = getattr(sh, 'pic_order_cnt_lsb', 0)
+
+        pred_flags = _get_b_pred_flags(mb_type)
+        is_16x16 = mb_type in (1, 2, 3)
+        is_16x8 = mb_type in (4, 6, 8, 10, 12, 14, 16, 18, 20)
+
+        num_parts = len(pred_flags)
+        refs_l0 = [0] * num_parts
+        refs_l1 = [0] * num_parts
+        mvx_l0 = [0] * num_parts
+        mvy_l0 = [0] * num_parts
+        mvx_l1 = [0] * num_parts
+        mvy_l1 = [0] * num_parts
+
+        l0_ref_idx = 0
+        l1_ref_idx = 0
+        l0_mvd_idx = 0
+        l1_mvd_idx = 0
+
+        # Resolve ref indices
+        for i in range(num_parts):
+            if pred_flags[i][0]:
+                refs_l0[i] = ref_idx_l0[l0_ref_idx] if l0_ref_idx < len(ref_idx_l0) else 0
+                l0_ref_idx += 1
+            else:
+                refs_l0[i] = -1
+        for i in range(num_parts):
+            if pred_flags[i][1]:
+                refs_l1[i] = ref_idx_l1[l1_ref_idx] if l1_ref_idx < len(ref_idx_l1) else 0
+                l1_ref_idx += 1
+            else:
+                refs_l1[i] = -1
+
+        # Resolve MVs and store per-partition immediately so partition 1
+        # can see partition 0's MVs in the cache during prediction.
+        mv_cache_l1 = getattr(self.state, 'mv_cache_l1', None)
+        for i in range(num_parts):
+            # L0 MV prediction + store
+            if pred_flags[i][0]:
+                mvd = mvd_l0[l0_mvd_idx] if l0_mvd_idx < len(mvd_l0) else (0, 0)
+                l0_mvd_idx += 1
+                if is_16x16:
+                    mvp_x, mvp_y = predict_mv_16x16(
+                        self.state.mv_cache, mb_x, mb_y, target_ref=refs_l0[i],
+                    )
+                elif is_16x8:
+                    mvp_x, mvp_y = predict_mv_16x8(
+                        self.state.mv_cache, mb_x, mb_y, i, target_ref=refs_l0[i],
+                    )
+                else:
+                    mvp_x, mvp_y = predict_mv_8x16(
+                        self.state.mv_cache, mb_x, mb_y, i, target_ref=refs_l0[i],
+                    )
+                mvx_l0[i] = mvp_x + mvd[0]
+                mvy_l0[i] = mvp_y + mvd[1]
+
+            # Store L0 MV (or mark unavailable for this list)
+            if is_16x16:
+                if pred_flags[i][0]:
+                    self.state.mv_cache.set_mv_16x16(
+                        mb_x, mb_y, mvx_l0[i], mvy_l0[i], ref_idx=refs_l0[i],
+                    )
+                else:
+                    self.state.mv_cache.set_mv_16x16(mb_x, mb_y, 0, 0, ref_idx=-1)
+            elif is_16x8:
+                if pred_flags[i][0]:
+                    self.state.mv_cache.set_mv_16x8(
+                        mb_x, mb_y, i, mvx_l0[i], mvy_l0[i], ref_idx=refs_l0[i],
+                    )
+                else:
+                    self.state.mv_cache.set_mv_16x8(
+                        mb_x, mb_y, i, 0, 0, ref_idx=-1,
+                    )
+            else:  # 8x16
+                if pred_flags[i][0]:
+                    self.state.mv_cache.set_mv_8x16(
+                        mb_x, mb_y, i, mvx_l0[i], mvy_l0[i], ref_idx=refs_l0[i],
+                    )
+                else:
+                    self.state.mv_cache.set_mv_8x16(
+                        mb_x, mb_y, i, 0, 0, ref_idx=-1,
+                    )
+
+            # L1 MV prediction + store
+            if pred_flags[i][1]:
+                mvd = mvd_l1[l1_mvd_idx] if l1_mvd_idx < len(mvd_l1) else (0, 0)
+                l1_mvd_idx += 1
+                if mv_cache_l1:
+                    if is_16x16:
+                        mvp_x, mvp_y = predict_mv_16x16(
+                            mv_cache_l1, mb_x, mb_y, target_ref=refs_l1[i],
+                        )
+                    elif is_16x8:
+                        mvp_x, mvp_y = predict_mv_16x8(
+                            mv_cache_l1, mb_x, mb_y, i, target_ref=refs_l1[i],
+                        )
+                    else:
+                        mvp_x, mvp_y = predict_mv_8x16(
+                            mv_cache_l1, mb_x, mb_y, i, target_ref=refs_l1[i],
+                        )
+                else:
+                    mvp_x, mvp_y = 0, 0
+                mvx_l1[i] = mvp_x + mvd[0]
+                mvy_l1[i] = mvp_y + mvd[1]
+
+            # Store L1 MV (or mark unavailable)
+            if mv_cache_l1:
+                if is_16x16:
+                    if pred_flags[i][1]:
+                        mv_cache_l1.set_mv_16x16(
+                            mb_x, mb_y, mvx_l1[i], mvy_l1[i], ref_idx=refs_l1[i],
+                        )
+                    else:
+                        mv_cache_l1.set_mv_16x16(mb_x, mb_y, 0, 0, ref_idx=-1)
+                elif is_16x8:
+                    if pred_flags[i][1]:
+                        mv_cache_l1.set_mv_16x8(
+                            mb_x, mb_y, i, mvx_l1[i], mvy_l1[i], ref_idx=refs_l1[i],
+                        )
+                    else:
+                        mv_cache_l1.set_mv_16x8(
+                            mb_x, mb_y, i, 0, 0, ref_idx=-1,
+                        )
+                else:  # 8x16
+                    if pred_flags[i][1]:
+                        mv_cache_l1.set_mv_8x16(
+                            mb_x, mb_y, i, mvx_l1[i], mvy_l1[i], ref_idx=refs_l1[i],
+                        )
+                    else:
+                        mv_cache_l1.set_mv_8x16(
+                            mb_x, mb_y, i, 0, 0, ref_idx=-1,
+                        )
+
+        # Dispatch to appropriate reconstruction
+        if mb_type == 1:  # B_L0_16x16
+            return reconstruct_b_l0_16x16(
+                ref_buffer=self.state.ref_buffer,
+                ref_idx=refs_l0[0], mvx=mvx_l0[0], mvy=mvy_l0[0],
+                residual_luma=None, residual_cb=None, residual_cr=None,
+                mb_x=mb_x, mb_y=mb_y,
+            )
+        elif mb_type == 2:  # B_L1_16x16
+            return reconstruct_b_l1_16x16(
+                ref_buffer=self.state.ref_buffer,
+                ref_idx=refs_l1[0], mvx=mvx_l1[0], mvy=mvy_l1[0],
+                residual_luma=None, residual_cb=None, residual_cr=None,
+                mb_x=mb_x, mb_y=mb_y,
+            )
+        elif mb_type == 3:  # B_Bi_16x16
+            return reconstruct_b_bi_16x16(
+                ref_buffer=self.state.ref_buffer,
+                ref_idx_l0=refs_l0[0], mvx_l0=mvx_l0[0], mvy_l0=mvy_l0[0],
+                ref_idx_l1=refs_l1[0], mvx_l1=mvx_l1[0], mvy_l1=mvy_l1[0],
+                residual_luma=None, residual_cb=None, residual_cr=None,
+                mb_x=mb_x, mb_y=mb_y,
+                weighted_bipred_idc=weighted_bipred_idc,
+                current_poc=current_poc,
+            )
+        # Convert pred_flags to pred_modes strings
+        pred_modes = []
+        for l0, l1 in pred_flags:
+            if l0 and l1:
+                pred_modes.append("Bi")
+            elif l0:
+                pred_modes.append("L0")
+            else:
+                pred_modes.append("L1")
+
+        if is_16x8:
+            return reconstruct_b_16x8(
+                ref_buffer=self.state.ref_buffer,
+                pred_modes=pred_modes,
+                ref_idx_l0=refs_l0, ref_idx_l1=refs_l1,
+                mvx_l0=mvx_l0, mvy_l0=mvy_l0,
+                mvx_l1=mvx_l1, mvy_l1=mvy_l1,
+                residual_luma=None, residual_cb=None, residual_cr=None,
+                mb_x=mb_x, mb_y=mb_y,
+                weighted_bipred_idc=weighted_bipred_idc,
+                current_poc=current_poc,
+            )
+        else:  # 8x16
+            return reconstruct_b_8x16(
+                ref_buffer=self.state.ref_buffer,
+                pred_modes=pred_modes,
+                ref_idx_l0=refs_l0, ref_idx_l1=refs_l1,
+                mvx_l0=mvx_l0, mvy_l0=mvy_l0,
+                mvx_l1=mvx_l1, mvy_l1=mvy_l1,
+                residual_luma=None, residual_cb=None, residual_cr=None,
+                mb_x=mb_x, mb_y=mb_y,
+                weighted_bipred_idc=weighted_bipred_idc,
+                current_poc=current_poc,
+            )
+
+    def _cabac_b_8x8_mc(
+        self, sub_types: list,
+        ref_idx_l0: list, ref_idx_l1: list,
+        mvd_l0: list, mvd_l1: list,
+        mb_x: int, mb_y: int,
+    ) -> tuple:
+        """B_8x8 motion compensation with sub-partitions.
+
+        Handles all B sub_mb_types (0-12) including sub-partition shapes
+        8x8, 8x4, 4x8, and 4x4 with per-sub-partition MV prediction.
+
+        H.264 Spec Reference: Table 7-18, Section 8.4
+        """
+        from inter.direct_mode import derive_direct_spatial_sub8x8
+        from inter.bipred import bipred_average, implicit_bipred
+        from entropy.cabac_macroblock import (
+            _b_sub_uses_l0, _b_sub_uses_l1, _b_sub_num_parts,
+        )
+
+        mv_cache_l1 = getattr(self.state, 'mv_cache_l1', None)
+        sh = getattr(self.state, 'current_slice_header', None)
+        weighted_bipred_idc = getattr(self.state.current_pps, 'weighted_bipred_idc', 0) if self.state.current_pps else 0
+        current_poc = getattr(sh, 'pic_order_cnt_lsb', 0)
+
+        refs_l0 = [ref_idx_l0[i] if i < len(ref_idx_l0) else 0 for i in range(4)]
+        refs_l1 = [ref_idx_l1[i] if i < len(ref_idx_l1) else 0 for i in range(4)]
+
+        def _do_bipred(pred_l0, pred_l1, ri_l0, ri_l1):
+            """Apply bipred with correct weighting per weighted_bipred_idc."""
+            if weighted_bipred_idc == 2:
+                l0_poc = self.state.ref_buffer.get_l0_frame(max(ri_l0, 0)).poc
+                l1_poc = self.state.ref_buffer.get_l1_frame(max(ri_l1, 0)).poc
+                return implicit_bipred(pred_l0, pred_l1, current_poc, l0_poc, l1_poc)
+            return bipred_average(pred_l0, pred_l1)
+
+        # B sub_mb_type → shape index: 0=8x8, 1=8x4, 2=4x8, 3=4x4
+        _b_sub_shape = {
+            0: 0, 1: 0, 2: 0, 3: 0,   # Direct/L0/L1/Bi 8x8
+            4: 1, 6: 1, 8: 1,          # L0/L1/Bi 8x4
+            5: 2, 7: 2, 9: 2,          # L0/L1/Bi 4x8
+            10: 3, 11: 3, 12: 3,       # L0/L1/Bi 4x4
+        }
+
+        # Sub-partition definitions: (block_offset, part_width_4x4, coverage)
+        _sp = {
+            0: [((0, 0), 2, [(0, 0), (1, 0), (0, 1), (1, 1)])],
+            1: [((0, 0), 2, [(0, 0), (1, 0)]),
+                ((0, 1), 2, [(0, 1), (1, 1)])],
+            2: [((0, 0), 1, [(0, 0), (0, 1)]),
+                ((1, 0), 1, [(1, 0), (1, 1)])],
+            3: [((0, 0), 1, [(0, 0)]), ((1, 0), 1, [(1, 0)]),
+                ((0, 1), 1, [(0, 1)]), ((1, 1), 1, [(1, 1)])],
+        }
+
+        # Chroma sub-partition geometry: (cx_off, cy_off, cw, ch)
+        _csp = {
+            0: [(0, 0, 4, 4)],
+            1: [(0, 0, 4, 2), (0, 2, 4, 2)],
+            2: [(0, 0, 2, 4), (2, 0, 2, 4)],
+            3: [(0, 0, 2, 2), (2, 0, 2, 2), (0, 2, 2, 2), (2, 2, 2, 2)],
+        }
+
+        # Luma sub-partition pixel geometry: (px_off, py_off, pw, ph)
+        _lsp = {
+            0: [(0, 0, 8, 8)],
+            1: [(0, 0, 8, 4), (0, 4, 8, 4)],
+            2: [(0, 0, 4, 8), (4, 0, 4, 8)],
+            3: [(0, 0, 4, 4), (4, 0, 4, 4), (0, 4, 4, 4), (4, 4, 4, 4)],
+        }
+
+        # B sub_mb_type → pred mode string
+        _b_sub_pred_mode = {
+            0: "Direct",
+            1: "L0", 4: "L0", 5: "L0", 10: "L0",
+            2: "L1", 6: "L1", 7: "L1", 11: "L1",
+            3: "Bi", 8: "Bi", 9: "Bi", 12: "Bi",
+        }
+
+        luma = np.zeros((16, 16), dtype=np.uint8)
+        pred_cb = np.zeros((8, 8), dtype=np.uint8)
+        pred_cr = np.zeros((8, 8), dtype=np.uint8)
+        sub_mb_offsets = [(0, 0), (8, 0), (0, 8), (8, 8)]
+        chroma_offsets = [(0, 0), (4, 0), (0, 4), (4, 4)]
+
+        l0_mvd_idx = 0
+        l1_mvd_idx = 0
+
+        for sub_idx in range(4):
+            sub_type = sub_types[sub_idx] if sub_idx < len(sub_types) else 0
+            sub_bx = (sub_idx % 2) * 2
+            sub_by = (sub_idx // 2) * 2
+            sx, sy = sub_mb_offsets[sub_idx]
+            cx_base, cy_base = chroma_offsets[sub_idx]
+
+            if sub_type == 0:  # B_Direct_8x8
+                direct_result = derive_direct_spatial_sub8x8(
+                    self.state.mv_cache,
+                    mv_cache_l1,
+                    mb_x, mb_y, sub_idx,
+                    self.state.ref_buffer,
+                )
+                if direct_result:
+                    (d_mvx_l0, d_mvy_l0, d_mvx_l1, d_mvy_l1,
+                     pf_l0, pf_l1, d_ref_l0, d_ref_l1) = direct_result
+
+                    # Store derived MVs in caches for neighbor lookups
+                    for by in range(sub_by, sub_by + 2):
+                        for bx in range(sub_bx, sub_bx + 2):
+                            self.state.mv_cache.set_mv(
+                                mb_x, mb_y, bx, by,
+                                d_mvx_l0, d_mvy_l0, ref_idx=d_ref_l0,
+                            )
+                            if mv_cache_l1:
+                                mv_cache_l1.set_mv(
+                                    mb_x, mb_y, bx, by,
+                                    d_mvx_l1, d_mvy_l1, ref_idx=d_ref_l1,
+                                )
+
+                    # Determine prediction mode from pred flags
+                    if pf_l0 and pf_l1:
+                        ref_l0 = self.state.ref_buffer.get_l0_frame(d_ref_l0)
+                        ref_l1 = self.state.ref_buffer.get_l1_frame(d_ref_l1)
+                        l0_luma = apply_inter_prediction(
+                            ref_l0.luma,
+                            mb_x * 16 + sx + (d_mvx_l0 >> 2),
+                            mb_y * 16 + sy + (d_mvy_l0 >> 2),
+                            d_mvx_l0 & 3, d_mvy_l0 & 3, 8, 8,
+                        )
+                        l1_luma = apply_inter_prediction(
+                            ref_l1.luma,
+                            mb_x * 16 + sx + (d_mvx_l1 >> 2),
+                            mb_y * 16 + sy + (d_mvy_l1 >> 2),
+                            d_mvx_l1 & 3, d_mvy_l1 & 3, 8, 8,
+                        )
+                        luma[sy:sy + 8, sx:sx + 8] = _do_bipred(l0_luma, l1_luma, d_ref_l0, d_ref_l1)
+
+                        l0_cb = apply_chroma_prediction(
+                            ref_l0.cb,
+                            mb_x * 8 + cx_base + (d_mvx_l0 >> 3),
+                            mb_y * 8 + cy_base + (d_mvy_l0 >> 3),
+                            d_mvx_l0 & 7, d_mvy_l0 & 7, 4, 4,
+                        )
+                        l0_cr = apply_chroma_prediction(
+                            ref_l0.cr,
+                            mb_x * 8 + cx_base + (d_mvx_l0 >> 3),
+                            mb_y * 8 + cy_base + (d_mvy_l0 >> 3),
+                            d_mvx_l0 & 7, d_mvy_l0 & 7, 4, 4,
+                        )
+                        l1_cb = apply_chroma_prediction(
+                            ref_l1.cb,
+                            mb_x * 8 + cx_base + (d_mvx_l1 >> 3),
+                            mb_y * 8 + cy_base + (d_mvy_l1 >> 3),
+                            d_mvx_l1 & 7, d_mvy_l1 & 7, 4, 4,
+                        )
+                        l1_cr = apply_chroma_prediction(
+                            ref_l1.cr,
+                            mb_x * 8 + cx_base + (d_mvx_l1 >> 3),
+                            mb_y * 8 + cy_base + (d_mvy_l1 >> 3),
+                            d_mvx_l1 & 7, d_mvy_l1 & 7, 4, 4,
+                        )
+                        pred_cb[cy_base:cy_base + 4, cx_base:cx_base + 4] = (
+                            _do_bipred(l0_cb, l1_cb, d_ref_l0, d_ref_l1)
+                        )
+                        pred_cr[cy_base:cy_base + 4, cx_base:cx_base + 4] = (
+                            _do_bipred(l0_cr, l1_cr, d_ref_l0, d_ref_l1)
+                        )
+                    elif pf_l0:
+                        ref_l0 = self.state.ref_buffer.get_l0_frame(max(d_ref_l0, 0))
+                        luma[sy:sy + 8, sx:sx + 8] = apply_inter_prediction(
+                            ref_l0.luma,
+                            mb_x * 16 + sx + (d_mvx_l0 >> 2),
+                            mb_y * 16 + sy + (d_mvy_l0 >> 2),
+                            d_mvx_l0 & 3, d_mvy_l0 & 3, 8, 8,
+                        )
+                        pred_cb[cy_base:cy_base + 4, cx_base:cx_base + 4] = (
+                            apply_chroma_prediction(
+                                ref_l0.cb,
+                                mb_x * 8 + cx_base + (d_mvx_l0 >> 3),
+                                mb_y * 8 + cy_base + (d_mvy_l0 >> 3),
+                                d_mvx_l0 & 7, d_mvy_l0 & 7, 4, 4,
+                            )
+                        )
+                        pred_cr[cy_base:cy_base + 4, cx_base:cx_base + 4] = (
+                            apply_chroma_prediction(
+                                ref_l0.cr,
+                                mb_x * 8 + cx_base + (d_mvx_l0 >> 3),
+                                mb_y * 8 + cy_base + (d_mvy_l0 >> 3),
+                                d_mvx_l0 & 7, d_mvy_l0 & 7, 4, 4,
+                            )
+                        )
+                    else:
+                        ref_l1 = self.state.ref_buffer.get_l1_frame(max(d_ref_l1, 0))
+                        luma[sy:sy + 8, sx:sx + 8] = apply_inter_prediction(
+                            ref_l1.luma,
+                            mb_x * 16 + sx + (d_mvx_l1 >> 2),
+                            mb_y * 16 + sy + (d_mvy_l1 >> 2),
+                            d_mvx_l1 & 3, d_mvy_l1 & 3, 8, 8,
+                        )
+                        pred_cb[cy_base:cy_base + 4, cx_base:cx_base + 4] = (
+                            apply_chroma_prediction(
+                                ref_l1.cb,
+                                mb_x * 8 + cx_base + (d_mvx_l1 >> 3),
+                                mb_y * 8 + cy_base + (d_mvy_l1 >> 3),
+                                d_mvx_l1 & 7, d_mvy_l1 & 7, 4, 4,
+                            )
+                        )
+                        pred_cr[cy_base:cy_base + 4, cx_base:cx_base + 4] = (
+                            apply_chroma_prediction(
+                                ref_l1.cr,
+                                mb_x * 8 + cx_base + (d_mvx_l1 >> 3),
+                                mb_y * 8 + cy_base + (d_mvy_l1 >> 3),
+                                d_mvx_l1 & 7, d_mvy_l1 & 7, 4, 4,
+                            )
+                        )
+                continue
+
+            shape = _b_sub_shape.get(sub_type, 0)
+            parts = _sp[shape]
+            chroma_parts = _csp[shape]
+            luma_parts = _lsp[shape]
+            pred_mode = _b_sub_pred_mode.get(sub_type, "L0")
+            uses_l0 = _b_sub_uses_l0(sub_type)
+            uses_l1 = _b_sub_uses_l1(sub_type)
+
+            sub_mvs_l0 = []
+            sub_mvs_l1 = []
+
+            # L0 MV prediction per sub-partition
+            if uses_l0:
+                for j, ((dx, dy), pw, coverage) in enumerate(parts):
+                    mvd = mvd_l0[l0_mvd_idx] if l0_mvd_idx < len(mvd_l0) else (0, 0)
+                    l0_mvd_idx += 1
+
+                    mvp_x, mvp_y = predict_mv_partition(
+                        self.state.mv_cache, mb_x, mb_y,
+                        block_x=sub_bx + dx, block_y=sub_by + dy,
+                        part_width_blocks=pw, target_ref=refs_l0[sub_idx],
+                    )
+                    final_mvx = mvp_x + mvd[0]
+                    final_mvy = mvp_y + mvd[1]
+                    sub_mvs_l0.append((final_mvx, final_mvy))
+
+                    for (bx_off, by_off) in coverage:
+                        self.state.mv_cache.set_mv(
+                            mb_x, mb_y, sub_bx + bx_off, sub_by + by_off,
+                            final_mvx, final_mvy, ref_idx=refs_l0[sub_idx],
+                        )
+            else:
+                # No L0 — mark all blocks as unavailable in L0 cache
+                for (bx_off, by_off) in [(0, 0), (1, 0), (0, 1), (1, 1)]:
+                    self.state.mv_cache.set_mv(
+                        mb_x, mb_y, sub_bx + bx_off, sub_by + by_off,
+                        0, 0, ref_idx=-1,
+                    )
+                sub_mvs_l0 = [(0, 0)] * len(parts)
+
+            # L1 MV prediction per sub-partition
+            if uses_l1 and mv_cache_l1:
+                for j, ((dx, dy), pw, coverage) in enumerate(parts):
+                    mvd = mvd_l1[l1_mvd_idx] if l1_mvd_idx < len(mvd_l1) else (0, 0)
+                    l1_mvd_idx += 1
+
+                    mvp_x, mvp_y = predict_mv_partition(
+                        mv_cache_l1, mb_x, mb_y,
+                        block_x=sub_bx + dx, block_y=sub_by + dy,
+                        part_width_blocks=pw, target_ref=refs_l1[sub_idx],
+                    )
+                    final_mvx = mvp_x + mvd[0]
+                    final_mvy = mvp_y + mvd[1]
+                    sub_mvs_l1.append((final_mvx, final_mvy))
+
+                    for (bx_off, by_off) in coverage:
+                        mv_cache_l1.set_mv(
+                            mb_x, mb_y, sub_bx + bx_off, sub_by + by_off,
+                            final_mvx, final_mvy, ref_idx=refs_l1[sub_idx],
+                        )
+            else:
+                # No L1 — mark all blocks as unavailable in L1 cache
+                if mv_cache_l1:
+                    for (bx_off, by_off) in [(0, 0), (1, 0), (0, 1), (1, 1)]:
+                        mv_cache_l1.set_mv(
+                            mb_x, mb_y, sub_bx + bx_off, sub_by + by_off,
+                            0, 0, ref_idx=-1,
+                        )
+                sub_mvs_l1 = [(0, 0)] * len(parts)
+
+            # Reconstruct luma per sub-partition
+            for j, (px_off, py_off, pw, ph) in enumerate(luma_parts):
+                if pred_mode == "L0":
+                    mvx, mvy = sub_mvs_l0[j]
+                    ref_frame = self.state.ref_buffer.get_l0_frame(refs_l0[sub_idx])
+                    part_luma = apply_inter_prediction(
+                        ref_frame.luma,
+                        mb_x * 16 + sx + px_off + (mvx >> 2),
+                        mb_y * 16 + sy + py_off + (mvy >> 2),
+                        mvx & 3, mvy & 3, pw, ph,
+                    )
+                elif pred_mode == "L1":
+                    mvx, mvy = sub_mvs_l1[j]
+                    ref_frame = self.state.ref_buffer.get_l1_frame(refs_l1[sub_idx])
+                    part_luma = apply_inter_prediction(
+                        ref_frame.luma,
+                        mb_x * 16 + sx + px_off + (mvx >> 2),
+                        mb_y * 16 + sy + py_off + (mvy >> 2),
+                        mvx & 3, mvy & 3, pw, ph,
+                    )
+                else:  # Bi
+                    mvx0, mvy0 = sub_mvs_l0[j]
+                    mvx1, mvy1 = sub_mvs_l1[j]
+                    ref_l0 = self.state.ref_buffer.get_l0_frame(refs_l0[sub_idx])
+                    ref_l1 = self.state.ref_buffer.get_l1_frame(refs_l1[sub_idx])
+                    l0_part = apply_inter_prediction(
+                        ref_l0.luma,
+                        mb_x * 16 + sx + px_off + (mvx0 >> 2),
+                        mb_y * 16 + sy + py_off + (mvy0 >> 2),
+                        mvx0 & 3, mvy0 & 3, pw, ph,
+                    )
+                    l1_part = apply_inter_prediction(
+                        ref_l1.luma,
+                        mb_x * 16 + sx + px_off + (mvx1 >> 2),
+                        mb_y * 16 + sy + py_off + (mvy1 >> 2),
+                        mvx1 & 3, mvy1 & 3, pw, ph,
+                    )
+                    part_luma = _do_bipred(l0_part, l1_part, refs_l0[sub_idx], refs_l1[sub_idx])
+
+                luma[sy + py_off:sy + py_off + ph,
+                     sx + px_off:sx + px_off + pw] = part_luma
+
+            # Reconstruct chroma per sub-partition
+            for j, (cx_off, cy_off, cw, ch) in enumerate(chroma_parts):
+                if pred_mode == "L0":
+                    mvx, mvy = sub_mvs_l0[j]
+                    ref_frame = self.state.ref_buffer.get_l0_frame(refs_l0[sub_idx])
+                    pred_cb[cy_base + cy_off:cy_base + cy_off + ch,
+                            cx_base + cx_off:cx_base + cx_off + cw] = (
+                        apply_chroma_prediction(
+                            ref_frame.cb,
+                            mb_x * 8 + cx_base + cx_off + (mvx >> 3),
+                            mb_y * 8 + cy_base + cy_off + (mvy >> 3),
+                            mvx & 7, mvy & 7, cw, ch,
+                        )
+                    )
+                    pred_cr[cy_base + cy_off:cy_base + cy_off + ch,
+                            cx_base + cx_off:cx_base + cx_off + cw] = (
+                        apply_chroma_prediction(
+                            ref_frame.cr,
+                            mb_x * 8 + cx_base + cx_off + (mvx >> 3),
+                            mb_y * 8 + cy_base + cy_off + (mvy >> 3),
+                            mvx & 7, mvy & 7, cw, ch,
+                        )
+                    )
+                elif pred_mode == "L1":
+                    mvx, mvy = sub_mvs_l1[j]
+                    ref_frame = self.state.ref_buffer.get_l1_frame(refs_l1[sub_idx])
+                    pred_cb[cy_base + cy_off:cy_base + cy_off + ch,
+                            cx_base + cx_off:cx_base + cx_off + cw] = (
+                        apply_chroma_prediction(
+                            ref_frame.cb,
+                            mb_x * 8 + cx_base + cx_off + (mvx >> 3),
+                            mb_y * 8 + cy_base + cy_off + (mvy >> 3),
+                            mvx & 7, mvy & 7, cw, ch,
+                        )
+                    )
+                    pred_cr[cy_base + cy_off:cy_base + cy_off + ch,
+                            cx_base + cx_off:cx_base + cx_off + cw] = (
+                        apply_chroma_prediction(
+                            ref_frame.cr,
+                            mb_x * 8 + cx_base + cx_off + (mvx >> 3),
+                            mb_y * 8 + cy_base + cy_off + (mvy >> 3),
+                            mvx & 7, mvy & 7, cw, ch,
+                        )
+                    )
+                else:  # Bi
+                    mvx0, mvy0 = sub_mvs_l0[j]
+                    mvx1, mvy1 = sub_mvs_l1[j]
+                    ref_l0 = self.state.ref_buffer.get_l0_frame(refs_l0[sub_idx])
+                    ref_l1 = self.state.ref_buffer.get_l1_frame(refs_l1[sub_idx])
+                    l0_cb = apply_chroma_prediction(
+                        ref_l0.cb,
+                        mb_x * 8 + cx_base + cx_off + (mvx0 >> 3),
+                        mb_y * 8 + cy_base + cy_off + (mvy0 >> 3),
+                        mvx0 & 7, mvy0 & 7, cw, ch,
+                    )
+                    l0_cr = apply_chroma_prediction(
+                        ref_l0.cr,
+                        mb_x * 8 + cx_base + cx_off + (mvx0 >> 3),
+                        mb_y * 8 + cy_base + cy_off + (mvy0 >> 3),
+                        mvx0 & 7, mvy0 & 7, cw, ch,
+                    )
+                    l1_cb = apply_chroma_prediction(
+                        ref_l1.cb,
+                        mb_x * 8 + cx_base + cx_off + (mvx1 >> 3),
+                        mb_y * 8 + cy_base + cy_off + (mvy1 >> 3),
+                        mvx1 & 7, mvy1 & 7, cw, ch,
+                    )
+                    l1_cr = apply_chroma_prediction(
+                        ref_l1.cr,
+                        mb_x * 8 + cx_base + cx_off + (mvx1 >> 3),
+                        mb_y * 8 + cy_base + cy_off + (mvy1 >> 3),
+                        mvx1 & 7, mvy1 & 7, cw, ch,
+                    )
+                    pred_cb[cy_base + cy_off:cy_base + cy_off + ch,
+                            cx_base + cx_off:cx_base + cx_off + cw] = (
+                        _do_bipred(l0_cb, l1_cb, refs_l0[sub_idx], refs_l1[sub_idx])
+                    )
+                    pred_cr[cy_base + cy_off:cy_base + cy_off + ch,
+                            cx_base + cx_off:cx_base + cx_off + cw] = (
+                        _do_bipred(l0_cr, l1_cr, refs_l0[sub_idx], refs_l1[sub_idx])
+                    )
+
+        return luma, pred_cb, pred_cr
+
+    def _cabac_chroma_residual(
+        self, residual: dict, plane: str,
+        cbp_chroma: int, qp_chroma: int,
+        nz_counts: np.ndarray, nz_offset: int,
+    ) -> np.ndarray:
+        """Reconstruct chroma residual from pre-parsed CABAC coefficients.
+
+        Uses process_chroma_dc_coeffs for DC and same pattern as CAVLC path
+        for AC blocks.
+        """
+        from reconstruct.macroblock import process_chroma_dc_coeffs
+        from entropy.cavlc import CAVLCBlock
+
+        chroma_residual = np.zeros((8, 8), dtype=np.int32)
+
+        if cbp_chroma == 0:
+            return chroma_residual
+
+        # Process DC coefficients through hadamard + dequant
+        dc_key = f'chroma_dc_{plane}'
+        dc_raw = residual.get(dc_key)
+        if dc_raw is not None:
+            dc_arr = np.asarray(dc_raw, dtype=np.int32)
+            dc_dequant = process_chroma_dc_coeffs(dc_arr, qp_chroma)
+        else:
+            dc_dequant = None
+
+        # Build AC blocks (wrap in CAVLCBlock for build_chroma_residual)
+        ac_key = f'chroma_ac_{plane}'
+        ac_raw = residual.get(ac_key, [None] * 4)
+        ac_blocks = []
+
+        if cbp_chroma == 2:
+            for i in range(4):
+                if ac_raw[i] is not None:
+                    ac_arr = np.asarray(ac_raw[i], dtype=np.int32)
+                    nz_counts[nz_offset + i] = int(np.count_nonzero(ac_arr))
+                    block = CAVLCBlock(
+                        total_coeff=int(np.count_nonzero(ac_arr)),
+                        trailing_ones=0,
+                        coefficients=ac_arr,
+                    )
+                    ac_blocks.append(block)
+                else:
+                    nz_counts[nz_offset + i] = 0
+                    ac_blocks.append(CAVLCBlock(
+                        total_coeff=0, trailing_ones=0,
+                        coefficients=np.zeros(15, dtype=np.int32),
+                    ))
+
+        return build_chroma_residual(dc_dequant, ac_blocks, cbp_chroma, qp_chroma)
 
     def _build_b_slice_ref_lists(
         self,
@@ -3745,21 +4860,21 @@ class H264Decoder:
         """
         from entropy.cabac_syntax import decode_mb_skip_flag
 
-        # Get neighbor skip status
+        # H.264 9.3.3.1.1.3: condTermFlagN = 1 if available AND NOT skip
         mb_width = self.state.current_sps.pic_width_in_mbs
-        left_skip = False
-        top_skip = False
+        left_cond = False
+        top_cond = False
 
         if mb_x > 0:
             left_idx = mb_y * mb_width + (mb_x - 1)
-            left_skip = self.state.mb_types[left_idx] == -1  # -1 = skip
+            left_cond = self.state.mb_types[left_idx] != -1  # NOT skip
         if mb_y > 0:
             top_idx = (mb_y - 1) * mb_width + mb_x
-            top_skip = self.state.mb_types[top_idx] == -1
+            top_cond = self.state.mb_types[top_idx] != -1
 
         return decode_mb_skip_flag(
             cabac_decoder, self.state.cabac_contexts,
-            slice_type, mb_x, mb_y, left_skip, top_skip
+            slice_type, mb_x, mb_y, left_cond, top_cond
         )
 
     def _decode_residual_cabac(

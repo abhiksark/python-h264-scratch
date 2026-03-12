@@ -12,8 +12,11 @@ from typing import List, TYPE_CHECKING
 from entropy.cabac_context import (
     CTX_MB_TYPE_I_START,
     CTX_MB_TYPE_P_START,
+    CTX_MB_TYPE_P_SUFFIX,
     CTX_MB_TYPE_B_START,
+    CTX_MB_TYPE_B_SUFFIX,
     CTX_SUB_MB_TYPE_P_START,
+    CTX_SUB_MB_TYPE_B_START,
     CTX_MVD_START,
     CTX_REF_IDX_START,
     CTX_MB_QP_DELTA_START,
@@ -46,19 +49,22 @@ def decode_mb_skip_flag(
     """Decode mb_skip_flag.
 
     Context depends on neighbor skip status.
+    H.264 Section 9.3.3.1.1.3: condTermFlagN = 1 if neighbor is
+    available AND NOT skipped.
 
     Args:
         decoder: CABAC decoder
         contexts: Context models
         slice_type: 0=P, 1=B
         mb_x, mb_y: Macroblock position
-        left_skip: True if left MB is skipped
-        top_skip: True if top MB is skipped
+        left_skip: True if left MB is skipped (False if unavailable)
+        top_skip: True if top MB is skipped (False if unavailable)
 
     Returns:
         0 or 1
     """
-    # Context increment based on neighbors
+    # condTermFlagN = 1 if neighbor available AND NOT skip
+    # Callers must pass condTermFlags, not raw skip flags
     ctx_inc = (1 if left_skip else 0) + (1 if top_skip else 0)
 
     # Base context depends on slice type
@@ -74,32 +80,31 @@ def decode_mb_type_i(
     decoder: 'CABACDecoder',
     contexts: List['CABACContext'],
     ctx_inc: int = 0,
+    ctx_base: int = CTX_MB_TYPE_I_START,
 ) -> int:
-    """Decode mb_type for I-slice.
+    """Decode mb_type for I-slice (or I-suffix in P/B slice).
 
     Binarization (H.264 Table 9-26):
     - 0: I_4x4 = "0"
     - 1-24: I_16x16 sub-type
     - 25: I_PCM = "1" + terminate
 
-    Context indices (H.264 Table 9-32, ctxIdxOffset=3):
-    - binIdx 0: ctxIdx = 3 + ctx_inc (neighbor-dependent, 0-2)
-    - binIdx 1: decode_terminate (I_PCM check)
-    - binIdx 2: ctxIdx = 3 + 3 = 6 (cbp_luma flag)
-    - binIdx 3: ctxIdx = 3 + 4 = 7 (chroma CBP first)
-    - binIdx 4: ctxIdx = 3 + 5 = 8 (chroma CBP second, if needed)
-    - binIdx 5-6: bypass (pred mode, 2 bits)
+    Context indices depend on slice type (H.264 Table 9-32):
+    - I-slice: ctxIdxOffset = 3
+    - P-slice suffix: ctxIdxOffset = 17
+    - B-slice suffix: ctxIdxOffset = 32
 
     Args:
         decoder: CABAC decoder
         contexts: Context models
         ctx_inc: Context increment for first bin (condTermFlagA + condTermFlagB)
+        ctx_base: Context base offset (3 for I-slice, 17 for P-slice, 32 for B-slice)
 
     Returns:
         mb_type value (0-25)
     """
     # First bin: 0=I_4x4, 1=I_16x16 or I_PCM
-    ctx_idx = CTX_MB_TYPE_I_START + ctx_inc
+    ctx_idx = ctx_base + ctx_inc
     if decoder.decode_decision(contexts[ctx_idx]) == 0:
         return 0  # I_4x4
 
@@ -109,21 +114,67 @@ def decode_mb_type_i(
 
     # Decode I_16x16 sub-type (mb_type 1-24)
     # mb_type = 1 + pred_mode + 4*cbp_chroma + 12*(cbp_luma!=0)
+    # I-slice: spec ctxIdx 6-10 = ctx_base+3 through ctx_base+7
+    # (JM mb_type_contexts[0][4-8] with gap at [3] maps to ctxIdx 6-10)
 
-    # cbp_luma flag (ctxIdx = 3 + 3 = 6)
-    cbp_luma = decoder.decode_decision(contexts[CTX_MB_TYPE_I_START + 3])
+    # cbp_luma flag (ctxIdx 6)
+    cbp_luma = decoder.decode_decision(contexts[ctx_base + 3])
 
-    # cbp_chroma: truncated unary max 2 (ctxIdx 7 for first, 8 for second)
+    # cbp_chroma: truncated unary max 2 (ctxIdx 7, 8)
     cbp_chroma = 0
-    if decoder.decode_decision(contexts[CTX_MB_TYPE_I_START + 4]) == 1:
-        if decoder.decode_decision(contexts[CTX_MB_TYPE_I_START + 5]) == 1:
+    if decoder.decode_decision(contexts[ctx_base + 4]) == 1:
+        if decoder.decode_decision(contexts[ctx_base + 5]) == 1:
             cbp_chroma = 2
         else:
             cbp_chroma = 1
 
-    # pred_mode: 2 context-based bins (ctxIdx 9 and 10)
-    pred_mode_bit0 = decoder.decode_decision(contexts[CTX_MB_TYPE_I_START + 6])
-    pred_mode_bit1 = decoder.decode_decision(contexts[CTX_MB_TYPE_I_START + 7])
+    # pred_mode: 2 context-based bins (ctxIdx 9, 10)
+    pred_mode_bit0 = decoder.decode_decision(contexts[ctx_base + 6])
+    pred_mode_bit1 = decoder.decode_decision(contexts[ctx_base + 7])
+    pred_mode = pred_mode_bit0 * 2 + pred_mode_bit1
+
+    return 1 + pred_mode + 4 * cbp_chroma + 12 * cbp_luma
+
+
+def _decode_mb_type_i_suffix(
+    decoder: 'CABACDecoder',
+    contexts: List['CABACContext'],
+    ctx_base: int = CTX_MB_TYPE_P_SUFFIX,
+) -> int:
+    """Decode I-MB type in P/B-slice suffix.
+
+    H.264 Table 9-34/9-36: I-suffix context base differs by slice type.
+    P-slice: ctx_base=17 (CTX_MB_TYPE_P_SUFFIX)
+    B-slice: ctx_base=32 (CTX_MB_TYPE_B_SUFFIX)
+
+    Layout (5 contexts from ctx_base):
+    - ctx_base+0: I_4x4/I_16x16 bin0
+    - ctx_base+1: cbp_luma
+    - ctx_base+2: cbp_chroma (both bins, same context)
+    - ctx_base+3: pred_mode (both bins, same context)
+
+    Returns:
+        mb_type 0-25 (I_4x4=0, I_16x16 sub-types=1-24, I_PCM=25)
+    """
+    # bin0: I_4x4 vs I_16x16/I_PCM
+    if decoder.decode_decision(contexts[ctx_base]) == 0:
+        return 0  # I_4x4
+
+    if decoder.decode_terminate() == 1:
+        return 25  # I_PCM
+
+    # I_16x16 sub-type: cbp_luma, cbp_chroma, pred_mode
+    cbp_luma = decoder.decode_decision(contexts[ctx_base + 1])
+
+    cbp_chroma = 0
+    if decoder.decode_decision(contexts[ctx_base + 2]) == 1:
+        if decoder.decode_decision(contexts[ctx_base + 2]) == 1:
+            cbp_chroma = 2
+        else:
+            cbp_chroma = 1
+
+    pred_mode_bit0 = decoder.decode_decision(contexts[ctx_base + 3])
+    pred_mode_bit1 = decoder.decode_decision(contexts[ctx_base + 3])
     pred_mode = pred_mode_bit0 * 2 + pred_mode_bit1
 
     return 1 + pred_mode + 4 * cbp_chroma + 12 * cbp_luma
@@ -151,69 +202,90 @@ def decode_mb_type_p(
         # P-MB type
         ctx_idx = CTX_MB_TYPE_P_START + 1
         if decoder.decode_decision(contexts[ctx_idx]) == 0:
-            # P_L0_16x16 or P_8x8
+            # P_L0_16x16 or P_8x8 (path 0,0,x uses ctx 16)
             ctx_idx = CTX_MB_TYPE_P_START + 2
             if decoder.decode_decision(contexts[ctx_idx]) == 0:
                 return 0  # P_L0_16x16
             else:
                 return 3  # P_8x8
         else:
-            # P_L0_L0_16x8 or P_L0_L0_8x16
-            ctx_idx = CTX_MB_TYPE_P_START + 3
+            # P_L0_L0_8x16 or P_L0_L0_16x8 (H.264 Table 9-36)
+            # bin 2 path 0,1,x uses ctx 17 (shared with I-suffix bin0)
+            # JM: mb_type_contexts[1][7] for this bin
+            ctx_idx = CTX_MB_TYPE_P_SUFFIX
             if decoder.decode_decision(contexts[ctx_idx]) == 0:
-                return 1  # P_L0_L0_16x8
+                return 2  # P_L0_L0_8x16 (bins: 0 1 0)
             else:
-                return 2  # P_L0_L0_8x16
+                return 1  # P_L0_L0_16x8 (bins: 0 1 1)
     else:
         # I-MB in P-slice: decode as I-MB type + offset
-        i_type = decode_mb_type_i(decoder, contexts)
-        return 5 + i_type
+        # H.264 Table 9-32: P-slice I-suffix uses ctxIdxOffset=17
+        # JM uses mb_type_contexts[1] with compact offsets:
+        #   [7]=ctx17: bin0 (I_4x4/I_16x16), [8]=ctx18: cbp_luma,
+        #   [9]=ctx19: cbp_chroma (both bins), [10]=ctx20: pred_mode (both bins)
+        return 5 + _decode_mb_type_i_suffix(decoder, contexts)
 
 
 def decode_mb_type_b(
     decoder: 'CABACDecoder',
     contexts: List['CABACContext'],
+    ctx_inc: int = 0,
 ) -> int:
     """Decode mb_type for B-slice.
 
     B-MB types (0-22) or I-MB types (23+).
+    Flat 4-bin read per H.264 Table 9-37.
+
+    Context index assignment (H.264 Table 9-34):
+      bin 0: ctxIdx = 27 + ctx_inc (0, 1, or 2)
+      bin 1: ctxIdx = 30
+      bin 2: ctxIdx = 31
+      bins 3+: ctxIdx = 32
 
     Args:
         decoder: CABAC decoder
         contexts: Context models
+        ctx_inc: Context increment for bin 0 (condTermFlagA + condTermFlagB)
 
     Returns:
         mb_type value
     """
-    ctx_idx = CTX_MB_TYPE_B_START
+    ctx = CTX_MB_TYPE_B_START  # 27
 
-    # First bin: 0=B_Direct, 1=other
-    if decoder.decode_decision(contexts[ctx_idx]) == 0:
+    # bin 0 (ctxIdx = 27 + ctx_inc): 0=B_Direct, 1=other
+    if decoder.decode_decision(contexts[ctx + ctx_inc]) == 0:
         return 0  # B_Direct_16x16
 
-    ctx_idx = CTX_MB_TYPE_B_START + 1
-    if decoder.decode_decision(contexts[ctx_idx]) == 0:
-        # B_L0_16x16 or B_L1_16x16
-        ctx_idx = CTX_MB_TYPE_B_START + 3
-        if decoder.decode_decision(contexts[ctx_idx]) == 0:
-            return 1  # B_L0_16x16
-        else:
-            return 2  # B_L1_16x16
-    else:
-        ctx_idx = CTX_MB_TYPE_B_START + 2
-        if decoder.decode_decision(contexts[ctx_idx]) == 0:
-            # B_Bi_16x16 or partitioned
-            ctx_idx = CTX_MB_TYPE_B_START + 3
-            if decoder.decode_decision(contexts[ctx_idx]) == 0:
-                return 3  # B_Bi_16x16
-            else:
-                # Partitioned types (4-21) or B_8x8 (22)
-                # Simplified: return B_8x8
-                return 22
-        else:
-            # I-MB in B-slice
-            i_type = decode_mb_type_i(decoder, contexts)
-            return 23 + i_type
+    # bin 1 (ctxIdx = 30)
+    if decoder.decode_decision(contexts[ctx + 3]) == 0:
+        # bin 2 (ctxIdx = 32 per JM/ffmpeg): 0=B_L0_16x16, 1=B_L1_16x16
+        return 1 + decoder.decode_decision(contexts[ctx + 5])
+
+    # After bin0=1, bin1=1: read 4 bins as flat value (H.264 Table 9-37)
+    # bin 2 (ctxIdx = 31), bins 3-5 (ctxIdx = 32)
+    bits = decoder.decode_decision(contexts[ctx + 4]) << 3
+    bits |= decoder.decode_decision(contexts[ctx + 5]) << 2
+    bits |= decoder.decode_decision(contexts[ctx + 5]) << 1
+    bits |= decoder.decode_decision(contexts[ctx + 5])
+
+    if bits < 8:
+        return bits + 3  # types 3-10
+
+    if bits == 13:
+        # I-MB in B-slice (prefix 111101)
+        i_type = _decode_mb_type_i_suffix(
+            decoder, contexts, ctx_base=CTX_MB_TYPE_B_SUFFIX)
+        return 23 + i_type
+
+    if bits == 14:
+        return 11  # B_L1_L0_8x16
+
+    if bits == 15:
+        return 22  # B_8x8
+
+    # bits 8-12: read one more bin (ctxIdx = 32) for types 12-21
+    bits = (bits << 1) | decoder.decode_decision(contexts[ctx + 5])
+    return bits - 4
 
 
 def decode_sub_mb_type_p(
@@ -231,15 +303,18 @@ def decode_sub_mb_type_p(
     """
     ctx_idx = CTX_SUB_MB_TYPE_P_START
 
-    if decoder.decode_decision(contexts[ctx_idx]) == 0:
+    # JM: bin0=1 → type 0, bin0=0 → continue
+    if decoder.decode_decision(contexts[ctx_idx]) == 1:
         return 0  # P_L0_8x8
 
     ctx_idx = CTX_SUB_MB_TYPE_P_START + 1
+    # JM: bin1=0 → type 1, bin1=1 → continue
     if decoder.decode_decision(contexts[ctx_idx]) == 0:
         return 1  # P_L0_8x4
 
     ctx_idx = CTX_SUB_MB_TYPE_P_START + 2
-    if decoder.decode_decision(contexts[ctx_idx]) == 0:
+    # JM: bin2=1 → type 2, bin2=0 → type 3
+    if decoder.decode_decision(contexts[ctx_idx]) == 1:
         return 2  # P_L0_4x8
 
     return 3  # P_L0_4x4
@@ -251,6 +326,8 @@ def decode_sub_mb_type_b(
 ) -> int:
     """Decode sub_mb_type for B-slice B_8x8.
 
+    Flat grouped structure per JM/ffmpeg (H.264 Table 9-38).
+
     Args:
         decoder: CABAC decoder
         contexts: Context models
@@ -258,32 +335,71 @@ def decode_sub_mb_type_b(
     Returns:
         sub_mb_type (0-12)
     """
-    # Simplified: use truncated unary
-    return decode_truncated_unary(
-        decoder, max_val=12, ctx_base=CTX_SUB_MB_TYPE_P_START, contexts=contexts
-    )
+    ctx = CTX_SUB_MB_TYPE_B_START
+
+    # bin 0 (ctx+0 = 36)
+    if decoder.decode_decision(contexts[ctx]) == 0:
+        return 0  # B_Direct_8x8
+
+    # bin 1 (ctx+1 = 37)
+    if decoder.decode_decision(contexts[ctx + 1]) == 0:
+        # bin 2 (ctx+3 = 39): 0=B_L0_8x8, 1=B_L1_8x8
+        return 1 + decoder.decode_decision(contexts[ctx + 3])
+
+    # After bin0=1, bin1=1: grouped structure
+    # bin 2 (ctx+2 = 38): determines group
+    type_val = 3
+    if decoder.decode_decision(contexts[ctx + 2]):
+        type_val += 4  # type_val = 7
+        # bin 3 (ctx+3 = 39): sub-group
+        if decoder.decode_decision(contexts[ctx + 3]):
+            # type_val = 11: types 11-12 (just one more bin)
+            return 11 + decoder.decode_decision(contexts[ctx + 3])
+
+    # type_val is 3 (group 3-6) or 7 (group 7-10): two more bins
+    if decoder.decode_decision(contexts[ctx + 3]):
+        type_val += 2
+    if decoder.decode_decision(contexts[ctx + 3]):
+        type_val += 1
+    return type_val
 
 
 def decode_ref_idx(
     decoder: 'CABACDecoder',
     contexts: List['CABACContext'],
     list_idx: int,
+    num_ref: int = 0,
 ) -> int:
     """Decode ref_idx_lX.
 
-    Uses unary binarization.
+    Uses truncated unary binarization limited by num_ref-1.
+    Context base is ctxIdx 54 regardless of L0/L1 (H.264 Table 9-34).
 
     Args:
         decoder: CABAC decoder
         contexts: Context models
-        list_idx: 0=L0, 1=L1
+        list_idx: 0=L0, 1=L1 (unused for context, kept for API)
+        num_ref: Number of active references (max value = num_ref - 1)
 
     Returns:
         Reference index (>= 0)
     """
-    ctx_base = CTX_REF_IDX_START + list_idx * 3
+    ctx_base = CTX_REF_IDX_START
 
-    return decode_unary(decoder, ctx_base=ctx_base, contexts=contexts, max_ctx_inc=2)
+    if num_ref <= 1:
+        return 0
+
+    # Unary with max = num_ref - 1
+    value = 0
+    max_val = num_ref - 1
+
+    while value < max_val:
+        ctx_idx = ctx_base + min(value, 2)
+        if decoder.decode_decision(contexts[ctx_idx]) == 0:
+            break
+        value += 1
+
+    return value
 
 
 def decode_mvd_lx(
@@ -291,6 +407,7 @@ def decode_mvd_lx(
     contexts: List['CABACContext'],
     list_idx: int,
     comp: int,
+    ctx_inc_bin0: int = 0,
 ) -> int:
     """Decode mvd_lX[comp].
 
@@ -301,13 +418,14 @@ def decode_mvd_lx(
         contexts: Context models
         list_idx: 0=L0, 1=L1
         comp: 0=x, 1=y
+        ctx_inc_bin0: Context increment for bin0 from neighbor MVDs (0-2)
 
     Returns:
         Signed MVD value
     """
     from entropy.cabac_binarize import decode_mvd
 
-    return decode_mvd(decoder, contexts=contexts, comp=comp)
+    return decode_mvd(decoder, contexts=contexts, comp=comp, ctx_inc_bin0=ctx_inc_bin0)
 
 
 def decode_mb_qp_delta(

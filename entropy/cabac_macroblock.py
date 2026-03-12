@@ -42,6 +42,101 @@ CTX_TRANSFORM_SIZE_FLAG = 399
 CTX_MB_FIELD_DECODING_FLAG = 70
 CTX_END_OF_SLICE_FLAG = 276
 
+# Sub-MB index to 4x4 block base position (blk_x, blk_y)
+_SUB_MB_BASE = [(0, 0), (2, 0), (0, 2), (2, 2)]
+
+# Sub-partition block offsets within a sub-MB for each sub_mb_type
+# P: type 0=8x8, 1=8x4, 2=4x8, 3=4x4
+_P_SUB_PART_OFFSETS = {
+    0: [(0, 0)],                              # 8x8: 1 MVD
+    1: [(0, 0), (0, 1)],                      # 8x4: top, bottom
+    2: [(0, 0), (1, 0)],                      # 4x8: left, right
+    3: [(0, 0), (1, 0), (0, 1), (1, 1)],      # 4x4: raster scan
+}
+
+# Block coverage (rows, cols) for each sub-partition type
+_P_SUB_PART_COVERAGE = {
+    0: [(2, 2)],                              # 8x8
+    1: [(1, 2), (1, 2)],                      # 8x4: each covers 1 row x 2 cols
+    2: [(2, 1), (2, 1)],                      # 4x8: each covers 2 rows x 1 col
+    3: [(1, 1), (1, 1), (1, 1), (1, 1)],      # 4x4: each covers 1x1
+}
+
+# B sub-partition block offsets within a sub-MB (H.264 Table 7-18)
+# sub_type 0 (Direct) derives MVDs, not decoded — no entry needed
+_B_SUB_PART_OFFSETS = {
+    1: [(0, 0)],                              # B_L0_8x8
+    2: [(0, 0)],                              # B_L1_8x8
+    3: [(0, 0)],                              # B_Bi_8x8
+    4: [(0, 0), (0, 1)],                      # B_L0_8x4
+    5: [(0, 0), (1, 0)],                      # B_L0_4x8
+    6: [(0, 0), (0, 1)],                      # B_L1_8x4
+    7: [(0, 0), (1, 0)],                      # B_L1_4x8
+    8: [(0, 0), (0, 1)],                      # B_Bi_8x4
+    9: [(0, 0), (1, 0)],                      # B_Bi_4x8
+    10: [(0, 0), (1, 0), (0, 1), (1, 1)],     # B_L0_4x4
+    11: [(0, 0), (1, 0), (0, 1), (1, 1)],     # B_L1_4x4
+    12: [(0, 0), (1, 0), (0, 1), (1, 1)],     # B_Bi_4x4
+}
+
+_B_SUB_PART_COVERAGE = {
+    1: [(2, 2)],                              # 8x8
+    2: [(2, 2)],
+    3: [(2, 2)],
+    4: [(1, 2), (1, 2)],                      # 8x4
+    5: [(2, 1), (2, 1)],                      # 4x8
+    6: [(1, 2), (1, 2)],
+    7: [(2, 1), (2, 1)],
+    8: [(1, 2), (1, 2)],
+    9: [(2, 1), (2, 1)],
+    10: [(1, 1), (1, 1), (1, 1), (1, 1)],     # 4x4
+    11: [(1, 1), (1, 1), (1, 1), (1, 1)],
+    12: [(1, 1), (1, 1), (1, 1), (1, 1)],
+}
+
+
+def _compute_mvd_ctx_inc(
+    comp: int,
+    blk_x: int,
+    blk_y: int,
+    cur_mvds: np.ndarray,
+    left_mvds: Optional[np.ndarray],
+    top_mvds: Optional[np.ndarray],
+) -> int:
+    """Compute ctxIdxInc for MVD bin0 (H.264 Section 9.3.3.1.1.7).
+
+    Args:
+        comp: 0=x, 1=y
+        blk_x, blk_y: Current 4x4 block position (0-3)
+        cur_mvds: Current MB's MVD grid [4, 4, 2]
+        left_mvds: Left MB's MVD grid [4, 4, 2] or None
+        top_mvds: Top MB's MVD grid [4, 4, 2] or None
+
+    Returns:
+        ctxIdxInc: 0, 1, or 2
+    """
+    # Left neighbor (A)
+    abs_a = 0
+    if blk_x > 0:
+        abs_a = abs(int(cur_mvds[blk_y, blk_x - 1, comp]))
+    elif left_mvds is not None:
+        abs_a = abs(int(left_mvds[blk_y, 3, comp]))
+
+    # Top neighbor (B)
+    abs_b = 0
+    if blk_y > 0:
+        abs_b = abs(int(cur_mvds[blk_y - 1, blk_x, comp]))
+    elif top_mvds is not None:
+        abs_b = abs(int(top_mvds[3, blk_x, comp]))
+
+    total = abs_a + abs_b
+    if total < 3:
+        return 0
+    elif total > 32:
+        return 2
+    else:
+        return 1
+
 
 def decode_mb_skip_flag_cabac(
     decoder: 'CABACDecoder',
@@ -64,14 +159,14 @@ def decode_mb_skip_flag_cabac(
     mb_x = mb_info.get('mb_x', 0)
     mb_y = mb_info.get('mb_y', 0)
 
-    # Unavailable neighbors treated as not skipped
+    # H.264 9.3.3.1.1.3: condTermFlagN = 1 if neighbor available AND NOT skip
     left_available = mb_info.get('left_available', False)
     top_available = mb_info.get('top_available', False)
-    left_skip = mb_info.get('left_skip', False) if left_available else False
-    top_skip = mb_info.get('top_skip', False) if top_available else False
+    left_cond = left_available and not mb_info.get('left_skip', False)
+    top_cond = top_available and not mb_info.get('top_skip', False)
 
     return decode_mb_skip_flag(
-        decoder, contexts, slice_type, mb_x, mb_y, left_skip, top_skip
+        decoder, contexts, slice_type, mb_x, mb_y, left_cond, top_cond
     )
 
 
@@ -111,7 +206,20 @@ def decode_mb_type_cabac(
     elif slice_type == 0:  # P-slice
         return decode_mb_type_p(decoder, contexts)
     else:  # B-slice
-        return decode_mb_type_b(decoder, contexts)
+        # H.264 9.3.3.1.1.3: condTermFlagN = 1 if neighbor available
+        # and mb_type != B_Direct_16x16 (type 0) and not skip
+        left_available = mb_info.get('left_available', False)
+        top_available = mb_info.get('top_available', False)
+        left_mb_type = mb_info.get('left_mb_type', None)
+        top_mb_type = mb_info.get('top_mb_type', None)
+        left_skip = mb_info.get('left_skip', False)
+        top_skip = mb_info.get('top_skip', False)
+        cond_a = 1 if (left_available and left_mb_type is not None
+                       and left_mb_type != 0 and not left_skip) else 0
+        cond_b = 1 if (top_available and top_mb_type is not None
+                       and top_mb_type != 0 and not top_skip) else 0
+        ctx_inc = cond_a + cond_b
+        return decode_mb_type_b(decoder, contexts, ctx_inc=ctx_inc)
 
 
 def decode_sub_mb_type_cabac(
@@ -249,7 +357,10 @@ def decode_mb_pred_cabac(
     slice_type: int,
     mb_info: Dict[str, Any],
 ) -> Dict[str, Any]:
-    """Decode mb_pred (prediction modes, reference indices, MVDs).
+    """Decode mb_pred or sub_mb_pred.
+
+    H.264 Section 7.3.5.1 (mb_pred) and 7.3.5.2 (sub_mb_pred).
+    Parses ref_idx and MVD for each partition in syntax order.
 
     Args:
         decoder: CABAC decoder
@@ -259,7 +370,7 @@ def decode_mb_pred_cabac(
         mb_info: Neighbor information
 
     Returns:
-        Dict with intra_pred_modes, ref_idx, mvd values
+        Dict with intra_pred_modes, ref_idx, mvd values, sub_mb_types
     """
     result = {
         'intra_pred_modes': [],
@@ -267,44 +378,381 @@ def decode_mb_pred_cabac(
         'ref_idx_l1': [],
         'mvd_l0': [],
         'mvd_l1': [],
+        'sub_mb_types': [],
     }
 
-    # Check if this is an intra MB
     is_intra = _is_intra_mb_type(mb_type, slice_type)
 
     if is_intra:
-        # Decode intra prediction modes
-        if mb_type == 0:  # I_4x4
+        # Intra prediction modes
+        intra_base = mb_type
+        if slice_type == 0:
+            intra_base = mb_type - 5
+        elif slice_type == 1:
+            intra_base = mb_type - 23
+
+        if intra_base == 0:  # I_4x4
             for _ in range(16):
                 if decode_prev_intra4x4_pred_mode_flag(decoder, contexts) == 1:
-                    result['intra_pred_modes'].append(-1)  # Use predicted mode
+                    result['intra_pred_modes'].append(-1)
                 else:
                     mode = decode_rem_intra4x4_pred_mode(decoder, contexts)
                     result['intra_pred_modes'].append(mode)
 
-        # Chroma prediction mode
         result['intra_chroma_pred_mode'] = decode_intra_chroma_pred_mode_cabac(
             decoder, contexts, mb_info
         )
-    else:
-        # Inter prediction - decode ref_idx and MVD
-        num_ref_l0 = mb_info.get('num_ref_idx_l0_active', 1)
-        num_ref_l1 = mb_info.get('num_ref_idx_l1_active', 1)
+        return result
 
-        # Number of partitions depends on mb_type
-        num_parts = _get_num_partitions(mb_type, slice_type)
+    num_ref_l0 = mb_info.get('num_ref_idx_l0_active', 1)
+    num_ref_l1 = mb_info.get('num_ref_idx_l1_active', 1)
 
-        for _ in range(num_parts):
-            if num_ref_l0 > 1:
-                ref = decode_ref_idx(decoder, contexts, 0, num_ref_l0)
-                result['ref_idx_l0'].append(ref)
-
-            # MVD (x and y components)
-            mvd_x = decode_mvd_lx(decoder, contexts, 0, 0)  # L0, x
-            mvd_y = decode_mvd_lx(decoder, contexts, 0, 1)  # L0, y
-            result['mvd_l0'].append((mvd_x, mvd_y))
+    if slice_type == 0:  # P-slice
+        _decode_p_mb_pred(decoder, contexts, mb_type, num_ref_l0, result, mb_info)
+    elif slice_type == 1:  # B-slice
+        _decode_b_mb_pred(decoder, contexts, mb_type, num_ref_l0, num_ref_l1, result, mb_info)
 
     return result
+
+
+def _decode_p_mb_pred(
+    decoder: 'CABACDecoder',
+    contexts: list,
+    mb_type: int,
+    num_ref_l0: int,
+    result: dict,
+    mb_info: dict,
+) -> None:
+    """Decode P-slice mb_pred or sub_mb_pred."""
+    if mb_type == 3:  # P_8x8
+        _decode_p_sub_mb_pred(decoder, contexts, num_ref_l0, result, mb_info)
+        return
+    if mb_type == 4:  # P_8x8ref0
+        _decode_p_sub_mb_pred(decoder, contexts, 1, result, mb_info)
+        return
+
+    # Regular P partitions: 0=16x16, 1=16x8, 2=8x16
+    num_parts = _get_num_partitions(mb_type, 0)
+
+    # ref_idx_l0 for all partitions
+    for _ in range(num_parts):
+        ref = decode_ref_idx(decoder, contexts, 0, num_ref_l0)
+        result['ref_idx_l0'].append(ref)
+
+    # MVD grid for neighbor context computation
+    cur_mvds = np.zeros((4, 4, 2), dtype=np.int32)
+    left_mvds = mb_info.get('left_mb_mvds_l0')
+    top_mvds = mb_info.get('top_mb_mvds_l0')
+
+    # Partition top-left block positions: 16x16→(0,0), 16x8→(0,0)/(0,2), 8x16→(0,0)/(2,0)
+    part_positions = [(0, 0)]
+    if mb_type == 1:  # P_L0_16x8
+        part_positions = [(0, 0), (0, 2)]
+    elif mb_type == 2:  # P_L0_8x16
+        part_positions = [(0, 0), (2, 0)]
+
+    # mvd_l0 for all partitions
+    for part_idx in range(num_parts):
+        blk_x, blk_y = part_positions[part_idx]
+
+        ctx_inc_x = _compute_mvd_ctx_inc(0, blk_x, blk_y, cur_mvds, left_mvds, top_mvds)
+        ctx_inc_y = _compute_mvd_ctx_inc(1, blk_x, blk_y, cur_mvds, left_mvds, top_mvds)
+
+        mvd_x = decode_mvd_lx(decoder, contexts, 0, 0, ctx_inc_x)
+        mvd_y = decode_mvd_lx(decoder, contexts, 0, 1, ctx_inc_y)
+        result['mvd_l0'].append((mvd_x, mvd_y))
+
+        # Fill MVD grid for this partition
+        if mb_type == 0:  # P_16x16: all blocks
+            cur_mvds[:, :, 0] = mvd_x
+            cur_mvds[:, :, 1] = mvd_y
+        elif mb_type == 1:  # P_16x8
+            cur_mvds[blk_y:blk_y + 2, :, 0] = mvd_x
+            cur_mvds[blk_y:blk_y + 2, :, 1] = mvd_y
+        elif mb_type == 2:  # P_8x16
+            cur_mvds[:, blk_x:blk_x + 2, 0] = mvd_x
+            cur_mvds[:, blk_x:blk_x + 2, 1] = mvd_y
+
+    result['mvd_grid_l0'] = cur_mvds
+
+
+def _decode_p_sub_mb_pred(
+    decoder: 'CABACDecoder',
+    contexts: list,
+    num_ref_l0: int,
+    result: dict,
+    mb_info: dict,
+) -> None:
+    """Decode P_8x8 sub_mb_pred (H.264 7.3.5.2)."""
+    # sub_mb_type[4]
+    sub_types = []
+    for _ in range(4):
+        sub_types.append(decode_sub_mb_type_p(decoder, contexts))
+    result['sub_mb_types'] = sub_types
+
+    # ref_idx_l0[4]
+    for _ in range(4):
+        ref = decode_ref_idx(decoder, contexts, 0, num_ref_l0)
+        result['ref_idx_l0'].append(ref)
+
+    # MVD grid for neighbor context computation
+    cur_mvds = np.zeros((4, 4, 2), dtype=np.int32)
+    left_mvds = mb_info.get('left_mb_mvds_l0')
+    top_mvds = mb_info.get('top_mb_mvds_l0')
+
+    # mvd_l0 for each sub-partition
+    for sub_idx in range(4):
+        base_x, base_y = _SUB_MB_BASE[sub_idx]
+        sub_type = sub_types[sub_idx]
+        offsets = _P_SUB_PART_OFFSETS.get(sub_type, [(0, 0)])
+        coverage = _P_SUB_PART_COVERAGE.get(sub_type, [(2, 2)])
+
+        for part_i, (dx, dy) in enumerate(offsets):
+            blk_x = base_x + dx
+            blk_y = base_y + dy
+
+            ctx_inc_x = _compute_mvd_ctx_inc(0, blk_x, blk_y, cur_mvds, left_mvds, top_mvds)
+            ctx_inc_y = _compute_mvd_ctx_inc(1, blk_x, blk_y, cur_mvds, left_mvds, top_mvds)
+
+            mvd_x = decode_mvd_lx(decoder, contexts, 0, 0, ctx_inc_x)
+            mvd_y = decode_mvd_lx(decoder, contexts, 0, 1, ctx_inc_y)
+            result['mvd_l0'].append((mvd_x, mvd_y))
+
+            # Fill MVD grid for this sub-partition
+            rows, cols = coverage[part_i]
+            cur_mvds[blk_y:blk_y + rows, blk_x:blk_x + cols, 0] = mvd_x
+            cur_mvds[blk_y:blk_y + rows, blk_x:blk_x + cols, 1] = mvd_y
+
+    result['mvd_grid_l0'] = cur_mvds
+
+
+def _decode_b_mb_pred(
+    decoder: 'CABACDecoder',
+    contexts: list,
+    mb_type: int,
+    num_ref_l0: int,
+    num_ref_l1: int,
+    result: dict,
+    mb_info: dict,
+) -> None:
+    """Decode B-slice mb_pred or sub_mb_pred."""
+    if mb_type == 0:  # B_Direct_16x16 — no ref_idx or MVD in bitstream
+        return
+
+    if mb_type == 22:  # B_8x8
+        _decode_b_sub_mb_pred(decoder, contexts, num_ref_l0, num_ref_l1, result, mb_info)
+        return
+
+    # Regular B partitions (types 1-21)
+    num_parts = _get_num_partitions(mb_type, 1)
+    pred_flags = _get_b_pred_flags(mb_type)
+
+    # ref_idx_l0 for all partitions (H.264 7.3.5.1 order)
+    for i in range(num_parts):
+        if pred_flags[i][0]:  # predFlagL0
+            ref = decode_ref_idx(decoder, contexts, 0, num_ref_l0)
+            result['ref_idx_l0'].append(ref)
+
+    # ref_idx_l1 for all partitions
+    for i in range(num_parts):
+        if pred_flags[i][1]:  # predFlagL1
+            ref = decode_ref_idx(decoder, contexts, 1, num_ref_l1)
+            result['ref_idx_l1'].append(ref)
+
+    # Partition positions and coverage in 4x4 block units
+    if mb_type <= 3:  # 16x16
+        part_positions = [(0, 0)]
+        part_rows, part_cols = 4, 4
+    elif mb_type % 2 == 0:  # 16x8 (even types 4,6,...,20)
+        part_positions = [(0, 0), (0, 2)]
+        part_rows, part_cols = 2, 4
+    else:  # 8x16 (odd types 5,7,...,21)
+        part_positions = [(0, 0), (2, 0)]
+        part_rows, part_cols = 4, 2
+
+    # MVD grids for neighbor context computation (H.264 9.3.3.1.1.7)
+    cur_mvds_l0 = np.zeros((4, 4, 2), dtype=np.int32)
+    cur_mvds_l1 = np.zeros((4, 4, 2), dtype=np.int32)
+    left_mvds_l0 = mb_info.get('left_mb_mvds_l0')
+    top_mvds_l0 = mb_info.get('top_mb_mvds_l0')
+    left_mvds_l1 = mb_info.get('left_mb_mvds_l1')
+    top_mvds_l1 = mb_info.get('top_mb_mvds_l1')
+
+    # mvd_l0 for all partitions
+    for i in range(num_parts):
+        if pred_flags[i][0]:
+            blk_x, blk_y = part_positions[i]
+            ctx_inc_x = _compute_mvd_ctx_inc(0, blk_x, blk_y, cur_mvds_l0, left_mvds_l0, top_mvds_l0)
+            ctx_inc_y = _compute_mvd_ctx_inc(1, blk_x, blk_y, cur_mvds_l0, left_mvds_l0, top_mvds_l0)
+            mvd_x = decode_mvd_lx(decoder, contexts, 0, 0, ctx_inc_x)
+            mvd_y = decode_mvd_lx(decoder, contexts, 0, 1, ctx_inc_y)
+            result['mvd_l0'].append((mvd_x, mvd_y))
+            cur_mvds_l0[blk_y:blk_y + part_rows, blk_x:blk_x + part_cols, 0] = mvd_x
+            cur_mvds_l0[blk_y:blk_y + part_rows, blk_x:blk_x + part_cols, 1] = mvd_y
+
+    # mvd_l1 for all partitions
+    for i in range(num_parts):
+        if pred_flags[i][1]:
+            blk_x, blk_y = part_positions[i]
+            ctx_inc_x = _compute_mvd_ctx_inc(0, blk_x, blk_y, cur_mvds_l1, left_mvds_l1, top_mvds_l1)
+            ctx_inc_y = _compute_mvd_ctx_inc(1, blk_x, blk_y, cur_mvds_l1, left_mvds_l1, top_mvds_l1)
+            mvd_x = decode_mvd_lx(decoder, contexts, 1, 0, ctx_inc_x)
+            mvd_y = decode_mvd_lx(decoder, contexts, 1, 1, ctx_inc_y)
+            result['mvd_l1'].append((mvd_x, mvd_y))
+            cur_mvds_l1[blk_y:blk_y + part_rows, blk_x:blk_x + part_cols, 0] = mvd_x
+            cur_mvds_l1[blk_y:blk_y + part_rows, blk_x:blk_x + part_cols, 1] = mvd_y
+
+    result['mvd_grid_l0'] = cur_mvds_l0
+    result['mvd_grid_l1'] = cur_mvds_l1
+
+
+def _decode_b_sub_mb_pred(
+    decoder: 'CABACDecoder',
+    contexts: list,
+    num_ref_l0: int,
+    num_ref_l1: int,
+    result: dict,
+    mb_info: dict,
+) -> None:
+    """Decode B_8x8 sub_mb_pred (H.264 7.3.5.2)."""
+    # sub_mb_type[4]
+    sub_types = []
+    for _ in range(4):
+        sub_types.append(decode_sub_mb_type_b(decoder, contexts))
+    result['sub_mb_types'] = sub_types
+
+    # ref_idx_l0[4] — one per sub-MB, only if sub-partition uses L0
+    # B_Direct_8x8 (sub_type=0) derives ref_idx, does not read from bitstream
+    for i in range(4):
+        if sub_types[i] != 0 and _b_sub_uses_l0(sub_types[i]):
+            ref = decode_ref_idx(decoder, contexts, 0, num_ref_l0)
+            result['ref_idx_l0'].append(ref)
+        else:
+            result['ref_idx_l0'].append(0)  # placeholder or derived
+
+    # ref_idx_l1[4]
+    for i in range(4):
+        if sub_types[i] != 0 and _b_sub_uses_l1(sub_types[i]):
+            ref = decode_ref_idx(decoder, contexts, 1, num_ref_l1)
+            result['ref_idx_l1'].append(ref)
+        else:
+            result['ref_idx_l1'].append(0)  # placeholder or derived
+
+    # MVD grids for neighbor context computation
+    cur_mvds_l0 = np.zeros((4, 4, 2), dtype=np.int32)
+    cur_mvds_l1 = np.zeros((4, 4, 2), dtype=np.int32)
+    left_mvds_l0 = mb_info.get('left_mb_mvds_l0')
+    top_mvds_l0 = mb_info.get('top_mb_mvds_l0')
+    left_mvds_l1 = mb_info.get('left_mb_mvds_l1')
+    top_mvds_l1 = mb_info.get('top_mb_mvds_l1')
+
+    # mvd_l0 per sub-partition
+    for sub_idx in range(4):
+        if _b_sub_uses_l0(sub_types[sub_idx]) and sub_types[sub_idx] != 0:
+            base_x, base_y = _SUB_MB_BASE[sub_idx]
+            sub_type = sub_types[sub_idx]
+            offsets = _B_SUB_PART_OFFSETS.get(sub_type, [(0, 0)])
+            coverage = _B_SUB_PART_COVERAGE.get(sub_type, [(2, 2)])
+
+            for part_i, (dx, dy) in enumerate(offsets):
+                blk_x = base_x + dx
+                blk_y = base_y + dy
+
+                ctx_inc_x = _compute_mvd_ctx_inc(0, blk_x, blk_y, cur_mvds_l0, left_mvds_l0, top_mvds_l0)
+                ctx_inc_y = _compute_mvd_ctx_inc(1, blk_x, blk_y, cur_mvds_l0, left_mvds_l0, top_mvds_l0)
+
+                mvd_x = decode_mvd_lx(decoder, contexts, 0, 0, ctx_inc_x)
+                mvd_y = decode_mvd_lx(decoder, contexts, 0, 1, ctx_inc_y)
+                result['mvd_l0'].append((mvd_x, mvd_y))
+
+                rows, cols = coverage[part_i]
+                cur_mvds_l0[blk_y:blk_y + rows, blk_x:blk_x + cols, 0] = mvd_x
+                cur_mvds_l0[blk_y:blk_y + rows, blk_x:blk_x + cols, 1] = mvd_y
+
+    # mvd_l1 per sub-partition
+    for sub_idx in range(4):
+        if _b_sub_uses_l1(sub_types[sub_idx]) and sub_types[sub_idx] != 0:
+            base_x, base_y = _SUB_MB_BASE[sub_idx]
+            sub_type = sub_types[sub_idx]
+            offsets = _B_SUB_PART_OFFSETS.get(sub_type, [(0, 0)])
+            coverage = _B_SUB_PART_COVERAGE.get(sub_type, [(2, 2)])
+
+            for part_i, (dx, dy) in enumerate(offsets):
+                blk_x = base_x + dx
+                blk_y = base_y + dy
+
+                ctx_inc_x = _compute_mvd_ctx_inc(0, blk_x, blk_y, cur_mvds_l1, left_mvds_l1, top_mvds_l1)
+                ctx_inc_y = _compute_mvd_ctx_inc(1, blk_x, blk_y, cur_mvds_l1, left_mvds_l1, top_mvds_l1)
+
+                mvd_x = decode_mvd_lx(decoder, contexts, 1, 0, ctx_inc_x)
+                mvd_y = decode_mvd_lx(decoder, contexts, 1, 1, ctx_inc_y)
+                result['mvd_l1'].append((mvd_x, mvd_y))
+
+                rows, cols = coverage[part_i]
+                cur_mvds_l1[blk_y:blk_y + rows, blk_x:blk_x + cols, 0] = mvd_x
+                cur_mvds_l1[blk_y:blk_y + rows, blk_x:blk_x + cols, 1] = mvd_y
+
+    result['mvd_grid_l0'] = cur_mvds_l0
+    result['mvd_grid_l1'] = cur_mvds_l1
+
+
+def _p_sub_num_parts(sub_type: int) -> int:
+    """Number of sub-partitions for P sub_mb_type."""
+    # 0=8x8(1), 1=8x4(2), 2=4x8(2), 3=4x4(4)
+    return [1, 2, 2, 4][min(sub_type, 3)]
+
+
+def _b_sub_num_parts(sub_type: int) -> int:
+    """Number of sub-partitions for B sub_mb_type."""
+    # H.264 Table 7-18
+    # 0=Direct(4), 1=L0_8x8(1), 2=L1_8x8(1), 3=Bi_8x8(1),
+    # 4=L0_8x4(2), 5=L0_4x8(2), 6=L1_8x4(2), 7=L1_4x8(2),
+    # 8=Bi_8x4(2), 9=Bi_4x8(2), 10=L0_4x4(4), 11=L1_4x4(4), 12=Bi_4x4(4)
+    return [4, 1, 1, 1, 2, 2, 2, 2, 2, 2, 4, 4, 4][min(sub_type, 12)]
+
+
+def _b_sub_uses_l0(sub_type: int) -> bool:
+    """Whether B sub_mb_type uses L0 prediction."""
+    # Direct(0), L0(1,4,5,10), Bi(3,8,9,12)
+    return sub_type in (0, 1, 3, 4, 5, 8, 9, 10, 12)
+
+
+def _b_sub_uses_l1(sub_type: int) -> bool:
+    """Whether B sub_mb_type uses L1 prediction."""
+    # Direct(0), L1(2,6,7,11), Bi(3,8,9,12)
+    return sub_type in (0, 2, 3, 6, 7, 8, 9, 11, 12)
+
+
+# B-MB type prediction flags: per partition (predFlagL0, predFlagL1)
+# H.264 Table 7-14
+_B_PRED_FLAGS = {
+    1: [(True, False)],                        # B_L0_16x16
+    2: [(False, True)],                        # B_L1_16x16
+    3: [(True, True)],                         # B_Bi_16x16
+    4: [(True, False), (True, False)],         # B_L0_L0_16x8
+    5: [(True, False), (True, False)],         # B_L0_L0_8x16
+    6: [(False, True), (False, True)],         # B_L1_L1_16x8
+    7: [(False, True), (False, True)],         # B_L1_L1_8x16
+    8: [(True, False), (False, True)],         # B_L0_L1_16x8
+    9: [(True, False), (False, True)],         # B_L0_L1_8x16
+    10: [(False, True), (True, False)],        # B_L1_L0_16x8
+    11: [(False, True), (True, False)],        # B_L1_L0_8x16
+    12: [(True, False), (True, True)],         # B_L0_Bi_16x8
+    13: [(True, False), (True, True)],         # B_L0_Bi_8x16
+    14: [(False, True), (True, True)],         # B_L1_Bi_16x8
+    15: [(False, True), (True, True)],         # B_L1_Bi_8x16
+    16: [(True, True), (True, False)],         # B_Bi_L0_16x8
+    17: [(True, True), (True, False)],         # B_Bi_L0_8x16
+    18: [(True, True), (False, True)],         # B_Bi_L1_16x8
+    19: [(True, True), (False, True)],         # B_Bi_L1_8x16
+    20: [(True, True), (True, True)],          # B_Bi_Bi_16x8
+    21: [(True, True), (True, True)],          # B_Bi_Bi_8x16
+}
+
+
+def _get_b_pred_flags(mb_type: int) -> list:
+    """Get per-partition prediction flags for B mb_type."""
+    return _B_PRED_FLAGS.get(mb_type, [])
 
 
 def decode_macroblock_layer_cabac(
@@ -718,7 +1166,7 @@ def _decode_residual_cabac(
             for i in range(16):
                 ctx_idx = _get_cbf_ctx_idx(
                     1, i, mb_cbf, left_mb_cbf, top_mb_cbf,
-                    left_available, top_available,
+                    left_available, top_available, is_intra,
                 )
                 residual['luma_ac'][i] = decode_residual_block_cabac_with_cbf(
                     decoder, contexts, max_coeff=15, block_cat=1,
@@ -738,7 +1186,7 @@ def _decode_residual_cabac(
                     blk_idx = i8x8 * 4 + i4x4
                     ctx_idx = _get_cbf_ctx_idx(
                         2, blk_idx, mb_cbf, left_mb_cbf, top_mb_cbf,
-                        left_available, top_available,
+                        left_available, top_available, is_intra,
                     )
                     residual['luma_4x4'][blk_idx] = (
                         decode_residual_block_cabac_with_cbf(
@@ -780,7 +1228,7 @@ def _decode_residual_cabac(
         for i in range(4):
             ctx_idx = _get_cbf_ctx_idx(
                 4, i, mb_cbf, left_mb_cbf, top_mb_cbf,
-                left_available, top_available,
+                left_available, top_available, is_intra,
             )
             residual['chroma_ac_cb'][i] = decode_residual_block_cabac_with_cbf(
                 decoder, contexts, max_coeff=15, block_cat=4,
@@ -798,7 +1246,7 @@ def _decode_residual_cabac(
         for i in range(4):
             ctx_idx = _get_cbf_ctx_idx(
                 4, i, cr_cbf, left_mb_cbf, top_mb_cbf,
-                left_available, top_available,
+                left_available, top_available, is_intra,
                 chroma_ac_offset=4,
             )
             residual['chroma_ac_cr'][i] = decode_residual_block_cabac_with_cbf(
@@ -1123,9 +1571,9 @@ def get_mb_skip_flag_ctx_idx(
     Returns:
         Context index for mb_skip_flag
     """
-    # Unavailable neighbors are treated as not skipped
-    cond_term_flag_a = 1 if (left_available and left_skip) else 0
-    cond_term_flag_b = 1 if (top_available and top_skip) else 0
+    # H.264 9.3.3.1.1.3: condTermFlagN = 1 if neighbor available AND NOT skip
+    cond_term_flag_a = 1 if (left_available and not left_skip) else 0
+    cond_term_flag_b = 1 if (top_available and not top_skip) else 0
     ctx_inc = cond_term_flag_a + cond_term_flag_b
 
     if slice_type == 1:  # B-slice

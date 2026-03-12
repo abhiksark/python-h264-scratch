@@ -873,13 +873,13 @@ class TestMBSkipRunCABAC:
         )
         assert ctx_idx >= 0
 
-        # Both skipped: higher context
+        # Both skipped: lower context (condTermFlag=0 when neighbor IS skipped)
         ctx_idx_both = get_mb_skip_flag_ctx_idx(
             slice_type=0,
             left_available=True, left_skip=True,
             top_available=True, top_skip=True
         )
-        assert ctx_idx_both > ctx_idx
+        assert ctx_idx_both < ctx_idx
 
     def test_skip_to_non_skip_transition(self):
         """Handle transition from skipped to non-skipped MB."""
