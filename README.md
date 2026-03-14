@@ -9,7 +9,14 @@ A pixel-perfect H.264 video decoder written from scratch in pure Python and NumP
 
 Decodes real MP4 files downloaded from the internet — no C extensions, no FFI, no dependencies on existing codec libraries. Built to understand how video compression actually works.
 
-![Showcase — ffmpeg vs our decoder vs pixel diff](docs/showcase.png)
+![Showcase — ffmpeg reference vs our Python decoder, side by side](docs/linkedin_showcase.png)
+
+<details>
+<summary>With pixel diff visualization (click to expand)</summary>
+
+![Showcase with diff column — all black = zero error](docs/showcase.png)
+
+</details>
 
 ## What it does
 
