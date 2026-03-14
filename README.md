@@ -1,8 +1,15 @@
 # h264-decoder
 
+[![Python](https://img.shields.io/badge/Python-3.9+-blue.svg)](https://www.python.org/)
+[![License](https://img.shields.io/badge/License-Apache_2.0-green.svg)](LICENSE)
+[![Tests](https://img.shields.io/badge/Tests-1850_passing-brightgreen.svg)](#running-tests)
+[![Profile](https://img.shields.io/badge/H.264-Baseline_|_Main_|_High-orange.svg)](#supported-features)
+
 A pixel-perfect H.264 video decoder written from scratch in pure Python and NumPy.
 
 Decodes real MP4 files downloaded from the internet — no C extensions, no FFI, no dependencies on existing codec libraries. Built to understand how video compression actually works.
+
+![Showcase — ffmpeg vs our decoder vs pixel diff](docs/showcase.png)
 
 ## What it does
 
@@ -195,6 +202,20 @@ This decoder implements every stage of H.264 decoding from the spec (ITU-T H.264
 - **Intra prediction**: All 9 modes for 4x4 and 8x8 blocks with lowpass reference sample filtering
 - **Inter prediction**: Motion compensation with quarter-pixel interpolation, B-frame bi-prediction, weighted prediction, and direct mode
 - **Deblocking filter**: Boundary strength calculation and adaptive filtering
+
+## Performance
+
+This is an educational decoder — correctness over speed. Pure Python with NumPy, no SIMD, no threading.
+
+| Input | Resolution | I-frame decode | Notes |
+|-------|-----------|---------------|-------|
+| Big Buck Bunny | 640x360 | ~6s | 920 MBs, mixed I_4x4/I_8x8 |
+| Jellyfish | 640x360 | ~2.5s | 920 MBs, 227 I_16x16 |
+| Big Buck Bunny | 1280x720 | ~11s | 3600 MBs |
+
+Multi-frame decoding (P/B-frames): ~0.6 fps at 640x360.
+
+For comparison, ffmpeg decodes the same content at ~1000x the speed. The goal here isn't performance — it's a readable, spec-compliant implementation you can step through with a debugger.
 
 ## Dependencies
 

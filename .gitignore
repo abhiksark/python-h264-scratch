@@ -83,6 +83,7 @@ test_data/*.yuv
 test_data/*.mp4
 test_data/*.png
 test_data/*.pgm
+test_data/*.pgm
 test_data/**/*.264
 test_data/**/*.yuv
 
