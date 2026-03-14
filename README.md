@@ -214,11 +214,13 @@ This decoder implements every stage of H.264 decoding from the spec (ITU-T H.264
 
 This is an educational decoder — correctness over speed. Pure Python with NumPy, no SIMD, no threading.
 
-| Input | Resolution | I-frame decode | Notes |
-|-------|-----------|---------------|-------|
-| Big Buck Bunny | 640x360 | ~6s | 920 MBs, mixed I_4x4/I_8x8 |
-| Jellyfish | 640x360 | ~2.5s | 920 MBs, 227 I_16x16 |
-| Big Buck Bunny | 1280x720 | ~11s | 3600 MBs |
+![Performance benchmarks](docs/benchmarks.png)
+
+| Input | Resolution | I-frame decode | Throughput |
+|-------|-----------|---------------|------------|
+| Big Buck Bunny | 640x360 | ~6s | 0.04 Mpx/s |
+| Jellyfish | 640x360 | ~2.5s | 0.09 Mpx/s |
+| Big Buck Bunny | 1280x720 | ~11s | 0.08 Mpx/s |
 
 Multi-frame decoding (P/B-frames): ~0.6 fps at 640x360.
 
