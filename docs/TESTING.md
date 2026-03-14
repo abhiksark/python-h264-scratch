@@ -1,237 +1,103 @@
-# h264/docs/TESTING.md
 # Testing Strategy
 
 ## Overview
-Every component is tested against JM reference software to ensure bit-exact compliance.
 
-## JM Reference Software Setup
-
-### Installation
-```bash
-# Clone JM reference
-git clone https://github.com/shihuade/JM.git ~/JM
-cd ~/JM
-
-# Build (Linux/macOS)
-make
-
-# Binaries are in bin/
-ls bin/
-# lencod  ldecod  rtpdump  rtp_loss
-```
-
-### Generate Test Bitstreams
-
-#### Minimal Test (64x64, 1 I-frame)
-Create `encoder_test.cfg`:
-```ini
-# Basic settings
-InputFile = "test_input.yuv"
-OutputFile = "test.264"
-ReconFile = "test_rec.yuv"
-FramesToBeEncoded = 1
-SourceWidth = 64
-SourceHeight = 64
-FrameRate = 30
-
-# Baseline profile
-ProfileIDC = 66
-LevelIDC = 10
-
-# All I-frames
-IntraPeriod = 1
-IDRPeriod = 1
-
-# CAVLC (no CABAC)
-SymbolMode = 0
-
-# QP
-QPISlice = 26
-```
-
-Generate input YUV (solid gray):
-```bash
-# Create 64x64 gray frame (Y=128, Cb=Cr=128)
-python3 -c "
-import numpy as np
-y = np.full((64, 64), 128, dtype=np.uint8)
-uv = np.full((32, 32), 128, dtype=np.uint8)
-with open('test_input.yuv', 'wb') as f:
-    f.write(y.tobytes())
-    f.write(uv.tobytes())
-    f.write(uv.tobytes())
-"
-```
-
-Encode:
-```bash
-cd ~/JM
-./bin/lencod -d encoder_test.cfg
-```
-
-### Decode with Trace Output
-Create `decoder_test.cfg`:
-```ini
-InputFile = "test.264"
-OutputFile = "test_dec.yuv"
-RefFile = "test_rec.yuv"
-
-# Enable trace (dumps all intermediate values)
-Trace = 1
-```
-
-Decode:
-```bash
-./bin/ldecod -d decoder_test.cfg
-# Creates trace_dec.txt with detailed output
-```
-
-## Test Structure
-
-### Per-Module Tests
-Each module has `tests/` folder:
-```
-color/
-├── __init__.py
-├── yuv_to_rgb.py
-└── tests/
-    ├── __init__.py
-    ├── test_yuv_to_rgb.py
-    └── fixtures/
-        ├── input_yuv.npy
-        └── expected_rgb.npy
-```
-
-### Test Categories
-
-#### 1. Unit Tests
-Test single functions with known inputs:
-```python
-def test_yuv_to_rgb_black():
-    """Y=0, Cb=Cr=128 should give RGB black."""
-    y = np.zeros((2, 2), dtype=np.uint8)
-    cb = np.full((1, 1), 128, dtype=np.uint8)
-    cr = np.full((1, 1), 128, dtype=np.uint8)
-
-    rgb = yuv_to_rgb(y, cb, cr)
-
-    assert np.allclose(rgb, 0, atol=1)
-```
-
-#### 2. Reference Tests
-Compare with JM output:
-```python
-def test_dequant_matches_jm():
-    """Dequantization must match JM reference exactly."""
-    # Load JM trace values
-    jm_coeffs = np.load("fixtures/jm_coeffs_qp26.npy")
-    jm_dequant = np.load("fixtures/jm_dequant_qp26.npy")
-
-    # Our implementation
-    result = dequant_4x4(jm_coeffs, qp=26)
-
-    np.testing.assert_array_equal(result, jm_dequant)
-```
-
-#### 3. Edge Case Tests
-Test boundary conditions:
-```python
-def test_intra_16x16_dc_no_neighbors():
-    """DC prediction with no available neighbors uses 128."""
-    # Top-left macroblock has no neighbors
-    pred = intra_16x16_dc(
-        top_available=False,
-        left_available=False,
-        top_pixels=None,
-        left_pixels=None
-    )
-
-    assert np.all(pred == 128)
-```
+1,850 tests verify every pipeline stage. Pixel-perfect accuracy is validated against ffmpeg on real internet videos.
 
 ## Running Tests
 
-### All Tests
 ```bash
-cd /home/abhik/Projects/personal/h264
+# Full suite
 pytest -v
-```
 
-### Specific Module
-```bash
-pytest color/tests/ -v
-pytest transform/tests/ -v
-```
+# Specific module
+pytest decoder/tests/ -v
+pytest entropy/tests/ -v
 
-### With Debug Logging
-```bash
+# High Profile pixel-perfect tests (requires test videos)
+pytest decoder/tests/test_high_profile.py -v
+
+# With debug logging
 pytest -v --log-cli-level=DEBUG
 ```
 
-### Coverage Report
+## Test Data Setup
+
+Binary files (`.264`, `.yuv`, `.mp4`) are not tracked in git.
+
+### Download test videos
+
 ```bash
-pytest --cov=. --cov-report=html
-open htmlcov/index.html
+wget "https://test-videos.co.uk/vids/bigbuckbunny/mp4/h264/360/Big_Buck_Bunny_360_10s_1MB.mp4" \
+  -O test_data/bbb_360_10s.mp4
+wget "https://test-videos.co.uk/vids/bigbuckbunny/mp4/h264/720/Big_Buck_Bunny_720_10s_1MB.mp4" \
+  -O test_data/bbb_720_10s.mp4
+wget "https://test-videos.co.uk/vids/jellyfish/mp4/h264/360/Jellyfish_360_10s_1MB.mp4" \
+  -O test_data/jellyfish_360_10s.mp4
 ```
 
-## Generating Test Fixtures
+### Generate ffmpeg reference output
 
-### From JM Trace
-Parse `trace_dec.txt` to extract values:
+```bash
+# No-deblock references (for pixel-perfect comparison)
+ffmpeg -skip_loop_filter all -i test_data/bbb_360_10s.mp4 \
+  -vframes 1 -f rawvideo -pix_fmt yuv420p test_data/bbb_frame1_ref.yuv
+ffmpeg -skip_loop_filter all -i test_data/jellyfish_360_10s.mp4 \
+  -vframes 1 -f rawvideo -pix_fmt yuv420p test_data/jellyfish_360_10s_ref.yuv
+ffmpeg -skip_loop_filter all -i test_data/bbb_720_10s.mp4 \
+  -vframes 1 -f rawvideo -pix_fmt yuv420p test_data/bbb_720_10s_ref.yuv
+```
+
+### Generate raw H.264 test streams (with JM)
+
+```bash
+git clone https://github.com/shihuade/JM.git ~/JM
+cd ~/JM && make
+
+# Or use ffmpeg
+ffmpeg -f lavfi -i "testsrc2=duration=0.2:size=176x144:rate=5" \
+  -c:v libx264 -profile:v high -pix_fmt yuv420p test_data/high_profile_176x144.264
+```
+
+## Test Categories
+
+### Pixel-perfect integration tests (`decoder/tests/test_high_profile.py`)
+
+Compare our decode output against ffmpeg reference frame-by-frame:
+
 ```python
-# scripts/parse_jm_trace.py
-def extract_dequant_values(trace_path, mb_index, block_index):
-    """Extract dequantized coefficients from JM trace."""
-    with open(trace_path) as f:
-        # Parse trace format...
-        pass
-    return coefficients
-
-# Generate fixture
-coeffs = extract_dequant_values("trace_dec.txt", mb=0, block=0)
-np.save("fixtures/jm_dequant_mb0_block0.npy", coeffs)
+def test_mp4_frame1_pixel_perfect(video, ref, width, height):
+    d = H264Decoder(deblocking_enabled=False)
+    frame = next(d.decode_file(mp4_path))
+    ref_y, ref_cb, ref_cr = load_yuv420(ref_path, w, h)
+    np.testing.assert_array_equal(frame.luma, ref_y)
+    np.testing.assert_array_equal(frame.cb, ref_cb)
+    np.testing.assert_array_equal(frame.cr, ref_cr)
 ```
 
-### Synthetic Test Data
-```python
-# Known transform pair
-input_coeffs = np.array([
-    [16, 0, 0, 0],
-    [0, 0, 0, 0],
-    [0, 0, 0, 0],
-    [0, 0, 0, 0]
-], dtype=np.int32)
+### Unit tests (per module)
 
-# DC-only input should give flat output
-expected_output = np.full((4, 4), 16, dtype=np.int32)
+Each module has its own `tests/` directory testing individual functions:
 
-np.save("fixtures/idct_dc_only_input.npy", input_coeffs)
-np.save("fixtures/idct_dc_only_expected.npy", expected_output)
+```
+entropy/tests/test_cabac_arith.py    — arithmetic decoder
+intra/tests/test_intra_8x8.py       — I_8x8 prediction modes
+transform/tests/test_idct_8x8.py    — 8x8 IDCT butterfly
+dequant/tests/test_dequant_8x8.py   — 8x8 dequantization
 ```
 
-## Continuous Validation
+### TDD red tests
 
-After any change:
-1. Run `pytest -v`
-2. Check all reference tests pass
-3. Verify no regressions when replacing libs with NumPy
+Tests marked `xfail` define requirements for features not yet implemented (interlaced, FMO, etc). They serve as a roadmap.
 
-## Debugging Failed Tests
+## Debugging Pixel Mismatches
 
-### Visual Diff
-```python
-def test_with_visual_diff():
-    expected = np.load("expected.npy")
-    actual = our_function(...)
+When a test fails with pixel differences:
 
-    if not np.array_equal(expected, actual):
-        diff = expected.astype(int) - actual.astype(int)
-        print(f"Max diff: {np.abs(diff).max()}")
-        print(f"Diff locations: {np.argwhere(diff != 0)}")
+1. **Find the first bad MB**: compare per-macroblock to narrow down
+2. **Check dequant**: compare against JM's `rshift_rnd_sf((level * IS) << qp_per, 6)` formula
+3. **Check IDCT**: verify with JM's `inverse4x4` / `inverse8x8` (rows first, then columns)
+4. **Check prediction**: compute `our_pixel - our_residual` vs `ref_pixel - our_residual`
+5. **Check CABAC**: trace bin decisions and compare context states with JM
 
-        # Save for visual inspection
-        Image.fromarray(expected).save("expected.png")
-        Image.fromarray(actual).save("actual.png")
-
-    np.testing.assert_array_equal(expected, actual)
-```
+The JM reference decoder (`~/JM/bin/ldecod.exe`) can be instrumented with `fprintf(stderr, ...)` in `read_comp_cabac.c` and `block.c` to dump intermediate values.

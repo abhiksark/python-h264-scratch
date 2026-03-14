@@ -1,156 +1,104 @@
-# h264/docs/ARCHITECTURE.md
-# Architecture Decisions
+# Architecture
 
 ## Design Philosophy
 
-### 1. One Folder Per Pipeline Stage
-Each decoding stage is isolated in its own folder with:
-- `__init__.py` - Public API exports
-- Core implementation files
-- `tests/` subfolder
+### One folder per pipeline stage
+Each decoding stage is isolated in its own directory with source files, tests, and a public API via `__init__.py`. This maps 1:1 to the H.264 spec sections and makes it easy to test each stage independently.
 
-**Rationale**:
-- Easy to test each stage independently
-- Clear ownership of functionality
-- Can swap implementations (e.g., bitstring → NumPy) without affecting other stages
+### Correctness first, performance never
+This is an educational decoder. Every function prioritizes readability and spec compliance over speed. Pure Python with NumPy — no SIMD, no C extensions, no threading.
 
-### 2. Lib First, NumPy Later
-Start with libraries (bitstring) for complex bit manipulation, then replace with NumPy.
-
-**Rationale**:
-- Get working decoder faster
-- Validate correctness before optimizing
-- Learn the algorithm before implementing low-level details
-
-### 3. Heavy Testing with JM Reference
-Every function is tested against JM reference software output.
-
-**Rationale**:
-- H.264 is a solved problem - we know correct outputs
-- Bit-exact compliance is required
-- Catch regressions when replacing libs with NumPy
+### Verified against reference decoders
+Every pipeline stage is tested against JM (the H.264 reference software) and ffmpeg. Pixel-perfect accuracy is verified on real internet videos.
 
 ## Data Flow
 
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│                        Annex B Bitstream                         │
-│                    (bytes from .264 file)                        │
-└─────────────────────────────────────────────────────────────────┘
-                                │
-                                ▼
-┌─────────────────────────────────────────────────────────────────┐
-│ bitstream/                                                       │
-│   Input: bytes                                                   │
-│   Output: List[NALUnit] (type, rbsp_bytes)                      │
-└─────────────────────────────────────────────────────────────────┘
-                                │
-                    ┌───────────┴───────────┐
-                    ▼                       ▼
-┌──────────────────────────┐   ┌──────────────────────────┐
-│ parameters/              │   │ slice/                   │
-│   Input: NAL type 7,8    │   │   Input: NAL type 1,5    │
-│   Output: SPS, PPS       │   │   Output: SliceHeader    │
-└──────────────────────────┘   └──────────────────────────┘
-                    │                       │
-                    └───────────┬───────────┘
-                                ▼
-┌─────────────────────────────────────────────────────────────────┐
-│ entropy/                                                         │
-│   Input: slice data bits, SPS, PPS                              │
-│   Output: coefficients[mb][block] (4x4 arrays)                  │
-└─────────────────────────────────────────────────────────────────┘
-                                │
-                                ▼
-┌─────────────────────────────────────────────────────────────────┐
-│ dequant/                                                         │
-│   Input: coefficients, QP                                        │
-│   Output: dequantized coefficients                               │
-└─────────────────────────────────────────────────────────────────┘
-                                │
-                                ▼
-┌─────────────────────────────────────────────────────────────────┐
-│ transform/                                                       │
-│   Input: dequantized coefficients                                │
-│   Output: residual pixels (4x4 blocks)                          │
-└─────────────────────────────────────────────────────────────────┘
-                                │
-                                ▼
-┌─────────────────────────────────────────────────────────────────┐
-│ intra/ (or inter/)                                               │
-│   Input: neighboring pixels, mode                                │
-│   Output: prediction pixels (16x16 or 4x4)                      │
-└─────────────────────────────────────────────────────────────────┘
-                                │
-                                ▼
-┌─────────────────────────────────────────────────────────────────┐
-│ reconstruct/                                                     │
-│   Input: prediction + residual                                   │
-│   Output: reconstructed Y, Cb, Cr planes                        │
-└─────────────────────────────────────────────────────────────────┘
-                                │
-                                ▼
-┌─────────────────────────────────────────────────────────────────┐
-│ color/                                                           │
-│   Input: Y, Cb, Cr planes (4:2:0)                               │
-│   Output: RGB numpy array (H, W, 3), uint8                      │
-└─────────────────────────────────────────────────────────────────┘
+Input (MP4 or Annex B .264)
+    │
+    ▼
+container/       MP4 box parsing, avcC extraction (or Annex B start code scan)
+    │
+    ▼
+bitstream/       NAL unit extraction, emulation prevention byte removal
+    │
+    ├──▶ parameters/   SPS (NAL type 7), PPS (NAL type 8)
+    │
+    ▼
+slice/           Slice header parsing (type, QP, reference lists, weight tables)
+    │
+    ▼
+entropy/         CAVLC or CABAC → quantized coefficients + MB syntax
+    │
+    ▼
+dequant/         Inverse quantization (QP-dependent scaling, scaling lists)
+    │
+    ▼
+transform/       4x4 or 8x8 inverse integer transform → spatial residual
+    │
+    ▼
+intra/           Intra prediction from neighboring pixels (I-frames)
+inter/           Motion compensation from reference frames (P/B-frames)
+    │
+    ▼
+reconstruct/     prediction + residual → reconstructed macroblock
+    │
+    ▼
+deblock/         In-loop deblocking filter (boundary strength, adaptive)
+    │
+    ▼
+decoder/         Frame buffer management, DPB, output ordering
+    │
+    ▼
+color/           YCbCr 4:2:0 → RGB (optional)
 ```
 
 ## Key Data Structures
 
-### NALUnit
+### DecodedFrame
 ```python
 @dataclass
-class NALUnit:
-    nal_ref_idc: int      # 2 bits
-    nal_unit_type: int    # 5 bits
-    rbsp: bytes           # Raw byte sequence payload
+class DecodedFrame:
+    luma: np.ndarray      # (H, W) uint8
+    cb: np.ndarray        # (H/2, W/2) uint8
+    cr: np.ndarray        # (H/2, W/2) uint8
+    width: int
+    height: int
+    poc: int              # Picture order count (display order)
 ```
 
-### SPS (Sequence Parameter Set)
-```python
-@dataclass
-class SPS:
-    profile_idc: int
-    level_idc: int
-    seq_parameter_set_id: int
-    pic_width_in_mbs: int
-    pic_height_in_map_units: int
-    frame_mbs_only_flag: bool
-    # ... more fields
-```
+### DecoderState
+The main decoder maintains per-frame state:
+- `frame_luma`, `frame_cb`, `frame_cr` — current frame being reconstructed
+- `mb_types`, `mb_qps`, `mb_cbps` — per-macroblock metadata
+- `nz_counts`, `intra_modes` — neighbor context for entropy coding
+- `ref_buffer` — decoded picture buffer (DPB) for inter prediction
+- `mv_cache` — motion vector storage for MV prediction
 
-### Macroblock
-```python
-@dataclass
-class Macroblock:
-    mb_type: int
-    intra_16x16_pred_mode: int  # For I_16x16
-    coded_block_pattern: int
-    qp_delta: int
-    coefficients: List[np.ndarray]  # 16 luma + 8 chroma 4x4 blocks
-```
+## Module Responsibilities
+
+| Module | Lines | Responsibility |
+|--------|-------|----------------|
+| `decoder/decoder.py` | ~5300 | Main orchestration — ties all modules together |
+| `entropy/cabac_macroblock.py` | ~2200 | CABAC MB-level syntax (mb_type, MVD, CBP, coefficients) |
+| `entropy/cabac_context.py` | ~2100 | 460 CABAC context models with init tables from spec |
+| `reconstruct/macroblock.py` | ~2300 | I_16x16, I_4x4 reconstruction pipelines |
+| `deblock/deblock.py` | ~1700 | Boundary strength + luma/chroma filtering |
+| `inter/p_reconstruct.py` | ~1450 | P-frame partition reconstruction |
+| `decoder/i8x8.py` | ~1070 | I_8x8 reconstruction with reference sample filtering |
 
 ## Why These Choices?
 
-### Why Baseline Profile?
-- Simplest H.264 profile
-- No B-frames (simpler reference management)
-- No CABAC (CAVLC is easier to understand)
-- Widely supported
+### Why Python/NumPy?
+- The math is visible — `(a + 2*b + c + 2) >> 2` reads like the spec
+- Easy to step through with a debugger
+- No build system, runs anywhere
 
-### Why Annex B Format?
-- Self-contained (no container parsing)
-- Start codes make NAL boundaries obvious
-- Easier to debug
+### Why not start with Baseline?
+We did. The decoder grew from Baseline (I-only) → Baseline (I+P) → Main (B-frames, CABAC) → High (8x8 transform) over several months.
 
-### Why NumPy?
-- Educational - see the math clearly
-- Vectorized operations match spec notation
-- Easy to visualize intermediate results
+### Why MP4 support?
+So you can download any video from the internet and decode it. Raw Annex B files are also supported.
 
-### Why Not FFmpeg?
-- FFmpeg is heavily optimized, hard to learn from
-- Thousands of edge cases obscure core algorithm
-- JM reference is cleaner for learning
+### Why pixel-perfect?
+An H.264 decoder is either correct or wrong — there's no "close enough". Pixel-perfect verification against ffmpeg proves the implementation matches the spec exactly.
