@@ -144,7 +144,7 @@ class CABACDecoder:
         self.renormalize()
 
         if self._trace_enabled:
-            self._trace.append(f"D {bin_val} ps={old_ps} mps={old_mps} R={self.codIRange}")
+            self._trace.append(f"D {bin_val} ps={old_ps} mps={old_mps} R={self.codIRange} O={self.codIOffset}")
             self._trace_ctx.append(('D', bin_val, old_ps, old_mps, self.codIRange))
 
         return bin_val

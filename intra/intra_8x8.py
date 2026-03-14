@@ -262,8 +262,9 @@ def intra_8x8_vertical_right(
         for x in range(8):
             zVR = 2 * x - y
             if zVR >= 0:
+                idx = x - (y >> 1)
                 if zVR % 2 == 0:
-                    idx = x - (y >> 1)
+                    # Even: avg2 from top reference
                     if idx == 0:
                         pred[y, x] = _avg2(M, t[0])
                     elif idx <= 7:
@@ -271,36 +272,27 @@ def intra_8x8_vertical_right(
                     else:
                         pred[y, x] = t[7]
                 else:
-                    idx = x - (y >> 1)
-                    if idx == 0:
-                        pred[y, x] = _avg3(l[0], M, t[0])
-                    elif idx == 1:
+                    # Odd: avg3 from top reference
+                    if idx <= 1:
                         pred[y, x] = _avg3(M, t[0], t[1])
                     elif idx <= 7:
                         pred[y, x] = _avg3(t[idx - 2], t[idx - 1], t[idx])
                     else:
                         pred[y, x] = t[7]
+            elif zVR == -1:
+                # H.264 8.3.2.2.6: special case
+                pred[y, x] = _avg3(l[0], M, t[0])
             else:
-                # zVR < 0
-                idx = y - 2 * x - 1
-                if idx % 2 == 0:
-                    i = idx >> 1
-                    if i == 0:
-                        pred[y, x] = _avg2(M, l[0])
-                    elif i < 7:
-                        pred[y, x] = _avg2(l[i - 1], l[i])
-                    else:
-                        pred[y, x] = l[7]
+                # zVR < -1: always avg3 from left reference
+                # H.264 8.3.2.2.6: (p[y-2x-1,-1] + 2*p[y-2x-2,-1] + p[y-2x-3,-1] + 2) >> 2
+                c = y - 2 * x - 1
+                b = y - 2 * x - 2
+                a = y - 2 * x - 3
+                if a >= 0:
+                    pred[y, x] = (l[a] + 2 * l[b] + l[c] + 2) >> 2
                 else:
-                    i = idx >> 1
-                    if i == 0:
-                        pred[y, x] = _avg3(t[0], M, l[0])
-                    elif i == 1:
-                        pred[y, x] = _avg3(M, l[0], l[1])
-                    elif i < 7:
-                        pred[y, x] = _avg3(l[i - 2], l[i - 1], l[i])
-                    else:
-                        pred[y, x] = l[7]
+                    # a == -1: use corner pixel M for l[-1]
+                    pred[y, x] = (M + 2 * l[b] + l[c] + 2) >> 2
 
     return np.clip(pred, 0, 255).astype(np.uint8)
 
@@ -332,8 +324,9 @@ def intra_8x8_horizontal_down(
         for x in range(8):
             zHD = 2 * y - x
             if zHD >= 0:
+                idx = y - (x >> 1)
                 if zHD % 2 == 0:
-                    idx = y - (x >> 1)
+                    # Even: avg2 from left reference
                     if idx == 0:
                         pred[y, x] = _avg2(M, l[0])
                     elif idx <= 7:
@@ -341,36 +334,27 @@ def intra_8x8_horizontal_down(
                     else:
                         pred[y, x] = l[7]
                 else:
-                    idx = y - (x >> 1)
-                    if idx == 0:
-                        pred[y, x] = _avg3(t[0], M, l[0])
-                    elif idx == 1:
+                    # Odd: avg3 from left reference
+                    if idx <= 1:
                         pred[y, x] = _avg3(M, l[0], l[1])
                     elif idx <= 7:
                         pred[y, x] = _avg3(l[idx - 2], l[idx - 1], l[idx])
                     else:
                         pred[y, x] = l[7]
+            elif zHD == -1:
+                # H.264 8.3.2.2.7: special case
+                pred[y, x] = _avg3(t[0], M, l[0])
             else:
-                # zHD < 0
-                idx = x - 2 * y - 1
-                if idx % 2 == 0:
-                    i = idx >> 1
-                    if i == 0:
-                        pred[y, x] = _avg2(M, t[0])
-                    elif i < 7:
-                        pred[y, x] = _avg2(t[i - 1], t[i])
-                    else:
-                        pred[y, x] = t[7]
+                # zHD < -1: always avg3 from top reference
+                # H.264 8.3.2.2.7: (p[-1,x-2y-1] + 2*p[-1,x-2y-2] + p[-1,x-2y-3] + 2) >> 2
+                c = x - 2 * y - 1
+                b = x - 2 * y - 2
+                a = x - 2 * y - 3
+                if a >= 0:
+                    pred[y, x] = (t[a] + 2 * t[b] + t[c] + 2) >> 2
                 else:
-                    i = idx >> 1
-                    if i == 0:
-                        pred[y, x] = _avg3(l[0], M, t[0])
-                    elif i == 1:
-                        pred[y, x] = _avg3(M, t[0], t[1])
-                    elif i < 7:
-                        pred[y, x] = _avg3(t[i - 2], t[i - 1], t[i])
-                    else:
-                        pred[y, x] = t[7]
+                    # a == -1: use corner pixel M for t[-1]
+                    pred[y, x] = (M + 2 * t[b] + t[c] + 2) >> 2
 
     return np.clip(pred, 0, 255).astype(np.uint8)
 
@@ -416,7 +400,7 @@ def intra_8x8_vertical_left(
 def intra_8x8_horizontal_up(left: np.ndarray) -> np.ndarray:
     """Mode 8: Horizontal-Up prediction.
 
-    Extrapolates at 26.6° above horizontal.
+    H.264 Spec Reference: Section 8.3.2.2.9
 
     Args:
         left: Left neighbors (8 pixels)
@@ -430,20 +414,20 @@ def intra_8x8_horizontal_up(left: np.ndarray) -> np.ndarray:
 
     for y in range(8):
         for x in range(8):
-            zHU = y + 2 * x
+            zHU = x + 2 * y
             if zHU < 13:
+                idx = y + (x >> 1)
                 if zHU % 2 == 0:
-                    idx = y + (x >> 0)  # This is just y + x for even
-                    # Actually: zHU = y + 2*x, so if even:
-                    idx = (zHU >> 1)
                     if idx < 7:
                         pred[y, x] = _avg2(l[idx], l[idx + 1])
                     else:
                         pred[y, x] = l[7]
                 else:
-                    idx = (zHU >> 1)
-                    if idx < 6:
+                    if idx + 2 <= 7:
                         pred[y, x] = _avg3(l[idx], l[idx + 1], l[idx + 2])
+                    elif idx + 1 <= 7:
+                        # idx == 6: need l[6], l[7], l[8] -> clamp l[8] to l[7]
+                        pred[y, x] = _avg3(l[idx], l[idx + 1], l[7])
                     else:
                         pred[y, x] = l[7]
             elif zHU == 13:
@@ -519,10 +503,23 @@ def lowpass_filter_8x8(
     # Left[7]: (left[6] + 3*left[7] + 2) >> 2 (replicate edge)
     filtered_left[7] = (l[6] + 3 * l[7] + 2) >> 2
 
+    # Filter top-right samples (H.264 8.3.2.2.1: p'[-1, 8..15])
+    # Always filter — even when raw top_right is unavailable, the replicated
+    # raw values (tr = top[7] repeated) must be filtered to match JM.
+    filtered_tr = np.zeros(8, dtype=np.int32)
+    # tr[0]: (top[7] + 2*tr[0] + tr[1] + 2) >> 2 — uses original top[7]
+    filtered_tr[0] = (t[7] + 2 * tr[0] + tr[1] + 2) >> 2
+    for i in range(1, 7):
+        filtered_tr[i] = (tr[i - 1] + 2 * tr[i] + tr[i + 1] + 2) >> 2
+    # tr[7]: edge replication
+    filtered_tr[7] = (tr[6] + 3 * tr[7] + 2) >> 2
+    filtered_tr = np.clip(filtered_tr, 0, 255).astype(np.uint8)
+
     return {
         'top': np.clip(filtered_top, 0, 255).astype(np.uint8),
         'left': np.clip(filtered_left, 0, 255).astype(np.uint8),
         'top_left': int(np.clip(filtered_corner, 0, 255)),
+        'top_right': filtered_tr,
     }
 
 

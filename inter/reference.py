@@ -178,8 +178,11 @@ class ReferenceFrameBuffer:
     def get_frame(self, ref_idx: int) -> ReferenceFrame:
         """Get frame by reference index.
 
-        ref_idx=0 is the most recently added frame.
-        ref_idx=1 is the second most recent, etc.
+        Uses L0 reference list when available (after build_p_slice_ref_list
+        or build_ref_lists), falls back to raw DPB order.
+
+        When num_ref_idx_l0_active exceeds the list size, extra entries
+        are padding (H.264 8.2.4.1). Clamp to the last available frame.
 
         Args:
             ref_idx: Reference index (0 = most recent)
@@ -188,13 +191,23 @@ class ReferenceFrameBuffer:
             The reference frame at the given index
 
         Raises:
-            IndexError: If ref_idx is out of range
+            IndexError: If buffer is empty or ref_idx is negative
         """
-        if ref_idx < 0 or ref_idx >= len(self._frames):
-            raise IndexError(
-                f"Reference index {ref_idx} out of range "
-                f"(buffer has {len(self._frames)} frames)"
+        # Use L0 list when available (P-slice ref list reordering)
+        l0_list = getattr(self, '_l0_list', [])
+        if l0_list:
+            return self.get_l0_frame(ref_idx)
+
+        if not self._frames:
+            raise IndexError("Reference buffer is empty")
+        if ref_idx < 0:
+            raise IndexError(f"Negative reference index {ref_idx}")
+        if ref_idx >= len(self._frames):
+            logger.debug(
+                f"ref_idx {ref_idx} exceeds DPB size {len(self._frames)}, "
+                f"clamping to {len(self._frames) - 1}"
             )
+            ref_idx = len(self._frames) - 1
         return self._frames[ref_idx]
 
     def get_frame_by_num(self, frame_num: int) -> Optional[ReferenceFrame]:
@@ -223,6 +236,7 @@ class ReferenceFrameBuffer:
 
         Default order: descending frame_num (most recent first).
         Optionally applies ref_pic_list_modification.
+        Builds _l0_list without modifying the DPB (_frames).
 
         Args:
             current_frame_num: frame_num of current slice
@@ -231,15 +245,21 @@ class ReferenceFrameBuffer:
 
         H.264 Spec: Section 8.2.4.1, 8.2.4.3.1
         """
-        # Default: sorted by frame_num descending
-        self._frames.sort(key=lambda f: f.frame_num, reverse=True)
+        # Default: sorted by frame_num descending (work on a copy)
+        self._l0_list = sorted(
+            self._frames, key=lambda f: f.frame_num, reverse=True
+        )
 
         if modification is None or not modification.modification_of_pic_nums_idc:
             return
 
         # Apply reference list reordering (H.264 8.2.4.3.1)
+        # Uses the spec's shift-insert-compact algorithm, NOT simple pop/insert.
+        num_active = len(self._l0_list)
+        ref_list = list(self._l0_list) + [None]  # Extra slot for shift
+
         pic_num_no_wrap = current_frame_num
-        ref_list = list(self._frames)
+        ref_idx = 0
 
         for i, idc in enumerate(modification.modification_of_pic_nums_idc):
             if idc == 0 or idc == 1:
@@ -253,20 +273,56 @@ class ReferenceFrameBuffer:
                     if pic_num_no_wrap >= max_frame_num:
                         pic_num_no_wrap -= max_frame_num
 
-                # Find frame with this frame_num and move to position i
+                pic_num = pic_num_no_wrap
+
+                # Find the frame with this PicNum in the DPB
                 target = None
-                target_idx = -1
-                for j, f in enumerate(ref_list):
-                    if f.frame_num == pic_num_no_wrap:
+                for f in self._frames:
+                    if f.frame_num == pic_num:
                         target = f
-                        target_idx = j
                         break
 
-                if target is not None and target_idx != i:
-                    ref_list.pop(target_idx)
-                    ref_list.insert(i, target)
+                if target is None:
+                    continue
 
-        self._frames[:] = ref_list
+                # Shift right: make room at ref_idx
+                for c in range(num_active, ref_idx, -1):
+                    ref_list[c] = ref_list[c - 1]
+
+                # Place target at ref_idx
+                ref_list[ref_idx] = target
+
+                # Compact: remove duplicate of target after ref_idx
+                n_idx = ref_idx + 1
+                for c in range(ref_idx + 1, num_active + 1):
+                    if ref_list[c] is not target:
+                        ref_list[n_idx] = ref_list[c]
+                        n_idx += 1
+
+                ref_idx += 1
+
+        self._l0_list[:] = ref_list[:num_active]
+
+    def remove_by_frame_num(self, frame_num: int) -> bool:
+        """Remove a short-term reference frame by frame_num.
+
+        Used by MMCO operation 1 (mark short-term as unused for reference).
+
+        Args:
+            frame_num: frame_num of the frame to remove
+
+        Returns:
+            True if a frame was removed, False if not found
+        """
+        for i, f in enumerate(self._frames):
+            if f.frame_num == frame_num:
+                removed = self._frames.pop(i)
+                logger.debug(
+                    f"MMCO: removed frame_num={frame_num} (POC={removed.poc}) "
+                    f"from reference buffer"
+                )
+                return True
+        return False
 
     def clear(self) -> None:
         """Remove all frames from buffer."""
@@ -278,33 +334,40 @@ class ReferenceFrameBuffer:
     def build_ref_lists(self, current_poc: int) -> None:
         """Build L0 and L1 reference lists for B-slices.
 
-        L0 contains frames with POC < current (past frames), sorted descending.
-        L1 contains frames with POC > current (future frames), sorted ascending.
-
-        For single-reference case, the frame appears in both lists.
+        H.264 Section 8.2.4.2.3: Default ref list construction for B-slices.
+        L0 = past frames (descending POC) + future frames (ascending POC).
+        L1 = future frames (ascending POC) + past frames (descending POC).
+        If L0 == L1 and len > 1, swap first two entries of L1.
 
         Args:
             current_poc: POC of current picture being decoded
-
-        H.264 Spec: Section 8.2.4 - Decoding process for reference picture lists
         """
-        # Separate frames by POC relative to current
-        past_frames = [f for f in self._frames if f.poc < current_poc]
-        future_frames = [f for f in self._frames if f.poc > current_poc]
+        past_frames = sorted(
+            [f for f in self._frames if f.poc < current_poc],
+            key=lambda f: f.poc, reverse=True,
+        )
+        future_frames = sorted(
+            [f for f in self._frames if f.poc > current_poc],
+            key=lambda f: f.poc,
+        )
 
-        # L0: Past frames, closest first (descending POC)
-        self._l0_list = sorted(past_frames, key=lambda f: f.poc, reverse=True)
+        # L0: past (descending) then future (ascending)
+        self._l0_list = past_frames + future_frames
 
-        # L1: Future frames, closest first (ascending POC)
-        self._l1_list = sorted(future_frames, key=lambda f: f.poc)
+        # L1: future (ascending) then past (descending)
+        self._l1_list = future_frames + past_frames
 
-        # If one list is empty, copy from the other (single-reference case)
-        if not self._l0_list and self._l1_list:
-            self._l0_list = self._l1_list.copy()
-        elif not self._l1_list and self._l0_list:
-            self._l1_list = self._l0_list.copy()
+        # H.264 8.2.4.2.3: If L0 and L1 are identical and have > 1 entry,
+        # swap the first two entries of L1
+        if (len(self._l0_list) > 1
+                and len(self._l0_list) == len(self._l1_list)
+                and all(a.poc == b.poc
+                        for a, b in zip(self._l0_list, self._l1_list))):
+            self._l1_list[0], self._l1_list[1] = (
+                self._l1_list[1], self._l1_list[0]
+            )
 
-        # If still empty but we have frames, use all frames
+        # Fallback: if no frames classified, use all
         if not self._l0_list and not self._l1_list and self._frames:
             self._l0_list = self._frames.copy()
             self._l1_list = self._frames.copy()
@@ -334,6 +397,8 @@ class ReferenceFrameBuffer:
     def get_l0_frame(self, ref_idx: int) -> ReferenceFrame:
         """Get frame from L0 list by index.
 
+        Clamps to list size when num_ref_idx_active exceeds DPB.
+
         Args:
             ref_idx: Index into L0 list
 
@@ -341,15 +406,21 @@ class ReferenceFrameBuffer:
             Reference frame
 
         Raises:
-            IndexError: If ref_idx out of range
+            IndexError: If L0 list is empty or ref_idx negative
         """
         l0_list = self.get_l0_list()
-        if ref_idx < 0 or ref_idx >= len(l0_list):
-            raise IndexError(f"L0 ref_idx {ref_idx} out of range (size={len(l0_list)})")
+        if not l0_list:
+            raise IndexError("L0 reference list is empty")
+        if ref_idx < 0:
+            raise IndexError(f"Negative L0 ref_idx {ref_idx}")
+        if ref_idx >= len(l0_list):
+            ref_idx = len(l0_list) - 1
         return l0_list[ref_idx]
 
     def get_l1_frame(self, ref_idx: int) -> ReferenceFrame:
         """Get frame from L1 list by index.
+
+        Clamps to list size when num_ref_idx_active exceeds DPB.
 
         Args:
             ref_idx: Index into L1 list
@@ -358,9 +429,13 @@ class ReferenceFrameBuffer:
             Reference frame
 
         Raises:
-            IndexError: If ref_idx out of range
+            IndexError: If L1 list is empty or ref_idx negative
         """
         l1_list = self.get_l1_list()
-        if ref_idx < 0 or ref_idx >= len(l1_list):
-            raise IndexError(f"L1 ref_idx {ref_idx} out of range (size={len(l1_list)})")
+        if not l1_list:
+            raise IndexError("L1 reference list is empty")
+        if ref_idx < 0:
+            raise IndexError(f"Negative L1 ref_idx {ref_idx}")
+        if ref_idx >= len(l1_list):
+            ref_idx = len(l1_list) - 1
         return l1_list[ref_idx]

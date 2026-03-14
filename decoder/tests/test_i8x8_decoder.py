@@ -508,7 +508,12 @@ class TestI8x8WithAllPredictionModes:
         assert result.dtype == np.uint8
 
     def test_i8x8_vertical_mode_copies_top(self):
-        """Mode 0 (Vertical) should copy top row to all rows."""
+        """Mode 0 (Vertical) should copy filtered top row to all rows.
+
+        H.264 Section 8.3.2.2.1: I_8x8 always uses lowpass-filtered reference
+        samples. top[7] is filtered using top_right (replicated top[7] when
+        unavailable), so filtered_top[7] = (70 + 2*80 + 80 + 2) >> 2 = 78.
+        """
         from decoder.i8x8 import reconstruct_i8x8_block
 
         top = np.array([10, 20, 30, 40, 50, 60, 70, 80], dtype=np.uint8)
@@ -527,11 +532,19 @@ class TestI8x8WithAllPredictionModes:
             top_right_available=False,
         )
 
+        # Expected: filtered top samples (lowpass filter modifies boundaries)
+        # filtered_top[0] = (0 + 2*10 + 20 + 2) >> 2 = 10
+        # filtered_top[7] = (70 + 2*80 + 80 + 2) >> 2 = 78
+        expected_top = np.array([10, 20, 30, 40, 50, 60, 70, 78], dtype=np.uint8)
         for row in range(8):
-            np.testing.assert_array_equal(result[row, :], top)
+            np.testing.assert_array_equal(result[row, :], expected_top)
 
     def test_i8x8_horizontal_mode_copies_left(self):
-        """Mode 1 (Horizontal) should copy left column to all columns."""
+        """Mode 1 (Horizontal) should copy filtered left column to all columns.
+
+        H.264 Section 8.3.2.2.1: I_8x8 always uses lowpass-filtered reference
+        samples. left[7] is filtered: (70 + 3*80 + 2) >> 2 = 78.
+        """
         from decoder.i8x8 import reconstruct_i8x8_block
 
         top = np.full(8, 0, dtype=np.uint8)
@@ -550,8 +563,12 @@ class TestI8x8WithAllPredictionModes:
             top_right_available=False,
         )
 
+        # Expected: filtered left samples (lowpass filter modifies boundaries)
+        # filtered_left[0] = (0 + 2*10 + 20 + 2) >> 2 = 10
+        # filtered_left[7] = (70 + 3*80 + 2) >> 2 = 78 (edge replication)
+        expected_left = np.array([10, 20, 30, 40, 50, 60, 70, 78], dtype=np.uint8)
         for col in range(8):
-            np.testing.assert_array_equal(result[:, col], left)
+            np.testing.assert_array_equal(result[:, col], expected_left)
 
 
 class TestMixedI4x4I8x8Frame:

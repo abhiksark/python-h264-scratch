@@ -121,12 +121,13 @@ class TestReferenceFrameBuffer:
         assert buffer.get_frame(1).frame_num == 1
 
     def test_get_frame_invalid_index_raises(self):
-        """Invalid reference index raises error."""
+        """Negative ref_idx raises; OOB clamps to last frame."""
         buffer = ReferenceFrameBuffer(max_frames=4)
         buffer.add_frame(self._make_frame(0))
 
-        with pytest.raises(IndexError):
-            buffer.get_frame(ref_idx=1)  # Only one frame in buffer
+        # OOB ref_idx clamps to last available frame (H.264 padding)
+        f = buffer.get_frame(ref_idx=1)
+        assert f.frame_num == 0
 
         with pytest.raises(IndexError):
             buffer.get_frame(ref_idx=-1)  # Negative index

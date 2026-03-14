@@ -370,9 +370,11 @@ class TestDequant8x8DCCoefficient:
 
         result = dequant_8x8(coeffs, qp=qp)
 
-        # Expected: coeff * LevelScale8x8[0][0] << (qp // 6)
-        # = 1 * 20 << 2 = 80
-        expected_dc = LEVEL_SCALE_8x8[0, 0] << (qp // 6)
+        # H.264 Section 8.5.11: 8x8 dequant uses << (qp_div_6 - 2)
+        # Expected: coeff * LevelScale8x8[0][0] << (qp // 6 - 2)
+        # = 1 * 20 << 0 = 20
+        qp_div_6 = qp // 6
+        expected_dc = LEVEL_SCALE_8x8[0, 0] << (qp_div_6 - 2)
         assert result[0, 0] == expected_dc
 
     def test_dc_coefficient_with_scaling_list(self):
@@ -507,7 +509,8 @@ class TestDequant8x8KnownValues:
         Formula: d[i,j] = c[i,j] * LevelScale8x8[qp%6][pos_type] << (qp // 6)
         For QP=0: qp_div_6=0, qp_mod_6=0
         Position (0,0) has type 0, so LevelScale8x8[0][0] = 20
-        Expected: 1 * 20 << 0 = 20
+        H.264 8.5.11: 8x8 dequant for qp_div_6 < 2: (c * s + rounding) >> (2 - qp_div_6)
+        Expected: (1 * 20 + 2) >> 2 = 5
         """
         from dequant.dequant import dequant_8x8
 
@@ -516,13 +519,14 @@ class TestDequant8x8KnownValues:
 
         result = dequant_8x8(coeffs, qp=0)
 
-        assert result[0, 0] == 20
+        assert result[0, 0] == 5
 
     def test_known_value_qp6_coeff1(self):
         """Test known output for QP=6, coefficient=1.
 
         For QP=6: qp_div_6=1, qp_mod_6=0
-        Expected: 1 * 20 << 1 = 40
+        H.264 8.5.11: 8x8 dequant for qp_div_6=1: (c * s + rounding) >> (2 - 1) = >> 1
+        Expected: (1 * 20 + 1) >> 1 = 10
         """
         from dequant.dequant import dequant_8x8
 
@@ -531,13 +535,14 @@ class TestDequant8x8KnownValues:
 
         result = dequant_8x8(coeffs, qp=6)
 
-        assert result[0, 0] == 40
+        assert result[0, 0] == 10
 
     def test_known_value_qp12_coeff1(self):
         """Test known output for QP=12, coefficient=1.
 
         For QP=12: qp_div_6=2, qp_mod_6=0
-        Expected: 1 * 20 << 2 = 80
+        H.264 8.5.11: 8x8 dequant for qp_div_6=2: c * s << (2 - 2) = << 0
+        Expected: 1 * 20 << 0 = 20
         """
         from dequant.dequant import dequant_8x8
 
@@ -546,14 +551,14 @@ class TestDequant8x8KnownValues:
 
         result = dequant_8x8(coeffs, qp=12)
 
-        assert result[0, 0] == 80
+        assert result[0, 0] == 20
 
     def test_known_value_qp1_position_1_1(self):
         """Test known output for QP=1 at position (1,1).
 
         Position (1,1) has type 1, so LevelScale8x8[1][1] = 19
         For QP=1: qp_div_6=0, qp_mod_6=1
-        Expected: 1 * 19 << 0 = 19
+        H.264 8.5.11: (c * s + rounding) >> (2 - 0) = (19 + 2) >> 2 = 5
         """
         from dequant.dequant import dequant_8x8
 
@@ -562,14 +567,14 @@ class TestDequant8x8KnownValues:
 
         result = dequant_8x8(coeffs, qp=1)
 
-        assert result[1, 1] == 19
+        assert result[1, 1] == 5
 
     def test_known_value_qp2_position_2_2(self):
         """Test known output for QP=2 at position (2,2).
 
         Position (2,2) has type 2, so LevelScale8x8[2][2] = 42
         For QP=2: qp_div_6=0, qp_mod_6=2
-        Expected: 1 * 42 << 0 = 42
+        H.264 8.5.11: (c * s + rounding) >> (2 - 0) = (42 + 2) >> 2 = 11
         """
         from dequant.dequant import dequant_8x8
 
@@ -578,14 +583,13 @@ class TestDequant8x8KnownValues:
 
         result = dequant_8x8(coeffs, qp=2)
 
-        assert result[2, 2] == 42
+        assert result[2, 2] == 11
 
     def test_known_value_with_flat_scaling_list(self):
         """Test known output with flat scaling list.
 
-        With flat list (all 16s), the formula becomes:
-        d = c * LevelScale8x8[qp%6][pos] * 16 / 16 << qp_div_6
-        = c * LevelScale8x8[qp%6][pos] << qp_div_6
+        With flat list (all 16s), the formula becomes same as no scaling list.
+        H.264 8.5.11: QP=6, qp_div_6=1: (c * s + 1) >> 1 = (20 + 1) >> 1 = 10
         """
         from dequant.dequant import dequant_8x8
 
@@ -595,14 +599,13 @@ class TestDequant8x8KnownValues:
         result = dequant_8x8(coeffs, qp=6, scaling_list=FLAT_8x8)
 
         # Same as without scaling list
-        assert result[0, 0] == 40
+        assert result[0, 0] == 10
 
     def test_known_value_with_double_scaling_list(self):
         """Test known output with doubled scaling list.
 
-        With scaling list of all 32s:
-        d = c * LevelScale8x8[qp%6][pos] * 32 / 16 << qp_div_6
-        = c * LevelScale8x8[qp%6][pos] * 2 << qp_div_6
+        With scaling list of all 32s: scale_matrix *= 32/16 = 2x
+        H.264 8.5.11: QP=6, qp_div_6=1: (c * s*2 + 1) >> 1 = (40 + 1) >> 1 = 20
         """
         from dequant.dequant import dequant_8x8
 
@@ -612,7 +615,7 @@ class TestDequant8x8KnownValues:
         result = dequant_8x8(coeffs, qp=6, scaling_list=[32] * 64)
 
         # Should be double the flat list result
-        assert result[0, 0] == 80
+        assert result[0, 0] == 20
 
     @pytest.mark.xfail(reason="JM reference decoder output values need verification")
     def test_jm_reference_block_qp26(self):

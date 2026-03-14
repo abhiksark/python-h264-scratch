@@ -793,9 +793,9 @@ class TestReferenceListOrderingByPOC:
         buffer.build_ref_lists(current_poc=5)
         l0 = buffer.get_l0_list()
 
-        # L0 should have POC 4, 2, 0 (past frames, closest first)
+        # L0 = past (descending POC) + future (ascending POC) per H.264 8.2.4.2.3
         l0_pocs = [f.poc for f in l0]
-        assert l0_pocs == [4, 2, 0], f"L0 POCs should be [4,2,0], got {l0_pocs}"
+        assert l0_pocs == [4, 2, 0, 6], f"L0 POCs should be [4,2,0,6], got {l0_pocs}"
 
     def test_l1_list_poc_order(self):
         """L1 list should be ordered by POC ascending (closest future first)."""
@@ -818,9 +818,9 @@ class TestReferenceListOrderingByPOC:
         buffer.build_ref_lists(current_poc=2)
         l1 = buffer.get_l1_list()
 
-        # L1 should have POC 4, 8, 12 (future frames, closest first)
+        # L1 = future (ascending POC) + past (descending POC) per H.264 8.2.4.2.3
         l1_pocs = [f.poc for f in l1]
-        assert l1_pocs == [4, 8, 12], f"L1 POCs should be [4,8,12], got {l1_pocs}"
+        assert l1_pocs == [4, 8, 12, 0], f"L1 POCs should be [4,8,12,0], got {l1_pocs}"
 
     def test_ref_list_for_b_between_i_and_p(self):
         """B-frame between I and P should have correct L0/L1."""
@@ -854,9 +854,11 @@ class TestReferenceListOrderingByPOC:
         l0 = buffer.get_l0_list()
         l1 = buffer.get_l1_list()
 
-        # L0[0] should be I (POC=0), L1[0] should be P (POC=4)
-        assert len(l0) == 1 and l0[0].poc == 0, "L0[0] should be I-frame (POC=0)"
-        assert len(l1) == 1 and l1[0].poc == 4, "L1[0] should be P-frame (POC=4)"
+        # L0 = past(desc) + future(asc) = [0, 4]; L1 = future(asc) + past(desc) = [4, 0]
+        assert l0[0].poc == 0, "L0[0] should be I-frame (POC=0)"
+        assert l0[1].poc == 4, "L0[1] should be P-frame (POC=4)"
+        assert l1[0].poc == 4, "L1[0] should be P-frame (POC=4)"
+        assert l1[1].poc == 0, "L1[1] should be I-frame (POC=0)"
 
 
 class TestPOCStatePersistence:

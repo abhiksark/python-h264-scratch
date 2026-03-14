@@ -290,8 +290,14 @@ def get_scaling_list_4x4(
         return FLAT_4x4.copy()
 
     if not getattr(sps, 'seq_scaling_matrix_present_flag', False):
-        # No scaling matrix present, use flat
-        return FLAT_4x4.copy()
+        # JM reference: when neither SPS nor PPS signals scaling matrices,
+        # use flat (all 16s). Default lists are only used as fallback when
+        # seq_scaling_matrix_present_flag=1 but a specific list is absent.
+        pps_has_scaling = (pps is not None and
+                           getattr(pps, 'pic_scaling_matrix_present_flag', False))
+        if not pps_has_scaling:
+            return FLAT_4x4.copy()
+        return DEFAULT_4x4_INTRA.copy() if index < 3 else DEFAULT_4x4_INTER.copy()
 
     # Check if this specific list is present in SPS
     if hasattr(sps, 'seq_scaling_list_present_flag') and sps.seq_scaling_list_present_flag:
@@ -358,8 +364,14 @@ def get_scaling_list_8x8(
         return FLAT_8x8.copy()
 
     if not getattr(sps, 'seq_scaling_matrix_present_flag', False):
-        # No scaling matrix present, use flat
-        return FLAT_8x8.copy()
+        # JM reference: when neither SPS nor PPS signals scaling matrices,
+        # use flat (all 16s). Default lists are only used as fallback when
+        # seq_scaling_matrix_present_flag=1 but a specific list is absent.
+        pps_has_scaling = (pps is not None and
+                           getattr(pps, 'pic_scaling_matrix_present_flag', False))
+        if not pps_has_scaling:
+            return FLAT_8x8.copy()
+        return DEFAULT_8x8_INTRA.copy() if index == 0 else DEFAULT_8x8_INTER.copy()
 
     # Check if this specific list is present in SPS
     if hasattr(sps, 'seq_scaling_list_present_flag') and sps.seq_scaling_list_present_flag:

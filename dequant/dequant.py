@@ -375,16 +375,36 @@ def dequant_8x8(
     # Get scale matrix
     scale_matrix = get_scale_matrix_8x8(qp)
 
-    # Apply scaling list if provided
+    # Apply scaling list if provided (H.264 Section 8.5.12.1)
     if scaling_list is not None:
         if len(scaling_list) != 64:
             raise ValueError(f"Scaling list must have 64 elements, got {len(scaling_list)}")
-        # Reshape scaling list to 8x8 (row-major)
-        scaling_matrix = np.array(scaling_list, dtype=np.int32).reshape(8, 8)
-        scale_matrix = scale_matrix * scaling_matrix // 16
+        # Scaling lists are in zigzag scan order; convert to raster for
+        # position-dependent scaling (H.264 Section 8.5.9)
+        from entropy.tables import ZIGZAG_8x8
+        sl_raster = np.zeros(64, dtype=np.int32)
+        for scan_pos in range(64):
+            sl_raster[int(ZIGZAG_8x8[scan_pos])] = scaling_list[scan_pos]
+        scaling_matrix = sl_raster.reshape(8, 8)
+        # LevelScale8x8 = normAdjust * weightScale (full precision, no //16)
+        level_scale = scale_matrix * scaling_matrix
 
-    # Apply dequantization with left shift
-    dequant = (coeffs * scale_matrix) << qp_div_6
+        # H.264 Section 8.5.12.1: exact spec formula
+        # d[i][j] = (c * LevelScale) << (qpPer - 6)  if qpPer >= 6
+        # d[i][j] = (c * LevelScale + 2^(5-qpPer)) >> (6 - qpPer)  if qpPer < 6
+        if qp_div_6 >= 6:
+            dequant = (coeffs * level_scale) << (qp_div_6 - 6)
+        else:
+            rounding = 1 << (5 - qp_div_6)
+            dequant = (coeffs * level_scale + rounding) >> (6 - qp_div_6)
+    else:
+        # No scaling list: normAdjust only (equivalent to FLAT weightScale=16)
+        # d = c * normAdjust * 16 << (qpPer - 6) = c * normAdjust << (qpPer - 2)
+        if qp_div_6 >= 2:
+            dequant = (coeffs * scale_matrix) << (qp_div_6 - 2)
+        else:
+            rounding = 1 << (1 - qp_div_6)
+            dequant = (coeffs * scale_matrix + rounding) >> (2 - qp_div_6)
 
     logger.debug(f"Dequantized 8x8 output: max={np.max(np.abs(dequant))}")
 

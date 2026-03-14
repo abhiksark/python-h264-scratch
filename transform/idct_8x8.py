@@ -79,60 +79,55 @@ SCALING_FACTORS_8x8 = np.array([
 
 
 def idct_1d_8(x: np.ndarray) -> np.ndarray:
-    """Apply 1D 8-point inverse transform.
+    """Apply 1D 8-point inverse transform per H.264 Section 8.5.12.
 
-    Uses H.264's integer butterfly structure for 8-point IDCT.
-    This is the core 1D transform that gets applied to rows and columns.
+    Matches JM reference decoder inverse8x8() from transform.c exactly.
 
     Args:
-        x: Input vector of 8 elements (int32)
+        x: Input vector of 8 elements (int32), p[0..7]
 
     Returns:
         Transformed vector of 8 elements (int32)
 
-    The butterfly implements the inverse of the H.264 8x8 forward transform,
-    using specific integer approximations for the DCT basis functions.
+    H.264 Spec Reference: Section 8.5.12
     """
     x = x.astype(np.int32)
+    p0, p1, p2, p3, p4, p5, p6, p7 = (
+        x[0], x[1], x[2], x[3], x[4], x[5], x[6], x[7]
+    )
 
-    # Stage 1: Initial butterfly
-    # Even indices: 0, 2, 4, 6
-    # Odd indices: 1, 3, 5, 7
+    # Even part
+    a0 = p0 + p4
+    a1 = p0 - p4
+    a2 = p6 - (p2 >> 1)
+    a3 = p2 + (p6 >> 1)
 
-    # Even part (4-point IDCT-like structure)
-    e0 = x[0] + x[4]
-    e1 = x[0] - x[4]
-    e2 = (x[2] >> 1) - x[6]
-    e3 = x[2] + (x[6] >> 1)
+    b0 = a0 + a3
+    b2 = a1 - a2
+    b4 = a1 + a2
+    b6 = a0 - a3
 
-    # Combine even terms
-    f0 = e0 + e3
-    f1 = e1 + e2
-    f2 = e1 - e2
-    f3 = e0 - e3
+    # Odd part
+    a0 = -p3 + p5 - p7 - (p7 >> 1)
+    a1 = p1 + p7 - p3 - (p3 >> 1)
+    a2 = -p1 + p7 + p5 + (p5 >> 1)
+    a3 = p3 + p5 + p1 + (p1 >> 1)
 
-    # Odd part (more complex butterfly)
-    # Using H.264 specific coefficients
-    g0 = x[1] - x[7]
-    g1 = x[1] + x[7]
-    g2 = x[3] - x[5]
-    g3 = x[3] + x[5]
+    b1 = a0 + (a3 >> 2)
+    b3 = a1 + (a2 >> 2)
+    b5 = a2 - (a1 >> 2)
+    b7 = a3 - (a0 >> 2)
 
-    h0 = g0 + (g2 >> 1)
-    h1 = (g0 >> 1) - g2
-    h2 = g1 - (g3 >> 1)
-    h3 = (g1 >> 1) + g3
-
-    # Final stage: combine even and odd
+    # Final combination (interleaved even/odd)
     return np.array([
-        f0 + h3,
-        f1 + h2,
-        f2 + h1,
-        f3 + h0,
-        f3 - h0,
-        f2 - h1,
-        f1 - h2,
-        f0 - h3,
+        b0 + b7,
+        b2 - b5,
+        b4 + b3,
+        b6 + b1,
+        b6 - b1,
+        b4 - b3,
+        b2 + b5,
+        b0 - b7,
     ], dtype=np.int32)
 
 
@@ -164,21 +159,20 @@ def idct_8x8(coeffs: np.ndarray) -> np.ndarray:
     # Work with int32 to avoid overflow
     temp = coeffs.astype(np.int32)
 
-    # Step 1: Apply 1D transform to each column
-    col_result = np.zeros((8, 8), dtype=np.int32)
-    for j in range(8):
-        col_result[:, j] = idct_1d_8(temp[:, j])
-
-    # Step 2: Apply 1D transform to each row
+    # Step 1: Apply 1D transform to each row (horizontal pass)
+    # JM inverse8x8: horizontal first, then vertical
     row_result = np.zeros((8, 8), dtype=np.int32)
     for i in range(8):
-        row_result[i, :] = idct_1d_8(col_result[i, :])
+        row_result[i, :] = idct_1d_8(temp[i, :])
 
-    # Step 3: Normalize (divide by 256 with rounding)
-    # For 8x8: scale factor is 2^6 per dimension = 2^12 total
-    # But H.264 spec uses 2^6 combined, giving effective 2^12 / 64 = 64
-    # Add 128 for rounding, then shift right by 8
-    result = (row_result + 128) >> 8
+    # Step 2: Apply 1D transform to each column (vertical pass)
+    col_result = np.zeros((8, 8), dtype=np.int32)
+    for j in range(8):
+        col_result[:, j] = idct_1d_8(row_result[:, j])
+
+    # Step 3: Normalize per H.264 Section 8.5.12
+    # r[i][j] = (f[i][j] + 32) >> 6
+    result = (col_result + 32) >> 6
 
     logger.debug(f"IDCT 8x8 output:\n{result}")
 
@@ -186,9 +180,7 @@ def idct_8x8(coeffs: np.ndarray) -> np.ndarray:
 
 
 def forward_1d_8(x: np.ndarray) -> np.ndarray:
-    """Apply 1D 8-point forward transform.
-
-    This computes the forward DCT using matrix multiplication.
+    """Apply 1D 8-point forward transform matching JM forward8x8().
 
     Args:
         x: Input vector of 8 elements (int32)
@@ -196,16 +188,48 @@ def forward_1d_8(x: np.ndarray) -> np.ndarray:
     Returns:
         Transformed vector of 8 elements (int32)
     """
-    return TRANSFORM_MATRIX_8x8 @ x.astype(np.int32)
+    x = x.astype(np.int32)
+    p0, p1, p2, p3, p4, p5, p6, p7 = (
+        x[0], x[1], x[2], x[3], x[4], x[5], x[6], x[7]
+    )
+
+    a0 = p0 + p7
+    a1 = p1 + p6
+    a2 = p2 + p5
+    a3 = p3 + p4
+
+    b0 = a0 + a3
+    b1 = a1 + a2
+    b2 = a0 - a3
+    b3 = a1 - a2
+
+    a0 = p0 - p7
+    a1 = p1 - p6
+    a2 = p2 - p5
+    a3 = p3 - p4
+
+    b4 = a1 + a2 + ((a0 >> 1) + a0)
+    b5 = a0 - a3 - ((a2 >> 1) + a2)
+    b6 = a0 + a3 - ((a1 >> 1) + a1)
+    b7 = a1 - a2 + ((a3 >> 1) + a3)
+
+    return np.array([
+        b0 + b1,
+        b4 + (b7 >> 2),
+        b2 + (b3 >> 1),
+        b5 + (b6 >> 2),
+        b0 - b1,
+        b6 - (b5 >> 2),
+        (b2 >> 1) - b3,
+        (b4 >> 2) - b7,
+    ], dtype=np.int32)
 
 
 def forward_8x8(block: np.ndarray) -> np.ndarray:
-    """Apply 8x8 forward transform (DCT).
+    """Apply 8x8 forward transform (DCT) matching JM forward8x8().
 
     This is the inverse of idct_8x8, used primarily for testing
     round-trip accuracy of the transform.
-
-    Uses matrix multiplication: Y = Cf * X * Cf^T
 
     Args:
         block: 8x8 spatial block (int32)
@@ -214,26 +238,23 @@ def forward_8x8(block: np.ndarray) -> np.ndarray:
         8x8 transform coefficients (int32)
 
     H.264 Spec: This is the encoder-side transform, inverse of Section 8.5.12
-
-    Note: The forward transform produces coefficients that when passed through
-    idct_8x8 will recover the original (within integer rounding).
     """
     if block.shape != (8, 8):
         raise ValueError(f"Expected 8x8 block, got {block.shape}")
 
-    # Work with int32
     temp = block.astype(np.int32)
 
-    # Apply: Cf * spatial * Cf^T (matrix multiplication)
-    raw = TRANSFORM_MATRIX_8x8 @ temp @ TRANSFORM_MATRIX_8x8.T
+    # Step 1: Apply 1D forward transform to each row
+    row_result = np.zeros((8, 8), dtype=np.int32)
+    for i in range(8):
+        row_result[i, :] = forward_1d_8(temp[i, :])
 
-    # Scale to match IDCT's normalization
-    # The H.264 integer transforms use scaled coefficients (8, 10, 12, etc.)
-    # The IDCT expects coefficients at a certain scale
-    # Empirically tune scaling for best round-trip accuracy
-    result = raw >> 4
+    # Step 2: Apply 1D forward transform to each column
+    col_result = np.zeros((8, 8), dtype=np.int32)
+    for j in range(8):
+        col_result[:, j] = forward_1d_8(row_result[:, j])
 
-    return result
+    return col_result
 
 
 def idct_8x8_batch(blocks: np.ndarray) -> np.ndarray:

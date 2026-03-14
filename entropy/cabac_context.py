@@ -49,8 +49,16 @@ CTX_SIG_COEFF_FLAG_START = 105       # significant_coeff_flag (ctxIdx 105-165)
 CTX_LAST_SIG_COEFF_START = 166       # last_significant_coeff_flag (ctxIdx 166-226)
 CTX_COEFF_ABS_LEVEL_START = 227      # coeff_abs_level_minus1 (ctxIdx 227-275)
 
+# 8x8 transform context index ranges (High Profile, H.264 Table 9-11)
+CTX_TRANSFORM_8X8_FLAG_START = 399   # transform_size_8x8_flag (ctxIdx 399-401)
+CTX_SIG_COEFF_FLAG_8X8_START = 402   # significant_coeff_flag 8x8 frame (ctxIdx 402-416)
+CTX_LAST_SIG_COEFF_8X8_START = 417   # last_significant_coeff_flag 8x8 frame (ctxIdx 417-425)
+CTX_COEFF_ABS_LEVEL_8X8_START = 426  # coeff_abs_level_minus1 8x8 (ctxIdx 426-435)
+CTX_CODED_BLOCK_FLAG_8X8_START = 85  # 8x8 reuses same CBF range (CBP handles gating)
+
 # Total number of contexts
 NUM_CONTEXTS = 460
+NUM_CONTEXTS_8X8 = 460  # 8x8 contexts fit within the base 460
 
 
 def calc_initial_state(m: int, n: int, slice_qp: int) -> Tuple[int, int]:
@@ -2034,3 +2042,25 @@ def init_context_models_with_idc(
         contexts.append(CABACContext(pStateIdx=p_state_idx, valMPS=val_mps))
 
     return contexts
+
+
+def init_context_models_8x8(
+    slice_type: int,
+    slice_qp: int,
+    cabac_init_idc: int = 0,
+) -> List[CABACContext]:
+    """Initialize CABAC context models including 8x8 contexts.
+
+    8x8 contexts (ctxIdx 277-459) are already within the base 460 contexts,
+    so this delegates to init_context_models_with_idc.
+
+    H.264 Spec Reference: Section 9.3.1.1
+    """
+    return init_context_models_with_idc(slice_type, slice_qp, cabac_init_idc)
+
+
+# Init param placeholders for 8x8 sig_coeff contexts (extracted from base tables)
+# These are the (m, n) values for ctxIdx 277-337 from Tables 9-12 through 9-23
+INIT_PARAMS_SIG_COEFF_8X8_I = _INIT_I[277:338]
+INIT_PARAMS_SIG_COEFF_8X8_P = _INIT_PB_IDC0[277:338]
+INIT_PARAMS_SIG_COEFF_8X8_B = _INIT_PB_IDC0[277:338]

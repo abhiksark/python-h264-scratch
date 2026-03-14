@@ -100,9 +100,16 @@ class TestDefaultScalingListSelection:
             assert get_scaling_list_8x8(sps, None, i) == FLAT_8x8
 
     def test_high_profile_no_matrix_uses_flat_scaling(self):
-        """High profile with scaling_matrix_present=0 uses flat lists."""
+        """High profile with scaling_matrix_present=0 uses FLAT lists.
+
+        JM reference decoder: when neither SPS nor PPS signals scaling
+        matrices (both present_flags=0), flat lists (all 16s) are used.
+        """
         from parameters.sps import parse_sps
-        from parameters.scaling import get_scaling_list_4x4
+        from parameters.scaling import (
+            get_scaling_list_4x4,
+            FLAT_4x4,
+        )
 
         writer = BitWriter()
         writer.write_bits(100, 8)  # High profile
@@ -129,7 +136,7 @@ class TestDefaultScalingListSelection:
         rbsp = writer.to_bytes()
         sps = parse_sps(rbsp)
 
-        # With seq_scaling_matrix_present_flag=0, use flat lists
+        # JM: when neither SPS nor PPS has scaling matrices, use flat
         for i in range(6):
             assert get_scaling_list_4x4(sps, None, i) == FLAT_4x4
 

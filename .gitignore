@@ -77,9 +77,12 @@ venv.bak/
 # AI assistant directories
 .claude/
 
-# Test data - binary files (regenerate with JM reference software)
+# Test data - binary files (regenerate with JM/ffmpeg)
 test_data/*.264
 test_data/*.yuv
+test_data/*.mp4
+test_data/*.png
+test_data/*.pgm
 test_data/**/*.264
 test_data/**/*.yuv
 

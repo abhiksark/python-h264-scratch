@@ -34,6 +34,7 @@ from bitstream import (
     iter_nal_units,
 )
 from parameters import SPS, PPS, parse_sps, parse_pps
+from parameters.sps import _is_high_profile
 from slice import SliceHeader, SliceType, parse_slice_header
 from reconstruct import decode_macroblock, MacroblockData
 from reconstruct.macroblock import (
@@ -46,7 +47,9 @@ from reconstruct.macroblock import (
 )
 from entropy import decode_residual_block, calculate_nC, ZIGZAG_4x4
 from dequant import dequant_4x4, get_chroma_qp
+from dequant.dequant import dequant_8x8
 from transform import idct_4x4
+from transform.idct_8x8 import idct_8x8
 from color import ycbcr_to_rgb, ColorMatrix
 from color.chroma_format import monochrome_to_rgb, ycbcr_422_to_rgb, ycbcr_444_to_rgb
 from inter.reference import ReferenceFrame, ReferenceFrameBuffer
@@ -304,6 +307,15 @@ class DecoderState:
         self.mb_mvds_l0 = np.zeros((mb_count, 4, 4, 2), dtype=np.int32)
         self.mb_mvds_l1 = np.zeros((mb_count, 4, 4, 2), dtype=np.int32)
 
+        # Per-MB ref_idx per 4x4 block for CABAC ref_idx context derivation
+        # Shape: (mb_count, 4, 4) → ref_idx for partition covering each block
+        # 0 = ref_idx 0 or intra (both give condTermFlag=0)
+        self.mb_ref_idx_l0 = np.zeros((mb_count, 4, 4), dtype=np.int8)
+        self.mb_ref_idx_l1 = np.zeros((mb_count, 4, 4), dtype=np.int8)
+
+        # Per-MB transform_size_8x8_flag for CABAC context derivation
+        self.mb_transform_8x8_flags = np.zeros(mb_count, dtype=np.int32)
+
         # Slice tracking
         self.mb_slice_ids = np.zeros(mb_count, dtype=np.int32)
         self.current_slice_id = 0
@@ -402,13 +414,55 @@ class H264Decoder:
 
         sps = getattr(self.state, "current_sps", None)
         max_frame_num = getattr(sps, "max_frame_num", None)
+        current_poc = self._calculate_poc(slice_header, sps) if sps else 0
         self.mmco_processor.process_non_idr(
             marking,
             current_frame=ref_frame,
             current_frame_num=slice_header.frame_num,
             max_frame_num=max_frame_num,
-            current_poc=getattr(slice_header, "pic_order_cnt_lsb", 0),
+            current_poc=current_poc,
         )
+
+    def _apply_mmco_to_ref_buffer(
+        self,
+        marking: 'DecRefPicMarking',
+        current_frame_num: int,
+        sps: 'SPS',
+    ) -> None:
+        """Apply MMCO operations to the reference buffer.
+
+        Currently supports MMCO 1 (mark short-term as unused).
+
+        H.264 Spec: Section 8.2.5.4
+        """
+        ops = getattr(marking, 'memory_management_control_operations', [])
+        diffs = getattr(marking, 'difference_of_pic_nums_minus1', [])
+        max_frame_num = getattr(sps, 'max_frame_num', 256)
+
+        diff_idx = 0
+        for op in ops:
+            if op == 0:
+                break
+            if op == 1:
+                # Mark short-term reference as unused
+                if diff_idx < len(diffs):
+                    diff = diffs[diff_idx] + 1
+                    diff_idx += 1
+                    pic_num = (current_frame_num - diff) % max_frame_num
+                    self.state.ref_buffer.remove_by_frame_num(pic_num)
+                    logger.debug(
+                        f"MMCO 1: marked frame_num={pic_num} as unused "
+                        f"(current_fn={current_frame_num}, diff={diff})"
+                    )
+            elif op == 5:
+                # Reset all reference pictures
+                self.state.ref_buffer.clear()
+                logger.debug("MMCO 5: cleared all reference pictures")
+            else:
+                # MMCO 2,3,4,6: long-term operations (skip for now)
+                logger.debug(f"MMCO {op}: not yet implemented, skipping")
+                if op in (1, 3) and diff_idx < len(diffs):
+                    diff_idx += 1
 
     def conceal_macroblock(self, *args, **kwargs):
         from decoder.error_concealment import conceal_macroblock as _conceal_macroblock
@@ -523,7 +577,12 @@ class H264Decoder:
     def _process_pps(self, nal: NALUnit) -> None:
         """Parse and store PPS."""
         try:
-            pps = parse_pps(nal.rbsp)  # parse_pps expects raw bytes
+            # Determine if any SPS is High profile for PPS extension parsing
+            is_hp = any(
+                _is_high_profile(sps.profile_idc)
+                for sps in self.state.sps_dict.values()
+            )
+            pps = parse_pps(nal.rbsp, is_high_profile=is_hp)
         except Exception as e:
             logger.warning(f"Failed to parse PPS (truncated or malformed): {e}")
             return
@@ -607,6 +666,9 @@ class H264Decoder:
         # Calculate slice QP
         slice_qp = 26 + pps.pic_init_qp_minus26 + slice_header.slice_qp_delta
         logger.debug(f"Slice QP: {slice_qp}")
+
+        # Calculate POC (works for all poc_type values)
+        current_poc = self._calculate_poc(slice_header, sps)
 
         # Initialize MV cache for P/B-slices
         if is_p_slice or is_b_slice:
@@ -733,7 +795,7 @@ class H264Decoder:
 
         frame = DecodedFrame(
             frame_num=slice_header.frame_num,
-            poc=getattr(slice_header, "pic_order_cnt_lsb", 0),
+            poc=current_poc,
             luma=out_luma.copy(),
             cb=out_cb.copy() if out_cb is not None else None,
             cr=out_cr.copy() if out_cr is not None else None,
@@ -744,12 +806,19 @@ class H264Decoder:
 
         # Add to reference buffer if this is a reference frame
         if nal.nal_ref_idc > 0:
+            # Apply MMCO before adding (H.264 8.2.5)
+            marking = getattr(slice_header, 'dec_ref_pic_marking', None)
+            if marking is not None and getattr(marking, 'adaptive_ref_pic_marking_mode_flag', False):
+                self._apply_mmco_to_ref_buffer(
+                    marking, slice_header.frame_num, sps
+                )
+
             ref_frame = ReferenceFrame(
                 luma=self.state.frame_luma.copy(),
                 cb=self.state.frame_cb.copy(),
                 cr=self.state.frame_cr.copy(),
                 frame_num=slice_header.frame_num,
-                poc=getattr(slice_header, "pic_order_cnt_lsb", 0),
+                poc=current_poc,
             )
             self._store_mvs_in_ref(ref_frame)
             self.state.ref_buffer.add_frame(ref_frame)
@@ -1607,6 +1676,14 @@ class H264Decoder:
                 dequant = dequant_4x4(coeffs_2d, current_qp)
                 residual_block = idct_4x4(dequant)
                 row, col = BLOCK_SCAN_ORDER[block_idx]
+                if getattr(self, '_trace_residual_mb', None) == (mb_x, mb_y):
+                    logger.warning(
+                        "TRACE_RESID blk=%d (%d,%d) coeffs=%s dq=%s res=%s",
+                        block_idx, row, col,
+                        coeffs_2d.flatten().tolist(),
+                        dequant.flatten().tolist(),
+                        residual_block.flatten().tolist(),
+                    )
                 luma_residual[row:row+4, col:col+4] = residual_block
 
         # ── Step 4: Parse chroma residual ──
@@ -2028,7 +2105,7 @@ class H264Decoder:
 
         # Get direct mode flag
         use_spatial = getattr(slice_header, 'direct_spatial_mv_pred_flag', True)
-        current_poc = getattr(slice_header, 'pic_order_cnt_lsb', 0)
+        current_poc = self._calculate_poc(slice_header, sps)
         weighted_bipred_idc = getattr(pps, 'weighted_bipred_idc', 0)
 
         # Build L0/L1 reference lists before decoding B-slice
@@ -2369,6 +2446,18 @@ class H264Decoder:
                 dc = self.state.mb_dc_cbf[top_idx]
                 top_mb_cbf.extend([int(dc[0]), int(dc[1]), int(dc[2])])
 
+        # Get neighbor transform_size_8x8_flag for context derivation
+        left_transform_8x8 = False
+        top_transform_8x8 = False
+        if mb_x > 0 and self.state.mb_transform_8x8_flags is not None:
+            left_idx = mb_idx - 1
+            if left_idx >= 0:
+                left_transform_8x8 = bool(self.state.mb_transform_8x8_flags[left_idx])
+        if mb_y > 0 and self.state.mb_transform_8x8_flags is not None:
+            top_idx = mb_idx - mb_width
+            if top_idx >= 0:
+                top_transform_8x8 = bool(self.state.mb_transform_8x8_flags[top_idx])
+
         # Get neighbor skip flags for skip context derivation
         left_skip = False
         top_skip = False
@@ -2397,6 +2486,22 @@ class H264Decoder:
             if self.state.mb_mvds_l1 is not None:
                 top_mvds_l1 = self.state.mb_mvds_l1[top_idx]
 
+        # Get neighbor ref_idx grids for ref_idx context derivation (H.264 9.3.3.1.1.3)
+        left_ref_l0 = None
+        top_ref_l0 = None
+        left_ref_l1 = None
+        top_ref_l1 = None
+        if mb_x > 0 and self.state.mb_ref_idx_l0 is not None:
+            left_idx = mb_idx - 1
+            left_ref_l0 = self.state.mb_ref_idx_l0[left_idx]
+            if self.state.mb_ref_idx_l1 is not None:
+                left_ref_l1 = self.state.mb_ref_idx_l1[left_idx]
+        if mb_y > 0 and self.state.mb_ref_idx_l0 is not None:
+            top_idx = mb_idx - mb_width
+            top_ref_l0 = self.state.mb_ref_idx_l0[top_idx]
+            if self.state.mb_ref_idx_l1 is not None:
+                top_ref_l1 = self.state.mb_ref_idx_l1[top_idx]
+
         return {
             'mb_x': mb_x,
             'mb_y': mb_y,
@@ -2411,6 +2516,8 @@ class H264Decoder:
             'top_chroma_mode': top_chroma_mode,
             'prev_mb_qp_delta': prev_mb_qp_delta,
             'transform_8x8_mode_flag': getattr(pps, 'transform_8x8_mode_flag', 0),
+            'left_transform_8x8': left_transform_8x8,
+            'top_transform_8x8': top_transform_8x8,
             'left_mb_cbf': left_mb_cbf,
             'top_mb_cbf': top_mb_cbf,
             'left_skip': left_skip,
@@ -2419,6 +2526,10 @@ class H264Decoder:
             'top_mb_mvds_l0': top_mvds_l0,
             'left_mb_mvds_l1': left_mvds_l1,
             'top_mb_mvds_l1': top_mvds_l1,
+            'left_mb_ref_l0': left_ref_l0,
+            'top_mb_ref_l0': top_ref_l0,
+            'left_mb_ref_l1': left_ref_l1,
+            'top_mb_ref_l1': top_ref_l1,
         }
 
     def _process_cabac_macroblock(
@@ -2462,6 +2573,10 @@ class H264Decoder:
             self.state.mb_qp_deltas[mb_idx] = mb_data.get('mb_qp_delta', 0)
         if self.state.mb_skip_flags is not None:
             self.state.mb_skip_flags[mb_idx] = mb_data.get('mb_skip_flag', 0)
+        if self.state.mb_transform_8x8_flags is not None:
+            self.state.mb_transform_8x8_flags[mb_idx] = mb_data.get(
+                'transform_size_8x8_flag', 0
+            )
 
         # Store DC coded_block_flag for CABAC neighbor context
         # Always clear first to prevent stale values from previous frame
@@ -2489,11 +2604,28 @@ class H264Decoder:
                     self.state.mb_mvds_l1[mb_idx] = mvd_grid
                 else:
                     self.state.mb_mvds_l1[mb_idx] = 0
+            # Store ref_idx grids for CABAC ref_idx context (H.264 9.3.3.1.1.3)
+            if self.state.mb_ref_idx_l0 is not None:
+                ref_grid = pred.get('ref_idx_grid_l0')
+                if ref_grid is not None:
+                    self.state.mb_ref_idx_l0[mb_idx] = ref_grid
+                else:
+                    self.state.mb_ref_idx_l0[mb_idx] = 0
+            if self.state.mb_ref_idx_l1 is not None:
+                ref_grid = pred.get('ref_idx_grid_l1')
+                if ref_grid is not None:
+                    self.state.mb_ref_idx_l1[mb_idx] = ref_grid
+                else:
+                    self.state.mb_ref_idx_l1[mb_idx] = 0
         else:
             if self.state.mb_mvds_l0 is not None:
                 self.state.mb_mvds_l0[mb_idx] = 0
             if self.state.mb_mvds_l1 is not None:
                 self.state.mb_mvds_l1[mb_idx] = 0
+            if self.state.mb_ref_idx_l0 is not None:
+                self.state.mb_ref_idx_l0[mb_idx] = 0
+            if self.state.mb_ref_idx_l1 is not None:
+                self.state.mb_ref_idx_l1[mb_idx] = 0
 
         ly, lx = mb_y * 16, mb_x * 16
         cy, cx = mb_y * 8, mb_x * 8
@@ -2517,6 +2649,11 @@ class H264Decoder:
 
         # Handle I-macroblock in any slice
         if self._is_intra_mb_cabac(mb_type, slice_type):
+            # Remap CABAC mb_type to canonical intra range (0-25) for deblocking
+            # P-slice intra types start at 5, B-slice at 23
+            if self.state.mb_types is not None and slice_type != 2:
+                intra_type = mb_type - 5 if slice_type == 0 else mb_type - 23
+                self.state.mb_types[mb_idx] = intra_type
             self._reconstruct_intra_mb_cabac(
                 cabac, contexts, mb_data, mb_x, mb_y, qp, sps, pps, slice_type
             )
@@ -2570,7 +2707,9 @@ class H264Decoder:
         else:  # B-skip
             sh = getattr(self.state, 'current_slice_header', None)
             use_spatial = getattr(sh, 'direct_spatial_mv_pred_flag', True)
-            current_poc = getattr(sh, 'pic_order_cnt_lsb', 0)
+            current_poc = self._calculate_poc(sh, self.state.current_sps) if sh else 0
+            pps = self.state.current_pps
+            weighted_bipred_idc = getattr(pps, 'weighted_bipred_idc', 0) if pps else 0
             luma, cb, cr = reconstruct_b_skip(
                 ref_buffer=self.state.ref_buffer,
                 mv_cache=self.state.mv_cache,
@@ -2579,6 +2718,7 @@ class H264Decoder:
                 mb_y=mb_y,
                 use_spatial=use_spatial,
                 current_poc=current_poc,
+                weighted_bipred_idc=weighted_bipred_idc,
             )
 
         # Copy to frame buffers
@@ -2731,6 +2871,131 @@ class H264Decoder:
             # Store intra_modes as DC default (I_16x16 is not I_4x4)
             if self.state.intra_modes is not None:
                 self.state.intra_modes[mb_idx, :] = 2  # DC default
+
+        elif mb_type == 0 and mb_data.get('transform_size_8x8_flag', 0) == 1:
+            # --- I_8x8 ---
+            from decoder.i8x8 import (
+                reconstruct_i8x8_luma,
+                get_i8x8_block_neighbors,
+                reconstruct_i8x8_block,
+            )
+            from entropy.tables import ZIGZAG_8x8 as ZZ8
+
+            cbp = mb_data.get('cbp', 0)
+            cbp_luma = cbp & 0x0F
+            cbp_chroma = (cbp >> 4) & 0x03
+
+            # Derive prediction modes (same MPM logic as I_4x4 but 4 blocks)
+            raw_modes = mb_pred.get('intra_pred_modes', [])
+            i8x8_modes = []
+
+            # I_8x8 block positions: 0=(0,0), 1=(0,8), 2=(8,0), 3=(8,8)
+            # Neighbor mode derivation uses 8x8 block grid
+            for block_idx in range(4):
+                brow = block_idx // 2  # 0 or 1
+                bcol = block_idx % 2   # 0 or 1
+
+                # Left neighbor mode
+                if bcol > 0:
+                    mode_a = i8x8_modes[block_idx - 1] if block_idx > 0 else 2
+                elif mb_x > 0 and self.state.intra_modes is not None:
+                    left_mb_idx = mb_y * mb_width + (mb_x - 1)
+                    # Right column of left MB: blocks 1 (top-right) and 3 (bottom-right)
+                    left_block_8x8 = 1 + brow * 2
+                    # Map to 4x4 block index: need rightmost column of that 8x8 block
+                    # 4x4 sub-block 1 (top-right) is the adjacent one
+                    left_4x4_idx = left_block_8x8 * 4 + 1
+                    mode_a = int(self.state.intra_modes[left_mb_idx, left_4x4_idx])
+                else:
+                    mode_a = -1
+
+                # Top neighbor mode
+                if brow > 0:
+                    mode_b = i8x8_modes[block_idx - 2]
+                elif mb_y > 0 and self.state.intra_modes is not None:
+                    top_mb_idx = (mb_y - 1) * mb_width + mb_x
+                    top_block_8x8 = 2 + bcol
+                    # Map to 4x4 block index: need bottom row of that 8x8 block
+                    # 4x4 sub-block 2 (bottom-left) is the adjacent one
+                    top_4x4_idx = top_block_8x8 * 4 + 2
+                    mode_b = int(self.state.intra_modes[top_mb_idx, top_4x4_idx])
+                else:
+                    mode_b = -1
+
+                # MPM derivation
+                if mode_a < 0 or mode_b < 0:
+                    predicted_mode = 2  # DC
+                else:
+                    predicted_mode = min(mode_a, mode_b)
+
+                cabac_mode = raw_modes[block_idx] if block_idx < len(raw_modes) else 0
+                if cabac_mode == -1:
+                    mode = predicted_mode
+                else:
+                    rem = cabac_mode
+                    mode = rem if rem < predicted_mode else rem + 1
+
+                i8x8_modes.append(mode)
+
+            # Reconstruct each 8x8 block
+            frame_width = sps.pic_width_in_mbs * 16
+            frame_height = sps.pic_height_in_map_units * 16
+            block_positions = [(0, 0), (0, 8), (8, 0), (8, 8)]
+            mb_luma = np.zeros((16, 16), dtype=np.uint8)
+
+            luma_8x8_list = residual.get('luma_8x8', [None] * 4)
+
+            for block_idx in range(4):
+                row_off, col_off = block_positions[block_idx]
+
+                # Get neighbors
+                neighbors = get_i8x8_block_neighbors(
+                    self.state.frame_luma, mb_luma,
+                    mb_x, mb_y, block_idx,
+                    frame_width, frame_height,
+                )
+
+                # Convert scan-order coefficients to 8x8 raster
+                coeffs_8x8 = np.zeros((8, 8), dtype=np.int32)
+                raw_coeffs = luma_8x8_list[block_idx] if luma_8x8_list else None
+                if raw_coeffs is not None and (cbp_luma & (1 << block_idx)):
+                    raw_coeffs = np.asarray(raw_coeffs, dtype=np.int32)
+                    for scan_idx in range(64):
+                        raster_pos = int(ZZ8[scan_idx])
+                        coeffs_8x8[raster_pos // 8, raster_pos % 8] = raw_coeffs[scan_idx]
+
+                # Dequant + IDCT (with scaling list for High Profile)
+                from parameters.scaling import get_scaling_list_8x8
+                scaling_list = get_scaling_list_8x8(sps, pps, index=0)  # Intra
+                dequant_block = dequant_8x8(coeffs_8x8, current_qp, scaling_list)
+                residual_block = idct_8x8(dequant_block)
+
+                # Reconstruct
+                block = reconstruct_i8x8_block(
+                    mode=i8x8_modes[block_idx],
+                    residual=residual_block,
+                    **neighbors,
+                )
+
+                mb_luma[row_off:row_off+8, col_off:col_off+8] = block
+
+                # Write to frame immediately for subsequent blocks' neighbors
+                abs_y = ly + row_off
+                abs_x = lx + col_off
+                self.state.frame_luma[abs_y:abs_y+8, abs_x:abs_x+8] = block
+
+                # nz_counts: mark all 4 sub-blocks of this 8x8 block
+                has_coeffs = 1 if np.any(coeffs_8x8 != 0) else 0
+                for sub in range(4):
+                    nz_counts[block_idx * 4 + sub] = has_coeffs
+
+            # Store I_8x8 modes (store same mode for all 4 sub-blocks)
+            if self.state.intra_modes is not None:
+                for block_idx in range(4):
+                    for sub in range(4):
+                        self.state.intra_modes[mb_idx, block_idx * 4 + sub] = (
+                            i8x8_modes[block_idx]
+                        )
 
         elif mb_type == 0:
             # --- I_4x4 ---
@@ -3057,26 +3322,54 @@ class H264Decoder:
         nz_counts = np.zeros(24, dtype=np.int32)
         luma_residual = np.zeros((16, 16), dtype=np.int32)
 
-        luma_4x4_raw = residual.get('luma_4x4', [None] * 16)
-        for block_idx in range(16):
-            block_8x8_idx = block_idx // 4
-            if not (cbp_luma & (1 << block_8x8_idx)):
-                continue
-            coeffs_raw = luma_4x4_raw[block_idx]
-            if coeffs_raw is None:
-                continue
-            coeffs_arr = np.asarray(coeffs_raw, dtype=np.int32)
-            nz_counts[block_idx] = int(np.count_nonzero(coeffs_arr))
-            if nz_counts[block_idx] > 0:
-                coeffs_2d = np.zeros((4, 4), dtype=np.int32)
-                for scan_idx in range(16):
-                    raster_pos = ZIGZAG_4x4[scan_idx]
-                    r, c = raster_pos // 4, raster_pos % 4
-                    coeffs_2d[r, c] = coeffs_arr[scan_idx]
-                dequant = dequant_4x4(coeffs_2d, current_qp)
-                block_residual = idct_4x4(dequant)
-                row, col = BLOCK_SCAN_ORDER[block_idx]
-                luma_residual[row:row+4, col:col+4] = block_residual
+        if mb_data.get('transform_size_8x8_flag', 0) == 1:
+            # 8x8 transform: 4 blocks of 64 coefficients
+            from entropy.tables import ZIGZAG_8x8 as ZZ8
+            luma_8x8_raw = residual.get('luma_8x8', [None] * 4)
+            block_8x8_pos = [(0, 0), (0, 8), (8, 0), (8, 8)]
+            for i8x8 in range(4):
+                if not (cbp_luma & (1 << i8x8)):
+                    continue
+                raw = luma_8x8_raw[i8x8] if luma_8x8_raw else None
+                if raw is None:
+                    continue
+                raw_arr = np.asarray(raw, dtype=np.int32)
+                has_nz = int(np.count_nonzero(raw_arr))
+                for sub in range(4):
+                    nz_counts[i8x8 * 4 + sub] = has_nz
+                if has_nz > 0:
+                    coeffs_2d = np.zeros((8, 8), dtype=np.int32)
+                    for si in range(64):
+                        rp = int(ZZ8[si])
+                        coeffs_2d[rp // 8, rp % 8] = raw_arr[si]
+                    from parameters.scaling import get_scaling_list_8x8
+                    sl_8x8 = get_scaling_list_8x8(sps, pps, index=1)  # Inter
+                    dequant_blk = dequant_8x8(coeffs_2d, current_qp, sl_8x8)
+                    blk_res = idct_8x8(dequant_blk)
+                    r0, c0 = block_8x8_pos[i8x8]
+                    luma_residual[r0:r0+8, c0:c0+8] = blk_res
+        else:
+            # 4x4 transform: 16 blocks of 16 coefficients
+            luma_4x4_raw = residual.get('luma_4x4', [None] * 16)
+            for block_idx in range(16):
+                block_8x8_idx = block_idx // 4
+                if not (cbp_luma & (1 << block_8x8_idx)):
+                    continue
+                coeffs_raw = luma_4x4_raw[block_idx]
+                if coeffs_raw is None:
+                    continue
+                coeffs_arr = np.asarray(coeffs_raw, dtype=np.int32)
+                nz_counts[block_idx] = int(np.count_nonzero(coeffs_arr))
+                if nz_counts[block_idx] > 0:
+                    coeffs_2d = np.zeros((4, 4), dtype=np.int32)
+                    for scan_idx in range(16):
+                        raster_pos = ZIGZAG_4x4[scan_idx]
+                        r, c = raster_pos // 4, raster_pos % 4
+                        coeffs_2d[r, c] = coeffs_arr[scan_idx]
+                    dequant = dequant_4x4(coeffs_2d, current_qp)
+                    block_residual = idct_4x4(dequant)
+                    row, col = BLOCK_SCAN_ORDER[block_idx]
+                    luma_residual[row:row+4, col:col+4] = block_residual
 
         # --- Chroma residual ---
         chroma_qp_offset = getattr(pps, 'chroma_qp_index_offset', 0)
@@ -3293,7 +3586,7 @@ class H264Decoder:
 
         sh = getattr(self.state, 'current_slice_header', None)
         use_spatial = getattr(sh, 'direct_spatial_mv_pred_flag', True)
-        current_poc = getattr(sh, 'pic_order_cnt_lsb', 0)
+        current_poc = self._calculate_poc(sh, self.state.current_sps) if sh else 0
         pps = self.state.current_pps
         weighted_bipred_idc = getattr(pps, 'weighted_bipred_idc', 0) if pps else 0
 
@@ -3343,7 +3636,7 @@ class H264Decoder:
 
         sh = getattr(self.state, 'current_slice_header', None)
         weighted_bipred_idc = getattr(self.state.current_pps, 'weighted_bipred_idc', 0) if self.state.current_pps else 0
-        current_poc = getattr(sh, 'pic_order_cnt_lsb', 0)
+        current_poc = self._calculate_poc(sh, self.state.current_sps) if sh else 0
 
         pred_flags = _get_b_pred_flags(mb_type)
         is_16x16 = mb_type in (1, 2, 3)
@@ -3558,7 +3851,7 @@ class H264Decoder:
         mv_cache_l1 = getattr(self.state, 'mv_cache_l1', None)
         sh = getattr(self.state, 'current_slice_header', None)
         weighted_bipred_idc = getattr(self.state.current_pps, 'weighted_bipred_idc', 0) if self.state.current_pps else 0
-        current_poc = getattr(sh, 'pic_order_cnt_lsb', 0)
+        current_poc = self._calculate_poc(sh, self.state.current_sps) if sh else 0
 
         refs_l0 = [ref_idx_l0[i] if i < len(ref_idx_l0) else 0 for i in range(4)]
         refs_l1 = [ref_idx_l1[i] if i < len(ref_idx_l1) else 0 for i in range(4)]
@@ -4017,7 +4310,7 @@ class H264Decoder:
             self.state.l1_list = []
             return
 
-        current_poc = getattr(slice_header, 'pic_order_cnt_lsb', 0)
+        current_poc = self._calculate_poc(slice_header, self.state.current_sps)
         self.state.ref_buffer.build_ref_lists(current_poc)
         self.state.l0_list = self.state.ref_buffer.get_l0_list()
         self.state.l1_list = self.state.ref_buffer.get_l1_list()
@@ -4275,7 +4568,8 @@ class H264Decoder:
                 mvd_x = reader.read_se()
                 mvd_y = reader.read_se()
                 mvp_x, mvp_y = predict_mv_16x16(
-                    self.state.mv_cache, mb_x, mb_y
+                    self.state.mv_cache, mb_x, mb_y,
+                    target_ref=ref_idx_l0[0],
                 )
                 mvx_l0[0] = mvp_x + mvd_x
                 mvy_l0[0] = mvp_y + mvd_y
@@ -4286,7 +4580,8 @@ class H264Decoder:
                 mvd_x = reader.read_se()
                 mvd_y = reader.read_se()
                 mvp_x, mvp_y = predict_mv_16x16(
-                    self.state.mv_cache_l1, mb_x, mb_y
+                    self.state.mv_cache_l1, mb_x, mb_y,
+                    target_ref=ref_idx_l1[0],
                 )
                 mvx_l1[0] = mvp_x + mvd_x
                 mvy_l1[0] = mvp_y + mvd_y
@@ -4296,19 +4591,25 @@ class H264Decoder:
             # Store MVs in caches
             if part_modes[0] in ("L0", "Bi"):
                 self.state.mv_cache.set_mv_16x16(
-                    mb_x, mb_y, mvx_l0[0], mvy_l0[0]
+                    mb_x, mb_y, mvx_l0[0], mvy_l0[0],
+                    ref_idx=ref_idx_l0[0],
                 )
             else:
                 # L1-only: mark L0 as unavailable (MV=0, ref=-1)
-                self.state.mv_cache.mark_intra(mb_x, mb_y)
+                self.state.mv_cache.set_mv_16x16(
+                    mb_x, mb_y, 0, 0, ref_idx=-1,
+                )
             if self.state.mv_cache_l1 is not None:
                 if part_modes[0] in ("L1", "Bi"):
                     self.state.mv_cache_l1.set_mv_16x16(
-                        mb_x, mb_y, mvx_l1[0], mvy_l1[0]
+                        mb_x, mb_y, mvx_l1[0], mvy_l1[0],
+                        ref_idx=ref_idx_l1[0],
                     )
                 else:
                     # L0-only: mark L1 as unavailable (MV=0, ref=-1)
-                    self.state.mv_cache_l1.mark_intra(mb_x, mb_y)
+                    self.state.mv_cache_l1.set_mv_16x16(
+                        mb_x, mb_y, 0, 0, ref_idx=-1,
+                    )
 
             if part_modes[0] == "L0":
                 luma_pred, cb_pred, cr_pred = reconstruct_b_l0_16x16(
@@ -4364,11 +4665,13 @@ class H264Decoder:
                     mvd_y = reader.read_se()
                     if part_size == (16, 8):
                         mvp_x, mvp_y = predict_mv_16x8(
-                            self.state.mv_cache, mb_x, mb_y, part
+                            self.state.mv_cache, mb_x, mb_y, part,
+                            target_ref=ref_idx_l0[part],
                         )
                     else:
                         mvp_x, mvp_y = predict_mv_8x16(
-                            self.state.mv_cache, mb_x, mb_y, part
+                            self.state.mv_cache, mb_x, mb_y, part,
+                            target_ref=ref_idx_l0[part],
                         )
                     mvx_l0[part] = mvp_x + mvd_x
                     mvy_l0[part] = mvp_y + mvd_y
@@ -4376,21 +4679,23 @@ class H264Decoder:
                     # Store L0 MV immediately for next partition
                     if part_size == (16, 8):
                         self.state.mv_cache.set_mv_16x8(
-                            mb_x, mb_y, part, mvx_l0[part], mvy_l0[part]
+                            mb_x, mb_y, part, mvx_l0[part], mvy_l0[part],
+                            ref_idx=ref_idx_l0[part],
                         )
                     else:
                         self.state.mv_cache.set_mv_8x16(
-                            mb_x, mb_y, part, mvx_l0[part], mvy_l0[part]
+                            mb_x, mb_y, part, mvx_l0[part], mvy_l0[part],
+                            ref_idx=ref_idx_l0[part],
                         )
                 else:
                     # L1-only: mark L0 as unavailable for this partition
                     if part_size == (16, 8):
-                        self.state.mv_cache.mark_intra_16x8(
-                            mb_x, mb_y, part
+                        self.state.mv_cache.set_mv_16x8(
+                            mb_x, mb_y, part, 0, 0, ref_idx=-1,
                         )
                     else:
-                        self.state.mv_cache.mark_intra_8x16(
-                            mb_x, mb_y, part
+                        self.state.mv_cache.set_mv_8x16(
+                            mb_x, mb_y, part, 0, 0, ref_idx=-1,
                         )
 
             for part in range(2):
@@ -4399,11 +4704,13 @@ class H264Decoder:
                     mvd_y = reader.read_se()
                     if part_size == (16, 8):
                         mvp_x, mvp_y = predict_mv_16x8(
-                            self.state.mv_cache_l1, mb_x, mb_y, part
+                            self.state.mv_cache_l1, mb_x, mb_y, part,
+                            target_ref=ref_idx_l1[part],
                         )
                     else:
                         mvp_x, mvp_y = predict_mv_8x16(
-                            self.state.mv_cache_l1, mb_x, mb_y, part
+                            self.state.mv_cache_l1, mb_x, mb_y, part,
+                            target_ref=ref_idx_l1[part],
                         )
                     mvx_l1[part] = mvp_x + mvd_x
                     mvy_l1[part] = mvp_y + mvd_y
@@ -4412,22 +4719,24 @@ class H264Decoder:
                     if self.state.mv_cache_l1 is not None:
                         if part_size == (16, 8):
                             self.state.mv_cache_l1.set_mv_16x8(
-                                mb_x, mb_y, part, mvx_l1[part], mvy_l1[part]
+                                mb_x, mb_y, part, mvx_l1[part], mvy_l1[part],
+                                ref_idx=ref_idx_l1[part],
                             )
                         else:
                             self.state.mv_cache_l1.set_mv_8x16(
-                                mb_x, mb_y, part, mvx_l1[part], mvy_l1[part]
+                                mb_x, mb_y, part, mvx_l1[part], mvy_l1[part],
+                                ref_idx=ref_idx_l1[part],
                             )
                 else:
                     # L0-only: mark L1 as unavailable for this partition
                     if self.state.mv_cache_l1 is not None:
                         if part_size == (16, 8):
-                            self.state.mv_cache_l1.mark_intra_16x8(
-                                mb_x, mb_y, part
+                            self.state.mv_cache_l1.set_mv_16x8(
+                                mb_x, mb_y, part, 0, 0, ref_idx=-1,
                             )
                         else:
-                            self.state.mv_cache_l1.mark_intra_8x16(
-                                mb_x, mb_y, part
+                            self.state.mv_cache_l1.set_mv_8x16(
+                                mb_x, mb_y, part, 0, 0, ref_idx=-1,
                             )
 
             if part_size == (16, 8):

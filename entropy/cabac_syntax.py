@@ -369,17 +369,24 @@ def decode_ref_idx(
     contexts: List['CABACContext'],
     list_idx: int,
     num_ref: int = 0,
+    ctx_inc_bin0: int = 0,
 ) -> int:
     """Decode ref_idx_lX.
 
-    Uses truncated unary binarization limited by num_ref-1.
+    Uses standard unary binarization (matching JM reference decoder).
+    Bin 0 uses neighbor-dependent context, bin 1 uses ctx+4, bin 2+ uses ctx+5.
     Context base is ctxIdx 54 regardless of L0/L1 (H.264 Table 9-34).
+
+    H.264 Spec Reference: Section 9.3.3.1.1.3
 
     Args:
         decoder: CABAC decoder
         contexts: Context models
         list_idx: 0=L0, 1=L1 (unused for context, kept for API)
-        num_ref: Number of active references (max value = num_ref - 1)
+        num_ref: Number of active references
+        ctx_inc_bin0: Context increment for bin 0, derived from neighbor
+            ref_idx values: condTermFlagA + condTermFlagB where
+            condTermFlag = 1 if neighbor_ref_idx > 0, else 0.
 
     Returns:
         Reference index (>= 0)
@@ -389,14 +396,18 @@ def decode_ref_idx(
     if num_ref <= 1:
         return 0
 
-    # Unary with max = num_ref - 1
-    value = 0
-    max_val = num_ref - 1
+    # Bin 0: ctx_base + ctx_inc_bin0 (neighbor-dependent, H.264 Table 9-34)
+    if decoder.decode_decision(contexts[ctx_base + ctx_inc_bin0]) == 0:
+        return 0
 
-    while value < max_val:
-        ctx_idx = ctx_base + min(value, 2)
-        if decoder.decode_decision(contexts[ctx_idx]) == 0:
-            break
+    # Standard unary decode for remaining bins (matches JM unary_bin_decode)
+    # Bin 1: ctx_base + 4
+    if decoder.decode_decision(contexts[ctx_base + 4]) == 0:
+        return 1
+
+    # Bin 2+: ctx_base + 5
+    value = 2
+    while decoder.decode_decision(contexts[ctx_base + 5]) != 0:
         value += 1
 
     return value

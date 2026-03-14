@@ -14,6 +14,7 @@ import numpy as np
 from entropy.cabac_residual import (
     decode_residual_block_cabac,
     decode_residual_block_cabac_with_cbf,
+    decode_residual_block_8x8,
 )
 from entropy.cabac_syntax import (
     decode_mb_skip_flag,
@@ -93,6 +94,45 @@ _B_SUB_PART_COVERAGE = {
     11: [(1, 1), (1, 1), (1, 1), (1, 1)],
     12: [(1, 1), (1, 1), (1, 1), (1, 1)],
 }
+
+
+def _compute_ref_idx_ctx_inc(
+    blk_x: int,
+    blk_y: int,
+    cur_refs: np.ndarray,
+    left_refs: Optional[np.ndarray],
+    top_refs: Optional[np.ndarray],
+) -> int:
+    """Compute ctxIdxInc for ref_idx bin 0 (H.264 Table 9-34).
+
+    condTermFlagA = 1 if left neighbor's ref_idx > 0, else 0.
+    condTermFlagB = 1 if top neighbor's ref_idx > 0, else 0.
+    ctxIdxInc = condTermFlagA + 2 * condTermFlagB.
+
+    Args:
+        blk_x, blk_y: Top-left 4x4 block position of current partition (0-3)
+        cur_refs: Current MB's ref_idx grid [4, 4]
+        left_refs: Left MB's ref_idx grid [4, 4] or None
+        top_refs: Top MB's ref_idx grid [4, 4] or None
+
+    Returns:
+        ctxIdxInc: 0, 1, 2, or 3
+    """
+    # Left neighbor (A)
+    cond_a = 0
+    if blk_x > 0:
+        cond_a = 1 if cur_refs[blk_y, blk_x - 1] > 0 else 0
+    elif left_refs is not None:
+        cond_a = 1 if left_refs[blk_y, 3] > 0 else 0
+
+    # Top neighbor (B)
+    cond_b = 0
+    if blk_y > 0:
+        cond_b = 1 if cur_refs[blk_y - 1, blk_x] > 0 else 0
+    elif top_refs is not None:
+        cond_b = 1 if top_refs[3, blk_x] > 0 else 0
+
+    return cond_a + 2 * cond_b
 
 
 def _compute_mvd_ctx_inc(
@@ -391,8 +431,11 @@ def decode_mb_pred_cabac(
         elif slice_type == 1:
             intra_base = mb_type - 23
 
-        if intra_base == 0:  # I_4x4
-            for _ in range(16):
+        if intra_base == 0:  # I_NxN (I_4x4 or I_8x8)
+            # I_8x8: 4 prediction modes; I_4x4: 16 prediction modes
+            t8x8 = mb_info.get('transform_size_8x8_flag', 0)
+            num_modes = 4 if t8x8 else 16
+            for _ in range(num_modes):
                 if decode_prev_intra4x4_pred_mode_flag(decoder, contexts) == 1:
                     result['intra_pred_modes'].append(-1)
                 else:
@@ -434,22 +477,41 @@ def _decode_p_mb_pred(
     # Regular P partitions: 0=16x16, 1=16x8, 2=8x16
     num_parts = _get_num_partitions(mb_type, 0)
 
-    # ref_idx_l0 for all partitions
-    for _ in range(num_parts):
-        ref = decode_ref_idx(decoder, contexts, 0, num_ref_l0)
-        result['ref_idx_l0'].append(ref)
-
-    # MVD grid for neighbor context computation
-    cur_mvds = np.zeros((4, 4, 2), dtype=np.int32)
-    left_mvds = mb_info.get('left_mb_mvds_l0')
-    top_mvds = mb_info.get('top_mb_mvds_l0')
-
     # Partition top-left block positions: 16x16→(0,0), 16x8→(0,0)/(0,2), 8x16→(0,0)/(2,0)
     part_positions = [(0, 0)]
     if mb_type == 1:  # P_L0_16x8
         part_positions = [(0, 0), (0, 2)]
     elif mb_type == 2:  # P_L0_8x16
         part_positions = [(0, 0), (2, 0)]
+
+    # ref_idx context derivation needs neighbor grids
+    cur_refs_l0 = np.zeros((4, 4), dtype=np.int8)
+    left_refs_l0 = mb_info.get('left_mb_ref_l0')
+    top_refs_l0 = mb_info.get('top_mb_ref_l0')
+
+    # Partition coverage in 4x4 blocks: 16x16→(4,4), 16x8→(4,2), 8x16→(2,4)
+    if mb_type == 0:
+        part_rows, part_cols = 4, 4
+    elif mb_type == 1:
+        part_rows, part_cols = 2, 4
+    else:
+        part_rows, part_cols = 4, 2
+
+    # ref_idx_l0 for all partitions
+    for part_idx in range(num_parts):
+        blk_x, blk_y = part_positions[part_idx]
+        ctx_inc = _compute_ref_idx_ctx_inc(blk_x, blk_y, cur_refs_l0,
+                                           left_refs_l0, top_refs_l0)
+        ref = decode_ref_idx(decoder, contexts, 0, num_ref_l0, ctx_inc)
+        result['ref_idx_l0'].append(ref)
+        cur_refs_l0[blk_y:blk_y + part_rows, blk_x:blk_x + part_cols] = ref
+
+    result['ref_idx_grid_l0'] = cur_refs_l0
+
+    # MVD grid for neighbor context computation
+    cur_mvds = np.zeros((4, 4, 2), dtype=np.int32)
+    left_mvds = mb_info.get('left_mb_mvds_l0')
+    top_mvds = mb_info.get('top_mb_mvds_l0')
 
     # mvd_l0 for all partitions
     for part_idx in range(num_parts):
@@ -490,10 +552,18 @@ def _decode_p_sub_mb_pred(
         sub_types.append(decode_sub_mb_type_p(decoder, contexts))
     result['sub_mb_types'] = sub_types
 
-    # ref_idx_l0[4]
-    for _ in range(4):
-        ref = decode_ref_idx(decoder, contexts, 0, num_ref_l0)
+    # ref_idx_l0[4] — one per 8x8 sub-MB
+    cur_refs_l0 = np.zeros((4, 4), dtype=np.int8)
+    left_refs_l0 = mb_info.get('left_mb_ref_l0')
+    top_refs_l0 = mb_info.get('top_mb_ref_l0')
+    for i in range(4):
+        base_x, base_y = _SUB_MB_BASE[i]
+        ctx_inc = _compute_ref_idx_ctx_inc(base_x, base_y, cur_refs_l0,
+                                           left_refs_l0, top_refs_l0)
+        ref = decode_ref_idx(decoder, contexts, 0, num_ref_l0, ctx_inc)
         result['ref_idx_l0'].append(ref)
+        cur_refs_l0[base_y:base_y + 2, base_x:base_x + 2] = ref
+    result['ref_idx_grid_l0'] = cur_refs_l0
 
     # MVD grid for neighbor context computation
     cur_mvds = np.zeros((4, 4, 2), dtype=np.int32)
@@ -547,18 +617,6 @@ def _decode_b_mb_pred(
     num_parts = _get_num_partitions(mb_type, 1)
     pred_flags = _get_b_pred_flags(mb_type)
 
-    # ref_idx_l0 for all partitions (H.264 7.3.5.1 order)
-    for i in range(num_parts):
-        if pred_flags[i][0]:  # predFlagL0
-            ref = decode_ref_idx(decoder, contexts, 0, num_ref_l0)
-            result['ref_idx_l0'].append(ref)
-
-    # ref_idx_l1 for all partitions
-    for i in range(num_parts):
-        if pred_flags[i][1]:  # predFlagL1
-            ref = decode_ref_idx(decoder, contexts, 1, num_ref_l1)
-            result['ref_idx_l1'].append(ref)
-
     # Partition positions and coverage in 4x4 block units
     if mb_type <= 3:  # 16x16
         part_positions = [(0, 0)]
@@ -569,6 +627,37 @@ def _decode_b_mb_pred(
     else:  # 8x16 (odd types 5,7,...,21)
         part_positions = [(0, 0), (2, 0)]
         part_rows, part_cols = 4, 2
+
+    # ref_idx grids for context derivation (H.264 9.3.3.1.1.3)
+    cur_refs_l0 = np.zeros((4, 4), dtype=np.int8)
+    cur_refs_l1 = np.zeros((4, 4), dtype=np.int8)
+    left_refs_l0 = mb_info.get('left_mb_ref_l0')
+    top_refs_l0 = mb_info.get('top_mb_ref_l0')
+    left_refs_l1 = mb_info.get('left_mb_ref_l1')
+    top_refs_l1 = mb_info.get('top_mb_ref_l1')
+
+    # ref_idx_l0 for all partitions (H.264 7.3.5.1 order)
+    for i in range(num_parts):
+        if pred_flags[i][0]:  # predFlagL0
+            blk_x, blk_y = part_positions[i]
+            ctx_inc = _compute_ref_idx_ctx_inc(blk_x, blk_y, cur_refs_l0,
+                                               left_refs_l0, top_refs_l0)
+            ref = decode_ref_idx(decoder, contexts, 0, num_ref_l0, ctx_inc)
+            result['ref_idx_l0'].append(ref)
+            cur_refs_l0[blk_y:blk_y + part_rows, blk_x:blk_x + part_cols] = ref
+
+    # ref_idx_l1 for all partitions
+    for i in range(num_parts):
+        if pred_flags[i][1]:  # predFlagL1
+            blk_x, blk_y = part_positions[i]
+            ctx_inc = _compute_ref_idx_ctx_inc(blk_x, blk_y, cur_refs_l1,
+                                               left_refs_l1, top_refs_l1)
+            ref = decode_ref_idx(decoder, contexts, 1, num_ref_l1, ctx_inc)
+            result['ref_idx_l1'].append(ref)
+            cur_refs_l1[blk_y:blk_y + part_rows, blk_x:blk_x + part_cols] = ref
+
+    result['ref_idx_grid_l0'] = cur_refs_l0
+    result['ref_idx_grid_l1'] = cur_refs_l1
 
     # MVD grids for neighbor context computation (H.264 9.3.3.1.1.7)
     cur_mvds_l0 = np.zeros((4, 4, 2), dtype=np.int32)
@@ -621,22 +710,41 @@ def _decode_b_sub_mb_pred(
         sub_types.append(decode_sub_mb_type_b(decoder, contexts))
     result['sub_mb_types'] = sub_types
 
+    # ref_idx grids for context derivation (H.264 9.3.3.1.1.3)
+    cur_refs_l0 = np.zeros((4, 4), dtype=np.int8)
+    cur_refs_l1 = np.zeros((4, 4), dtype=np.int8)
+    left_refs_l0 = mb_info.get('left_mb_ref_l0')
+    top_refs_l0 = mb_info.get('top_mb_ref_l0')
+    left_refs_l1 = mb_info.get('left_mb_ref_l1')
+    top_refs_l1 = mb_info.get('top_mb_ref_l1')
+
     # ref_idx_l0[4] — one per sub-MB, only if sub-partition uses L0
     # B_Direct_8x8 (sub_type=0) derives ref_idx, does not read from bitstream
     for i in range(4):
+        base_x, base_y = _SUB_MB_BASE[i]
         if sub_types[i] != 0 and _b_sub_uses_l0(sub_types[i]):
-            ref = decode_ref_idx(decoder, contexts, 0, num_ref_l0)
+            ctx_inc = _compute_ref_idx_ctx_inc(base_x, base_y, cur_refs_l0,
+                                               left_refs_l0, top_refs_l0)
+            ref = decode_ref_idx(decoder, contexts, 0, num_ref_l0, ctx_inc)
             result['ref_idx_l0'].append(ref)
+            cur_refs_l0[base_y:base_y + 2, base_x:base_x + 2] = ref
         else:
             result['ref_idx_l0'].append(0)  # placeholder or derived
 
     # ref_idx_l1[4]
     for i in range(4):
+        base_x, base_y = _SUB_MB_BASE[i]
         if sub_types[i] != 0 and _b_sub_uses_l1(sub_types[i]):
-            ref = decode_ref_idx(decoder, contexts, 1, num_ref_l1)
+            ctx_inc = _compute_ref_idx_ctx_inc(base_x, base_y, cur_refs_l1,
+                                               left_refs_l1, top_refs_l1)
+            ref = decode_ref_idx(decoder, contexts, 1, num_ref_l1, ctx_inc)
             result['ref_idx_l1'].append(ref)
+            cur_refs_l1[base_y:base_y + 2, base_x:base_x + 2] = ref
         else:
             result['ref_idx_l1'].append(0)  # placeholder or derived
+
+    result['ref_idx_grid_l0'] = cur_refs_l0
+    result['ref_idx_grid_l1'] = cur_refs_l1
 
     # MVD grids for neighbor context computation
     cur_mvds_l0 = np.zeros((4, 4, 2), dtype=np.int32)
@@ -798,12 +906,18 @@ def decode_macroblock_layer_cabac(
         result['i_pcm'] = decode_i_pcm_cabac(decoder, mb_info)
         return result
 
-    # Transform size flag (High profile, inter or I_8x8)
-    if mb_info.get('transform_8x8_mode_flag', False):
-        if _can_use_8x8_transform(result['mb_type'], slice_type):
-            result['transform_size_8x8_flag'] = decode_transform_size_8x8_flag_cabac(
-                decoder, contexts, mb_info
-            )
+    # H.264 7.3.5: transform_size_8x8_flag position depends on MB type
+    is_intra_nxn = _is_intra_mb_type(result['mb_type'], slice_type) and \
+        not _is_i_16x16(result['mb_type'], slice_type) and \
+        not _is_i_pcm(result['mb_type'], slice_type)
+
+    # For I_NxN: parse transform_size_8x8_flag BEFORE mb_pred
+    if is_intra_nxn and mb_info.get('transform_8x8_mode_flag', False):
+        result['transform_size_8x8_flag'] = decode_transform_size_8x8_flag_cabac(
+            decoder, contexts, mb_info
+        )
+        # mb_pred needs this to decide 4 vs 16 intra modes
+        mb_info['transform_size_8x8_flag'] = result['transform_size_8x8_flag']
 
     # Decode mb_pred
     result['mb_pred'] = decode_mb_pred_cabac(
@@ -822,6 +936,16 @@ def decode_macroblock_layer_cabac(
         result['cbp_luma'] = cbp_luma
         result['cbp_chroma'] = cbp_chroma
         result['cbp'] = cbp_luma | (cbp_chroma << 4)
+
+    # For inter MBs: parse transform_size_8x8_flag AFTER CBP (H.264 7.3.5)
+    if not is_intra_nxn and not _is_i_16x16(result['mb_type'], slice_type) and \
+            not _is_intra_mb_type(result['mb_type'], slice_type) and \
+            mb_info.get('transform_8x8_mode_flag', False):
+        cbp_luma = result['cbp'] & 0x0F
+        if cbp_luma > 0:
+            result['transform_size_8x8_flag'] = decode_transform_size_8x8_flag_cabac(
+                decoder, contexts, mb_info
+            )
 
     # Decode mb_qp_delta: H.264 Section 7.3.5.1
     # Condition: CBP_luma > 0 OR CBP_chroma > 0 OR MbPartPredMode == Intra_16x16
@@ -1176,28 +1300,42 @@ def _decode_residual_cabac(
                 if residual['luma_ac'][i] is not None:
                     mb_cbf[i] = 1 if np.any(residual['luma_ac'][i] != 0) else 0
     else:
-        # I_4x4 or inter: block_cat=2, 16 coefficients per 4x4 block
         cbp_luma = cbp & 0x0F
         cbp_chroma = (cbp >> 4) & 0x03
 
-        for i8x8 in range(4):
-            if cbp_luma & (1 << i8x8):
-                for i4x4 in range(4):
-                    blk_idx = i8x8 * 4 + i4x4
-                    ctx_idx = _get_cbf_ctx_idx(
-                        2, blk_idx, mb_cbf, left_mb_cbf, top_mb_cbf,
-                        left_available, top_available, is_intra,
+        if transform_size_8x8_flag == 1:
+            # 8x8 transform: block_cat=5, 64 coefficients per 8x8 block
+            residual['luma_8x8'] = [None] * 4
+            for i8x8 in range(4):
+                if cbp_luma & (1 << i8x8):
+                    residual['luma_8x8'][i8x8] = decode_residual_block_8x8(
+                        decoder, contexts, block_cat=5,
                     )
-                    residual['luma_4x4'][blk_idx] = (
-                        decode_residual_block_cabac_with_cbf(
-                            decoder, contexts, max_coeff=16, block_cat=2,
-                            coded_block_flag_ctx_idx=ctx_idx,
+                    if residual['luma_8x8'][i8x8] is not None:
+                        has_nonzero = np.any(residual['luma_8x8'][i8x8] != 0)
+                        # Mark all 4 sub-blocks as having coefficients
+                        for i4x4 in range(4):
+                            mb_cbf[i8x8 * 4 + i4x4] = 1 if has_nonzero else 0
+        else:
+            # I_4x4 or inter: block_cat=2, 16 coefficients per 4x4 block
+            for i8x8 in range(4):
+                if cbp_luma & (1 << i8x8):
+                    for i4x4 in range(4):
+                        blk_idx = i8x8 * 4 + i4x4
+                        ctx_idx = _get_cbf_ctx_idx(
+                            2, blk_idx, mb_cbf, left_mb_cbf, top_mb_cbf,
+                            left_available, top_available, is_intra,
                         )
-                    )
-                    if residual['luma_4x4'][blk_idx] is not None:
-                        mb_cbf[blk_idx] = 1 if np.any(
-                            residual['luma_4x4'][blk_idx] != 0
-                        ) else 0
+                        residual['luma_4x4'][blk_idx] = (
+                            decode_residual_block_cabac_with_cbf(
+                                decoder, contexts, max_coeff=16, block_cat=2,
+                                coded_block_flag_ctx_idx=ctx_idx,
+                            )
+                        )
+                        if residual['luma_4x4'][blk_idx] is not None:
+                            mb_cbf[blk_idx] = 1 if np.any(
+                                residual['luma_4x4'][blk_idx] != 0
+                            ) else 0
 
     # Chroma DC: block_cat=3, 4 coefficients, with coded_block_flag
     if cbp_chroma >= 1:
@@ -1276,6 +1414,7 @@ def _empty_residual() -> Dict[str, Any]:
         'luma_dc': None,
         'luma_ac': [None] * 16,
         'luma_4x4': [None] * 16,
+        'luma_8x8': None,
         'chroma_dc_cb': None,
         'chroma_dc_cr': None,
         'chroma_ac_cb': [None] * 4,

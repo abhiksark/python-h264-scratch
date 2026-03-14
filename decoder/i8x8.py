@@ -219,13 +219,39 @@ def reconstruct_i8x8_block(
     if top_left is None:
         top_left = 128
 
-    # Get prediction
+    # H.264 Section 8.3.4.2.2: substitute unavailable reference samples
+    # before filtering. When one direction is unavailable, replace its
+    # samples with the nearest available sample from the other direction.
+    if not top_available and left_available:
+        top = np.full(8, left[0], dtype=np.uint8)
+        top_left = int(left[0])
+        if top_right is not None:
+            top_right = np.full(8, left[0], dtype=np.uint8)
+    elif not left_available and top_available:
+        left = np.full(8, top[0], dtype=np.uint8)
+        top_left = int(top[0])
+
+    # H.264 Section 8.3.2.2.1: filter reference samples for I_8x8
+    # All modes use filtered samples (unlike I_4x4 which uses raw)
+    f_top_right = top_right
+    if top_available or left_available:
+        from intra.intra_8x8 import lowpass_filter_8x8
+        filtered = lowpass_filter_8x8(top, left, top_left, top_right)
+        f_top = filtered['top']
+        f_left = filtered['left']
+        f_top_left = filtered['top_left']
+        if filtered.get('top_right') is not None:
+            f_top_right = filtered['top_right']
+    else:
+        f_top, f_left, f_top_left = top, left, top_left
+
+    # Get prediction using filtered reference samples
     prediction = predict_intra_8x8(
         mode=Intra8x8Mode(mode),
-        top=top,
-        left=left,
-        top_left=top_left,
-        top_right=top_right,
+        top=f_top,
+        left=f_left,
+        top_left=f_top_left,
+        top_right=f_top_right,
         top_available=top_available,
         left_available=left_available,
     )

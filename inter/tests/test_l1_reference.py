@@ -73,9 +73,11 @@ class TestL0ListBuilding:
         buffer.build_ref_lists(current_poc=3)
         l0_list = buffer.get_l0_list()
 
-        # L0 should have frames with POC < 3 (POC 0 and 2)
-        assert len(l0_list) >= 1
-        assert all(f.poc < 3 for f in l0_list)
+        # L0 = past(desc POC) + future(asc POC) per H.264 8.2.4.2.3
+        # First entries should be past frames (POC < 3)
+        assert len(l0_list) >= 2
+        assert l0_list[0].poc == 2, "L0[0] should be closest past (POC=2)"
+        assert l0_list[1].poc == 0, "L0[1] should be next past (POC=0)"
 
     def test_l0_list_ordered_by_poc_descending(self):
         """L0 list should be ordered by POC descending (closest first)."""
@@ -120,9 +122,11 @@ class TestL1ListBuilding:
         buffer.build_ref_lists(current_poc=3)
         l1_list = buffer.get_l1_list()
 
-        # L1 should have frames with POC > 3 (POC 4 and 6)
-        assert len(l1_list) >= 1
-        assert all(f.poc > 3 for f in l1_list)
+        # L1 = future(asc POC) + past(desc POC) per H.264 8.2.4.2.3
+        # First entries should be future frames (POC > 3)
+        assert len(l1_list) >= 2
+        assert l1_list[0].poc == 4, "L1[0] should be closest future (POC=4)"
+        assert l1_list[1].poc == 6, "L1[1] should be next future (POC=6)"
 
     def test_l1_list_ordered_by_poc_ascending(self):
         """L1 list should be ordered by POC ascending (closest first)."""
