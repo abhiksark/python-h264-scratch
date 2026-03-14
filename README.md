@@ -232,10 +232,21 @@ For comparison, ffmpeg decodes the same content at ~1000x the speed. The goal he
 - `pytest` — testing (dev only)
 - `pillow` — image output (optional)
 
+## Acknowledgements
+
+This project would not have been possible without the **[JM Reference Software](https://github.com/shihuade/JM)** (Joint Model). JM was the ground truth at every stage of development — when our output didn't match, JM's source code told us exactly why. Every butterfly coefficient, every context index, every dequantization formula was verified by reading JM's C implementation and comparing intermediate values. If you want to understand H.264, read JM. It's the single best resource after the spec itself.
+
+Thanks also to:
+- **[ffmpeg](https://ffmpeg.org/)** — used for generating pixel-perfect reference output and for the MP4 demuxing reference
+- **[x264](https://www.videolan.org/developers/x264.html)** — the encoder behind most of our test streams
+- The authors of **ITU-T H.264** — a remarkably well-designed spec that makes a pure Python implementation feasible
+- The **[test-videos.co.uk](https://test-videos.co.uk/)** project — for hosting freely downloadable H.264 test clips
+
 ## References
 
 - [ITU-T H.264](https://www.itu.int/rec/T-REC-H.264) — the spec
-- [JM Reference Software](https://github.com/shihuade/JM) — reference encoder/decoder used for verification
+- [JM Reference Software](https://github.com/shihuade/JM) — the reference decoder we verified every function against
+- [ffmpeg](https://ffmpeg.org/) — used for reference YUV generation and validation
 
 ## License
 
