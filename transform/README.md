@@ -48,8 +48,8 @@ flowchart TD
 |------|-------|-------------|
 | `idct_4x4.py` | 363 | 4x4 IDCT, 4x4 and 2x2 Hadamard transforms, DC block processing pipelines, forward transform (for testing) |
 | `idct_8x8.py` | 283 | 8x8 IDCT for High profile: 8-point butterfly matching JM `inverse8x8()`, zigzag scan tables, batch processing |
-| `hadamard.py` | 15 | Chroma DC dimension helper for different chroma formats |
-| `transform_size.py` | 5 | Chroma DC dimension lookup |
+| `hadamard.py` | 15 | Chroma DC dimensions: `get_chroma_dc_dimensions` returns (W, H) based on chroma format |
+| `transform_size.py` | 5 | 8x8 chroma transform predicate: `supports_8x8_chroma` checks applicability |
 
 ## Key Concepts
 
@@ -67,7 +67,7 @@ The `>> 1` implements the H.264-specific half-pixel scaling without floating poi
 
 **Hadamard Transform.** The Hadamard matrix `H * X * H^T` is self-inverse up to scaling: applying it twice (with appropriate scaling) returns the original. For 4x4: `H = [[1,1,1,1],[1,1,-1,-1],[1,-1,-1,1],[1,-1,1,-1]]`. For 2x2: `H = [[1,1],[1,-1]]`.
 
-**Separable 2D Transform.** Both 4x4 and 8x8 transforms apply the 1D butterfly to rows first, then columns (or vice versa). For 8x8, the pass order (rows then columns) matches the JM reference decoder's `inverse8x8()` and matters because integer right-shift rounding is not perfectly commutative.
+**Separable 2D Transform.** The 4x4 IDCT applies the 1D butterfly to columns first, then rows. The 8x8 IDCT applies rows first, then columns — matching JM's `inverse8x8()`. The pass order matters because integer right-shift rounding is not commutative; reversing the order produces off-by-one differences that cascade through inter prediction.
 
 ## Example
 

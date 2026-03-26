@@ -76,7 +76,7 @@ delta = Clip3(-tc, tc, ((q0 - p0) * 4 + (p1 - q1) + 4) >> 3)
 p0' = Clip1(p0 + delta)
 q0' = Clip1(q0 - delta)
 ```
-The clipping bound `tc = tc0 + 1` (for luma), where tc0 comes from `TC0_TABLE[indexA][bS-1]`.
+The clipping bound `tc = tc0 + ap + aq` (for luma), where `tc0 = TC0_TABLE[indexA][bS-1]`, `ap = 1 if |p2 - p0| < beta else 0`, and `aq = 1 if |q2 - q0| < beta else 0`.
 
 **Strong Filter (bS=4).** When `|p2 - p0| < beta` (and similarly for q), the strong path modifies p0, p1, p2:
 ```

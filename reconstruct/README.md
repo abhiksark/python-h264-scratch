@@ -89,9 +89,9 @@ mb_data = decode_macroblock(
     reader=reader,
     sps=sps, pps=pps,
     mb_x=5, mb_y=3,
-    frame=current_frame,
-    nz_counts=nz_count_array,
-    qp=28,
+    frame_luma=frame_luma, frame_cb=frame_cb, frame_cr=frame_cr,
+    frame_nz_counts=nz_count_array,
+    slice_qp=28,
 )
 # mb_data.luma is (16, 16) uint8
 # mb_data.cb, mb_data.cr are (8, 8) uint8

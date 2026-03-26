@@ -2,7 +2,7 @@
 
 Generates prediction blocks for intra-coded macroblocks using already-decoded neighboring pixels. Supports all nine 4x4 and 8x8 luma prediction modes, four 16x16 luma modes, four chroma modes, and I_PCM raw sample macroblocks.
 
-**H.264 Spec Reference:** Section 8.3.1 (Intra_4x4), Section 8.3.1.3 (Intra_8x8), Section 8.3.3 (Intra_16x16), Section 8.3.4 (Chroma prediction)
+**H.264 Spec Reference:** Section 8.3.1 (Intra_4x4), Section 8.3.2 (Intra_8x8), Section 8.3.3 (Intra_16x16), Section 8.3.4 (Chroma prediction)
 
 ## What It Does
 

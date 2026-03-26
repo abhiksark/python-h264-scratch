@@ -89,8 +89,7 @@ decoder = H264Decoder()
 with open("video.264", "rb") as f:
     bitstream = f.read()
 
-frames = decoder.decode(bitstream)
-for i, frame in enumerate(frames):
+for i, frame in enumerate(decoder.decode_bytes(bitstream)):
     # frame.luma is (H, W) uint8
     # frame.cb, frame.cr are (H/2, W/2) uint8
     print(f"Frame {i}: {frame.luma.shape}, POC={frame.poc}")

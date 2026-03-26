@@ -71,13 +71,13 @@ Together, these allow computing the exact byte range for any sample.
 ## Example
 
 ```python
-from container.mp4 import parse_mp4, extract_annexb_stream
+from container.mp4 import extract_h264_from_mp4
 
 with open("video.mp4", "rb") as f:
     mp4_data = f.read()
 
-# Parse the MP4 and extract Annex B bitstream
-annexb_stream = extract_annexb_stream(mp4_data)
+# Parse MP4 boxes, extract SPS/PPS from avcC, convert to Annex B
+annexb_stream = extract_h264_from_mp4(mp4_data)
 
 # Now decode with the standard pipeline
 from bitstream import extract_nal_units

@@ -86,7 +86,7 @@ mvp_x, mvp_y = predict_mv_16x16(mv_cache, mb_x=5, mb_y=3)
 mvx = mvp_x + mvd_x  # Add decoded MVD
 mvy = mvp_y + mvd_y
 
-pred_block = get_block_fractional(ref_luma, x=5*16*4+mvx, y=3*16*4+mvy, 16, 16)
+pred_block = get_luma_block_fractional(ref_luma, x=5*16, y=3*16, dx=mvx%4, dy=mvy%4, width=16, height=16)
 ```
 
 ## Spec Compliance Notes
