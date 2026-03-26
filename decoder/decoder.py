@@ -3613,7 +3613,7 @@ class H264Decoder:
         if mb_type == 22:  # B_8x8
             return self._cabac_b_8x8_mc(
                 sub_types, ref_idx_l0, ref_idx_l1, mvd_l0, mvd_l1,
-                mb_x, mb_y,
+                mb_x, mb_y, use_spatial=use_spatial, current_poc=current_poc,
             )
 
         logger.warning(f"Unexpected B mb_type={mb_type} at ({mb_x},{mb_y})")
@@ -3834,6 +3834,7 @@ class H264Decoder:
         ref_idx_l0: list, ref_idx_l1: list,
         mvd_l0: list, mvd_l1: list,
         mb_x: int, mb_y: int,
+        use_spatial: bool = True, current_poc: int = 0,
     ) -> tuple:
         """B_8x8 motion compensation with sub-partitions.
 
@@ -3842,7 +3843,7 @@ class H264Decoder:
 
         H.264 Spec Reference: Table 7-18, Section 8.4
         """
-        from inter.direct_mode import derive_direct_spatial_sub8x8
+        from inter.direct_mode import derive_direct_spatial_sub8x8, derive_direct_temporal
         from inter.bipred import bipred_average, implicit_bipred
         from entropy.cabac_macroblock import (
             _b_sub_uses_l0, _b_sub_uses_l1, _b_sub_num_parts,
@@ -3924,12 +3925,19 @@ class H264Decoder:
             cx_base, cy_base = chroma_offsets[sub_idx]
 
             if sub_type == 0:  # B_Direct_8x8
-                direct_result = derive_direct_spatial_sub8x8(
-                    self.state.mv_cache,
-                    mv_cache_l1,
-                    mb_x, mb_y, sub_idx,
-                    self.state.ref_buffer,
-                )
+                if use_spatial:
+                    direct_result = derive_direct_spatial_sub8x8(
+                        self.state.mv_cache,
+                        mv_cache_l1,
+                        mb_x, mb_y, sub_idx,
+                        self.state.ref_buffer,
+                    )
+                else:
+                    mvs = derive_direct_temporal(
+                        self.state.ref_buffer, current_poc,
+                        mb_x, mb_y, sub_idx=sub_idx,
+                    )
+                    direct_result = mvs + (True, True, 0, 0)
                 if direct_result:
                     (d_mvx_l0, d_mvy_l0, d_mvx_l1, d_mvy_l1,
                      pf_l0, pf_l1, d_ref_l0, d_ref_l1) = direct_result
