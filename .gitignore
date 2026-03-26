@@ -97,6 +97,9 @@ test_data/dataDec.*
 !test_data/generators/.gitkeep
 !test_data/reference/.gitkeep
 
+# Worktrees
+.worktrees/
+
 # Local development
 *.local
 *.log
