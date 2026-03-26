@@ -949,7 +949,8 @@ def decode_macroblock_layer_cabac(
             # direct_8x8_inference_flag=1, which is mandatory for High
             # Profile (the only profile where transform_8x8_mode_flag=1).
             no_sub_lt_8x8 = True
-            sub_types = result.get('sub_mb_types', None)
+            mb_pred = result.get('mb_pred', {})
+            sub_types = mb_pred.get('sub_mb_types', None) if isinstance(mb_pred, dict) else getattr(mb_pred, 'sub_mb_types', None)
             if sub_types is not None:
                 # P_8x8: sub_mb_type must be 0 (P_L0_8x8)
                 # B_8x8: sub_mb_type must be <= 3 (B_*_8x8)
