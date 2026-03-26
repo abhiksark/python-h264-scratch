@@ -79,7 +79,7 @@ flowchart TD
 
 ```python
 from inter.mv_prediction import MVCache, predict_mv_16x16
-from inter.motion_comp import get_block_fractional
+from inter.motion_comp import get_luma_block_fractional
 
 mv_cache = MVCache(width_in_mbs=22, height_in_mbs=18)
 mvp_x, mvp_y = predict_mv_16x16(mv_cache, mb_x=5, mb_y=3)

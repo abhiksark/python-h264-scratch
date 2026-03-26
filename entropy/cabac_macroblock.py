@@ -945,6 +945,9 @@ def decode_macroblock_layer_cabac(
         cbp_luma = result['cbp'] & 0x0F
         if cbp_luma > 0:
             # H.264 7.4.5: noSubMbPartSizeLessThan8x8Flag
+            # Note: B_Direct_8x8 (sub_mb_type=0) counts as 8x8 when
+            # direct_8x8_inference_flag=1, which is mandatory for High
+            # Profile (the only profile where transform_8x8_mode_flag=1).
             no_sub_lt_8x8 = True
             sub_types = result.get('sub_mb_types', None)
             if sub_types is not None:
