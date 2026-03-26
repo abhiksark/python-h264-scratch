@@ -1045,27 +1045,3 @@ def get_i8x8_scaling_list(
     return np.array(sps_list, dtype=np.int32)
 
 
-def decode_mixed_intra_frame(
-    *args, **kwargs
-) -> np.ndarray:
-    """Decode frame with mixed I_4x4 and I_8x8 macroblocks.
-
-    Placeholder for full implementation.
-    """
-    raise NotImplementedError("Mixed I_4x4/I_8x8 frame decode not yet implemented")
-
-
-def decode_i8x8_frame(*args, **kwargs):
-    """Decode complete I_8x8 frame.
-
-    Placeholder for full implementation.
-    """
-    raise NotImplementedError("I_8x8 frame decode not yet implemented")
-
-
-def decode_mixed_frame(*args, **kwargs):
-    """Decode frame with mixed macroblock types.
-
-    Placeholder for full implementation.
-    """
-    raise NotImplementedError("Mixed frame decode not yet implemented")

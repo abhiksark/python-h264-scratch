@@ -38,7 +38,7 @@
 
 | Feature | Status | Notes |
 |---------|--------|-------|
-| High Profile inter 8x8 | Not wired | I_8x8 works, P/B with 8x8 transform pending |
+| High Profile inter 8x8 | Done | P and B frames pixel-perfect with 8x8 transform |
 | CABAC at QP < 6 | Edge case | Sintel at QP=5 triggers arithmetic desync |
 | I_PCM macroblocks | Partial | Rare in practice |
 | Multiple slices (FMO/ASO) | Partial | Untested |

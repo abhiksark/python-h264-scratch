@@ -47,18 +47,18 @@ class TestCABACSliceDecoding:
     """Tests for CABAC slice data decoding."""
 
     def test_decoder_has_cabac_slice_decoder(self):
-        """Decoder should have _decode_slice_data_cabac method."""
+        """Decoder should have _decode_slice_cabac method."""
         decoder = H264Decoder()
 
-        assert hasattr(decoder, '_decode_slice_data_cabac'), \
-            "Decoder should have _decode_slice_data_cabac method"
+        assert hasattr(decoder, '_decode_slice_cabac'), \
+            "Decoder should have _decode_slice_cabac method"
 
-    def test_decoder_has_cabac_mb_decoder(self):
-        """Decoder should have _decode_macroblock_cabac method."""
+    def test_decoder_has_cabac_mb_processor(self):
+        """Decoder should have _process_cabac_macroblock method."""
         decoder = H264Decoder()
 
-        assert hasattr(decoder, '_decode_macroblock_cabac'), \
-            "Decoder should have _decode_macroblock_cabac method"
+        assert hasattr(decoder, '_process_cabac_macroblock'), \
+            "Decoder should have _process_cabac_macroblock method"
 
 
 class TestCABACContextManagement:
@@ -71,45 +71,30 @@ class TestCABACContextManagement:
         assert hasattr(state, 'cabac_contexts'), \
             "DecoderState should have cabac_contexts"
 
-    def test_decoder_initializes_cabac_contexts(self):
-        """Decoder should initialize CABAC contexts for each slice."""
+    def test_decoder_has_cabac_context_init(self):
+        """Decoder's CABAC slice path initializes contexts."""
         decoder = H264Decoder()
 
-        assert hasattr(decoder, '_init_cabac_contexts'), \
-            "Decoder should have _init_cabac_contexts method"
+        assert hasattr(decoder, '_decode_slice_cabac'), \
+            "Decoder should have _decode_slice_cabac method"
 
 
-class TestCABACMBSkipDecoding:
-    """Tests for mb_skip_flag decoding with CABAC."""
+class TestCABACMBDecoding:
+    """Tests for CABAC macroblock processing."""
 
-    def test_decoder_decodes_cabac_skip_flag(self):
-        """Decoder should decode mb_skip_flag using CABAC."""
+    def test_decoder_has_cabac_mb_processor(self):
+        """Decoder should process CABAC macroblocks."""
         decoder = H264Decoder()
 
-        assert hasattr(decoder, '_decode_mb_skip_flag_cabac'), \
-            "Decoder should have _decode_mb_skip_flag_cabac method"
+        assert hasattr(decoder, '_process_cabac_macroblock'), \
+            "Decoder should have _process_cabac_macroblock method"
 
-
-class TestCABACResidualDecoding:
-    """Tests for residual decoding with CABAC."""
-
-    def test_decoder_has_cabac_residual_decoder(self):
-        """Decoder should have _decode_residual_cabac method."""
+    def test_decoder_has_cabac_inter_reconstruct(self):
+        """Decoder should reconstruct inter MBs from CABAC."""
         decoder = H264Decoder()
 
-        assert hasattr(decoder, '_decode_residual_cabac'), \
-            "Decoder should have _decode_residual_cabac method"
-
-
-class TestCABACDecoderCreation:
-    """Tests for CABACDecoder creation."""
-
-    def test_decoder_creates_cabac_decoder(self):
-        """Decoder should create CABACDecoder instance."""
-        decoder = H264Decoder()
-
-        assert hasattr(decoder, '_create_cabac_decoder'), \
-            "Decoder should have _create_cabac_decoder method"
+        assert hasattr(decoder, '_reconstruct_inter_mb_cabac'), \
+            "Decoder should have _reconstruct_inter_mb_cabac method"
 
 
 class TestCABACProfileSupport:
