@@ -470,14 +470,14 @@ def decode_total_zeros(
 def _decode_run_before_vlc(
     reader: BitReader,
     decode_table: dict,
-    max_bits: int = 11
+    max_bits: int = 12
 ) -> Tuple[int, int]:
     """Decode run_before using VLC table.
 
     Args:
         reader: Bit reader
         decode_table: VLC decode table
-        max_bits: Maximum code length (default 11)
+        max_bits: Maximum code length (default 12, for run_before=15)
 
     Returns:
         Tuple of (run_value, num_bits_consumed)
