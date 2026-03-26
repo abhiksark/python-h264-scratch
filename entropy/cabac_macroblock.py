@@ -938,14 +938,30 @@ def decode_macroblock_layer_cabac(
         result['cbp'] = cbp_luma | (cbp_chroma << 4)
 
     # For inter MBs: parse transform_size_8x8_flag AFTER CBP (H.264 7.3.5)
+    # Only when noSubMbPartSizeLessThan8x8Flag == 1 (all sub-partitions >= 8x8)
     if not is_intra_nxn and not _is_i_16x16(result['mb_type'], slice_type) and \
             not _is_intra_mb_type(result['mb_type'], slice_type) and \
             mb_info.get('transform_8x8_mode_flag', False):
         cbp_luma = result['cbp'] & 0x0F
         if cbp_luma > 0:
-            result['transform_size_8x8_flag'] = decode_transform_size_8x8_flag_cabac(
-                decoder, contexts, mb_info
-            )
+            # H.264 7.4.5: noSubMbPartSizeLessThan8x8Flag
+            no_sub_lt_8x8 = True
+            sub_types = result.get('sub_mb_types', None)
+            if sub_types is not None:
+                # P_8x8: sub_mb_type must be 0 (P_L0_8x8)
+                # B_8x8: sub_mb_type must be <= 3 (B_*_8x8)
+                is_b = (slice_type == 1)
+                for st in sub_types:
+                    if is_b and st > 3:
+                        no_sub_lt_8x8 = False
+                        break
+                    elif not is_b and st > 0:
+                        no_sub_lt_8x8 = False
+                        break
+            if no_sub_lt_8x8:
+                result['transform_size_8x8_flag'] = decode_transform_size_8x8_flag_cabac(
+                    decoder, contexts, mb_info
+                )
 
     # Decode mb_qp_delta: H.264 Section 7.3.5.1
     # Condition: CBP_luma > 0 OR CBP_chroma > 0 OR MbPartPredMode == Intra_16x16
