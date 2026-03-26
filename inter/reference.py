@@ -231,6 +231,7 @@ class ReferenceFrameBuffer:
         current_frame_num: int,
         max_frame_num: int,
         modification: 'RefPicListModification' = None,
+        num_ref_idx_l0_active: int = 0,
     ) -> None:
         """Build L0 reference list for P-slices.
 
@@ -255,8 +256,12 @@ class ReferenceFrameBuffer:
 
         # Apply reference list reordering (H.264 8.2.4.3.1)
         # Uses the spec's shift-insert-compact algorithm, NOT simple pop/insert.
-        num_active = len(self._l0_list)
-        ref_list = list(self._l0_list) + [None]  # Extra slot for shift
+        # num_active from slice header, padded with last frame if DPB is smaller
+        num_active = max(num_ref_idx_l0_active, len(self._l0_list))
+        ref_list = list(self._l0_list)
+        while len(ref_list) < num_active:
+            ref_list.append(ref_list[-1] if ref_list else None)
+        ref_list.append(None)  # Extra slot for shift
 
         pic_num_no_wrap = current_frame_num
         ref_idx = 0

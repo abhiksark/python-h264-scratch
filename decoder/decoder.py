@@ -997,8 +997,10 @@ class H264Decoder:
         # Apply reference list reordering for P-slices (H.264 8.2.4)
         max_frame_num = getattr(sps, 'max_frame_num', 256)
         mod_l0 = getattr(slice_header, 'ref_pic_list_modification_l0', None)
+        num_l0_active = getattr(slice_header, 'num_ref_idx_l0_active_minus1', 0) + 1
         self.state.ref_buffer.build_p_slice_ref_list(
-            slice_header.frame_num, max_frame_num, mod_l0
+            slice_header.frame_num, max_frame_num, mod_l0,
+            num_ref_idx_l0_active=num_l0_active,
         )
 
         current_qp = slice_qp
@@ -2272,8 +2274,10 @@ class H264Decoder:
         if is_p_slice:
             max_frame_num = getattr(sps, 'max_frame_num', 256)
             mod_l0 = getattr(slice_header, 'ref_pic_list_modification_l0', None)
+            num_l0_active = getattr(slice_header, 'num_ref_idx_l0_active_minus1', 0) + 1
             self.state.ref_buffer.build_p_slice_ref_list(
-                slice_header.frame_num, max_frame_num, mod_l0
+                slice_header.frame_num, max_frame_num, mod_l0,
+                num_ref_idx_l0_active=num_l0_active,
             )
         elif is_b_slice:
             self._build_b_slice_ref_lists(slice_header)
