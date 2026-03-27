@@ -5071,8 +5071,10 @@ class H264Decoder:
     ) -> None:
         """Store MVs in reference frame for temporal/spatial direct mode.
 
-        Stores the L0 MV at block (0,0) of each macroblock. Used by the
-        colZeroFlag check in spatial direct mode (H.264 8.4.1.2.2).
+        Per H.264 8.4.1.2.1 Table 8-4, the co-located motion data uses the
+        L0 MV/ref_idx when the co-located partition has L0 prediction, and
+        the L1 MV/ref_idx when it has L1-only prediction.  This is needed
+        for the colZeroFlag check in spatial direct mode (8.4.1.2.2).
 
         Args:
             ref_frame: Reference frame to store MVs in
@@ -5084,6 +5086,8 @@ class H264Decoder:
         if sps is None:
             return
 
+        mv_cache_l1 = getattr(self.state, 'mv_cache_l1', None)
+
         # Store per-8x8-block MV and ref_idx for co-located lookups.
         # Map sub-block index to representative 4x4 block position.
         sub_to_4x4 = [(0, 0), (2, 0), (0, 2), (2, 2)]
@@ -5092,6 +5096,16 @@ class H264Decoder:
                 for si, (bx, by) in enumerate(sub_to_4x4):
                     mv = self.state.mv_cache.get_mv(mb_x, mb_y, bx, by)
                     ri = self.state.mv_cache.get_ref_idx(mb_x, mb_y, bx, by)
+                    # H.264 8.4.1.2.1: When L0 is unavailable (ref_idx < 0),
+                    # use L1 motion data for the co-located field.
+                    if ri < 0 and mv_cache_l1 is not None:
+                        mv_l1 = mv_cache_l1.get_mv(mb_x, mb_y, bx, by)
+                        ri_l1 = mv_cache_l1.get_ref_idx(
+                            mb_x, mb_y, bx, by,
+                        )
+                        if ri_l1 >= 0:
+                            mv = mv_l1
+                            ri = ri_l1
                     ref_frame.store_mv(
                         mb_x, mb_y, mv[0], mv[1],
                         ref_idx=ri, sub_idx=si,
