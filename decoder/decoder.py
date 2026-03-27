@@ -2285,6 +2285,13 @@ class H264Decoder:
         current_qp = slice_qp
         mb_idx = slice_header.first_mb_in_slice
 
+        # Prepare weighted prediction for P-slices (H.264 7.4.3.2)
+        cabac_weight_table = None
+        if is_p_slice and self._use_weighted_prediction(slice_header):
+            cabac_weight_table = getattr(
+                slice_header, 'weighted_pred_table', None
+            )
+
         # Reset intra prediction modes at start of new frame
         # Prevents stale modes from previous frames influencing MPM
         if mb_idx == 0 and self.state.intra_modes is not None:
@@ -2332,7 +2339,8 @@ class H264Decoder:
             try:
                 self._process_cabac_macroblock(
                     cabac, contexts, mb_data, mb_x, mb_y,
-                    current_qp, sps, pps, slice_type
+                    current_qp, sps, pps, slice_type,
+                    weight_table=cabac_weight_table,
                 )
             except Exception as exc:
                 msg = str(exc)
@@ -2547,6 +2555,7 @@ class H264Decoder:
         sps: 'SPS',
         pps: 'PPS',
         slice_type: int,
+        weight_table=None,
     ) -> None:
         """Process a CABAC-decoded macroblock and reconstruct pixels.
 
@@ -2558,6 +2567,7 @@ class H264Decoder:
             qp: Current QP
             sps, pps: Parameter sets
             slice_type: Slice type (0=P, 1=B, 2=I)
+            weight_table: Weighted prediction table for P-slices, or None
         """
         mb_width = sps.pic_width_in_mbs
         mb_idx = mb_y * mb_width + mb_x
@@ -2646,7 +2656,9 @@ class H264Decoder:
                 self.state.mb_dc_cbf[mb_idx] = 0
             if self.state.mb_coeffs is not None:
                 self.state.mb_coeffs[mb_idx] = 0
-            self._reconstruct_skip_mb_cabac(mb_x, mb_y, slice_type)
+            self._reconstruct_skip_mb_cabac(
+                mb_x, mb_y, slice_type, weight_table=weight_table,
+            )
             return
 
         mb_type = mb_data.get('mb_type', 0)
@@ -2664,7 +2676,8 @@ class H264Decoder:
         else:
             # Inter macroblock (P or B prediction)
             self._reconstruct_inter_mb_cabac(
-                cabac, contexts, mb_data, mb_x, mb_y, qp, sps, pps, slice_type
+                cabac, contexts, mb_data, mb_x, mb_y, qp, sps, pps, slice_type,
+                weight_table=weight_table,
             )
 
     def _is_intra_mb_cabac(self, mb_type: int, slice_type: int) -> bool:
@@ -2691,23 +2704,43 @@ class H264Decoder:
         mb_x: int,
         mb_y: int,
         slice_type: int,
+        weight_table=None,
     ) -> None:
         """Reconstruct a skipped macroblock.
 
         Args:
             mb_x, mb_y: Macroblock position
             slice_type: Slice type (0=P, 1=B)
+            weight_table: Weighted prediction table for P-slices, or None
         """
         ly, lx = mb_y * 16, mb_x * 16
         cy, cx = mb_y * 8, mb_x * 8
 
         if slice_type == 0:  # P-skip
-            luma, cb, cr = reconstruct_p_skip(
-                ref_buffer=self.state.ref_buffer,
-                mv_cache=self.state.mv_cache,
-                mb_x=mb_x,
-                mb_y=mb_y,
-            )
+            if weight_table is not None:
+                w_luma, o_luma = weight_table.get_luma_weight(0)
+                w_cb, o_cb, w_cr, o_cr = weight_table.get_chroma_weight(0)
+                luma, cb, cr = reconstruct_p_skip_weighted(
+                    ref_buffer=self.state.ref_buffer,
+                    mv_cache=self.state.mv_cache,
+                    mb_x=mb_x,
+                    mb_y=mb_y,
+                    weight_luma=w_luma,
+                    offset_luma=o_luma,
+                    log2_denom_luma=weight_table.luma_log2_weight_denom,
+                    weight_cb=w_cb,
+                    offset_cb=o_cb,
+                    weight_cr=w_cr,
+                    offset_cr=o_cr,
+                    log2_denom_chroma=weight_table.chroma_log2_weight_denom,
+                )
+            else:
+                luma, cb, cr = reconstruct_p_skip(
+                    ref_buffer=self.state.ref_buffer,
+                    mv_cache=self.state.mv_cache,
+                    mb_x=mb_x,
+                    mb_y=mb_y,
+                )
         else:  # B-skip
             sh = getattr(self.state, 'current_slice_header', None)
             use_spatial = getattr(sh, 'direct_spatial_mv_pred_flag', True)
@@ -3279,6 +3312,7 @@ class H264Decoder:
         sps: 'SPS',
         pps: 'PPS',
         slice_type: int,
+        weight_table=None,
     ) -> None:
         """Reconstruct an inter macroblock decoded with CABAC.
 
@@ -3315,7 +3349,7 @@ class H264Decoder:
         # --- Motion compensation ---
         if slice_type == 0:
             luma_pred, cb_pred, cr_pred = self._cabac_p_motion_comp(
-                mb_type, mb_pred, mb_x, mb_y
+                mb_type, mb_pred, mb_x, mb_y,
             )
         else:
             luma_pred, cb_pred, cr_pred = self._cabac_b_motion_comp(
@@ -3388,15 +3422,66 @@ class H264Decoder:
         )
 
         # --- Combine prediction + residual ---
-        luma = np.clip(
-            luma_pred.astype(np.int32) + luma_residual, 0, 255
-        ).astype(np.uint8)
-        cb = np.clip(
-            cb_pred.astype(np.int32) + cb_residual, 0, 255
-        ).astype(np.uint8)
-        cr = np.clip(
-            cr_pred.astype(np.int32) + cr_residual, 0, 255
-        ).astype(np.uint8)
+        # For weighted prediction, apply weighting in int32 before adding
+        # residual to avoid intermediate clipping precision loss.
+        luma_int = luma_pred.astype(np.int32)
+        cb_int = cb_pred.astype(np.int32)
+        cr_int = cr_pred.astype(np.int32)
+        if weight_table is not None and slice_type == 0:
+            # Determine the dominant ref_idx for this MB
+            ref_idx_l0 = mb_pred.get('ref_idx_l0', [0])
+            # For multi-partition types, apply per-partition weighting
+            if mb_type == 0:  # P_16x16
+                ref = ref_idx_l0[0] if ref_idx_l0 else 0
+                w_l, o_l = weight_table.get_luma_weight(ref)
+                w_cb, o_cb, w_cr, o_cr = weight_table.get_chroma_weight(ref)
+                ld = weight_table.luma_log2_weight_denom
+                cd = weight_table.chroma_log2_weight_denom
+                lr = (1 << (ld - 1)) if ld > 0 else 0
+                cr_ = (1 << (cd - 1)) if cd > 0 else 0
+                luma_int = ((luma_int * w_l + lr) >> ld) + o_l
+                cb_int = ((cb_int * w_cb + cr_) >> cd) + o_cb
+                cr_int = ((cr_int * w_cr + cr_) >> cd) + o_cr
+            elif mb_type in (1, 2):  # P_16x8, P_8x16
+                refs = [ref_idx_l0[i] if i < len(ref_idx_l0) else 0 for i in range(2)]
+                ld = weight_table.luma_log2_weight_denom
+                cd = weight_table.chroma_log2_weight_denom
+                lr = (1 << (ld - 1)) if ld > 0 else 0
+                crd = (1 << (cd - 1)) if cd > 0 else 0
+                for part in range(2):
+                    w_l, o_l = weight_table.get_luma_weight(refs[part])
+                    w_cb, o_cb, w_cr, o_cr = weight_table.get_chroma_weight(refs[part])
+                    if mb_type == 1:  # 16x8
+                        ly_s, ly_e = part * 8, (part + 1) * 8
+                        cy_s, cy_e = part * 4, (part + 1) * 4
+                        luma_int[ly_s:ly_e, :] = ((luma_int[ly_s:ly_e, :] * w_l + lr) >> ld) + o_l
+                        cb_int[cy_s:cy_e, :] = ((cb_int[cy_s:cy_e, :] * w_cb + crd) >> cd) + o_cb
+                        cr_int[cy_s:cy_e, :] = ((cr_int[cy_s:cy_e, :] * w_cr + crd) >> cd) + o_cr
+                    else:  # 8x16
+                        lx_s, lx_e = part * 8, (part + 1) * 8
+                        cx_s, cx_e = part * 4, (part + 1) * 4
+                        luma_int[:, lx_s:lx_e] = ((luma_int[:, lx_s:lx_e] * w_l + lr) >> ld) + o_l
+                        cb_int[:, cx_s:cx_e] = ((cb_int[:, cx_s:cx_e] * w_cb + crd) >> cd) + o_cb
+                        cr_int[:, cx_s:cx_e] = ((cr_int[:, cx_s:cx_e] * w_cr + crd) >> cd) + o_cr
+            elif mb_type in (3, 4):  # P_8x8, P_8x8ref0
+                refs = [ref_idx_l0[i] if i < len(ref_idx_l0) else 0 for i in range(4)]
+                ld = weight_table.luma_log2_weight_denom
+                cd = weight_table.chroma_log2_weight_denom
+                lr = (1 << (ld - 1)) if ld > 0 else 0
+                crd = (1 << (cd - 1)) if cd > 0 else 0
+                sub_offsets = [(0, 0), (8, 0), (0, 8), (8, 8)]
+                chroma_off = [(0, 0), (4, 0), (0, 4), (4, 4)]
+                for si in range(4):
+                    w_l, o_l = weight_table.get_luma_weight(refs[si])
+                    w_cb, o_cb, w_cr, o_cr = weight_table.get_chroma_weight(refs[si])
+                    sx, sy = sub_offsets[si]
+                    luma_int[sy:sy+8, sx:sx+8] = ((luma_int[sy:sy+8, sx:sx+8] * w_l + lr) >> ld) + o_l
+                    csx, csy = chroma_off[si]
+                    cb_int[csy:csy+4, csx:csx+4] = ((cb_int[csy:csy+4, csx:csx+4] * w_cb + crd) >> cd) + o_cb
+                    cr_int[csy:csy+4, csx:csx+4] = ((cr_int[csy:csy+4, csx:csx+4] * w_cr + crd) >> cd) + o_cr
+        luma = np.clip(luma_int + luma_residual, 0, 255).astype(np.uint8)
+        cb = np.clip(cb_int + cb_residual, 0, 255).astype(np.uint8)
+        cr = np.clip(cr_int + cr_residual, 0, 255).astype(np.uint8)
 
         self.state.frame_luma[ly:ly+16, lx:lx+16] = luma
         self.state.frame_cb[cy:cy+8, cx:cx+8] = cb
@@ -3414,7 +3499,12 @@ class H264Decoder:
     def _cabac_p_motion_comp(
         self, mb_type: int, mb_pred: dict, mb_x: int, mb_y: int,
     ) -> tuple:
-        """P-slice motion compensation from pre-parsed CABAC syntax."""
+        """P-slice motion compensation from pre-parsed CABAC syntax.
+
+        Returns UNWEIGHTED prediction. Weighted prediction is applied
+        in _reconstruct_inter_mb_cabac alongside residual to avoid
+        intermediate clipping that loses precision.
+        """
         ref_idx_l0 = mb_pred.get('ref_idx_l0', [])
         mvd_l0 = mb_pred.get('mvd_l0', [])
         sub_types = mb_pred.get('sub_mb_types', [])

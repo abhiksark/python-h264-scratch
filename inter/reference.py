@@ -255,8 +255,7 @@ class ReferenceFrameBuffer:
             return
 
         # Apply reference list reordering (H.264 8.2.4.3.1)
-        # Uses the spec's shift-insert-compact algorithm, NOT simple pop/insert.
-        # num_active from slice header, padded with last frame if DPB is smaller
+        # Uses the spec's shift-insert-compact algorithm.
         num_active = max(num_ref_idx_l0_active, len(self._l0_list))
         ref_list = list(self._l0_list)
         while len(ref_list) < num_active:
