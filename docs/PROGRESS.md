@@ -1,10 +1,15 @@
 # Implementation Progress
 
-## Current Status — v0.1
+## Current Status — v0.2
 
-**Working:** Pixel-perfect I/P/B-frame decoder with CAVLC, CABAC, and High Profile I_8x8 support.
-**Tests:** 1,850 passing
-**Verified on:** 4 real internet videos (Big Buck Bunny 360p/720p, Jellyfish 360p, Sintel 360p)
+**Working:** Pixel-perfect I/P/B-frame decoder with CAVLC, CABAC, High Profile I_8x8, B-pyramid, and CABAC weighted prediction.
+**Tests:** 1,833 passing
+**Verified on:** 4 real internet videos + generated multi-frame streams (bframes=3, ref=3)
+
+### v0.2 Changes (from v0.1)
+- **fix(b-frame):** Correct collocated MV storage for L1-only partitions — fixes B-pyramid with bframes>=3
+- **fix(cabac):** Add weighted prediction for CABAC P-slices — fixes ref>2 decode errors
+- **test:** Multi-frame regression tests (B-pyramid, P-only, BBB 300-frame)
 
 ## What Works
 
@@ -29,7 +34,7 @@
 | MV prediction | Done | Spatial median, all partition sizes |
 | P-frame (all types) | Done | Skip, 16x16, 16x8, 8x16, 8x8, sub-partitions |
 | B-frame (all types) | Done | L0, L1, Bi, Direct (spatial + temporal) |
-| Weighted prediction | Done | Implicit weights, explicit P-frame weights |
+| Weighted prediction | Done | Implicit weights, explicit P/B-frame weights (CAVLC + CABAC) |
 | Deblocking filter | Done | Boundary strength, adaptive filtering |
 | Scaling lists | Done | 4x4/8x8, flat + custom |
 | MP4 demuxer | Done | avcC SPS/PPS extraction, auto-detection |
@@ -40,6 +45,7 @@
 |---------|--------|-------|
 | High Profile inter 8x8 | Done | P and B frames pixel-perfect with 8x8 transform |
 | CABAC at QP < 6 | Edge case | Sintel at QP=5 triggers arithmetic desync |
+| weightp=2 with ref>2 | Edge case | x264 duplicate-ref weighted prediction mode |
 | I_PCM macroblocks | Partial | Rare in practice |
 | Multiple slices (FMO/ASO) | Partial | Untested |
 | Interlaced (MBAFF) | No | Frame-only |
@@ -65,8 +71,8 @@
 ## Test Breakdown
 
 ```
-Total:       1,850 passing
-Skipped:        76 (missing test data)
+Total:       1,833 passing
+Skipped:        96 (missing test data)
 xfailed:       317 (TDD red tests for future features)
 xpassed:       444 (features completed ahead of tests)
 ```
