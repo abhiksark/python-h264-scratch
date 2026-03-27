@@ -1,98 +1,152 @@
-# Intra
+# Intra Prediction
 
-Generates prediction blocks for intra-coded macroblocks using already-decoded neighboring pixels. Supports all nine 4x4 and 8x8 luma prediction modes, four 16x16 luma modes, four chroma modes, and I_PCM raw sample macroblocks.
+Generates prediction blocks for intra-coded macroblocks from already-decoded
+neighboring pixels. Intra prediction is the only prediction available in
+I-frames and also appears within P/B-frames for intra-coded MBs.
 
-**H.264 Spec Reference:** Section 8.3.1 (Intra_4x4), Section 8.3.2 (Intra_8x8), Section 8.3.3 (Intra_16x16), Section 8.3.4 (Chroma prediction)
+**H.264 Spec:** Sections 8.3.1 (4x4), 8.3.2 (8x8), 8.3.3 (16x16), 8.3.4 (Chroma)
 
-## What It Does
+## Reference Sample Layout
 
-Intra prediction exploits spatial redundancy within a single frame. For each block, the decoder generates a prediction from previously-reconstructed neighboring pixels (left, top, top-right, and top-left), then adds the decoded residual to produce the final reconstructed pixels. This is the only prediction mode available in I-frames and is also used for intra-coded macroblocks within P- and B-frames.
+All intra modes predict from previously reconstructed neighbors around the
+current block. The naming convention for a 4x4 block:
 
-For 4x4 blocks, nine directional and DC modes are available. Each mode extracts up to 13 reference samples (4 top, 4 top-right, 4 left, and 1 corner) and applies directional extrapolation at angles like vertical (0 degrees), horizontal (90 degrees), or diagonals (45 degrees). The DC mode averages all available neighbors. The 8x8 variant (High profile) uses the same nine modes scaled to 25 reference samples (8 top, 8 top-right, 8 left, 1 corner) with additional low-pass filtering of the reference samples.
+```
+              top_left   top (A-D)     top_right (E-H)
+                M    A  B  C  D    E  F  G  H
+        left  I [  predicted  ]
+        (I-L) J [   4x4      ]
+              K [   block     ]
+              L [             ]
+```
 
-For 16x16 blocks, four simpler modes are available: vertical, horizontal, DC, and plane. The plane mode performs a bi-linear interpolation that works well for smooth gradients. Chroma prediction uses the same four modes applied to the 8x8 chroma blocks (in 4:2:0).
+For 8x8 (High Profile), the layout scales to 25 samples: 8 top (A0-A7),
+8 top-right (B0-B7), 8 left (I0-I7), and 1 corner (M). For 16x16, the
+full 16-pixel top and left rows are used.
 
-## Pipeline Position
+When a neighbor is outside the frame or belongs to an inter MB (with
+`constrained_intra_pred_flag`), it is **unavailable**. DC mode falls back
+to the available side or defaults to 128 (midpoint of 8-bit range).
+For 8x8, unavailable top samples are substituted from `left[0]` before
+the lowpass filter is applied.
+
+## The Nine 4x4 / 8x8 Prediction Modes
+
+```
+    Mode 0     Mode 1      Mode 2      Mode 3      Mode 4
+   Vertical  Horizontal     DC      Diag Down-L  Diag Down-R
+
+    A B C D                          \             /
+    | | | |   I---->       avg       A \          / A
+    | | | |   J---->      (all       B  \        /  B
+    | | | |   K---->    neighbors)   C   \      /   C
+    | | | |   L---->                 D    v    v    D
+
+    Mode 5      Mode 6      Mode 7       Mode 8
+  Vert-Right  Horiz-Down   Vert-Left   Horiz-Up
+
+     |/         --/          |\
+     |/        I--/          |\          I--\
+     |/        J--/          |\          J--\
+     |/        K--/          |\          K--\
+    26.6deg    26.6deg      26.6deg     26.6deg
+```
+
+Each directional mode extrapolates from neighbors at a specific angle.
+The formula uses weighted averages of 2 or 3 reference samples:
+- `avg2(a, b) = (a + b + 1) >> 1` (half-pel positions)
+- `avg3(a, b, c) = (a + 2b + c + 2) >> 2` (filtered positions)
+
+## I_16x16 Modes
+
+Four simpler modes applied to the full 16x16 luma block:
 
 ```mermaid
 flowchart LR
-    TF[transform] --> INTRA["**intra**"]
-    INTRA --> REC[reconstruct]
-    INTRA --> DEC[decoder]
-    style INTRA fill:#f9a825,stroke:#333,color:#000
+    subgraph "16x16 Modes"
+        V["0: Vertical\ntop row copied down"]
+        H["1: Horizontal\nleft col copied right"]
+        DC["2: DC\navg of all 32 neighbors"]
+        P["3: Plane\nbilinear gradient fit"]
+    end
 ```
 
-## Architecture
+The **Plane** mode computes horizontal (H) and vertical (V) gradients from
+the neighbors, then fills the block with a tilted plane:
 
-```mermaid
-flowchart TD
-    NB["Neighbor Pixels"] --> P4["predict_intra_4x4"]
-    NB --> P16["predict_intra_16x16"]
-    NB --> P8["predict_intra_8x8"]
-    NB --> PC["chroma prediction"]
-    P4 --> M4["9 modes: V, H, DC, DDL, DDR, VR, HD, VL, HU"]
-    P16 --> M16["4 modes: V, H, DC, Plane"]
-    P8 --> M8["9 modes (same as 4x4, scaled)"]
-    PC --> MC["4 modes: DC, H, V, Plane"]
-    IPCM["I_PCM"] --> RAW["Raw 256+64+64 samples"]
-    subgraph "Reference Samples"
-        TOP["top 4/8/16"]
-        TR["top_right 4/8"]
-        LEFT["left 4/8/16"]
-        TL["top_left corner"]
-    end
+```
+pred[y,x] = Clip((a + b*(x-7) + c*(y-7) + 16) >> 5)
+
+a = 16 * (top[15] + left[15])
+b = (5*H + 32) >> 6     H = sum_{i=0..7} (i+1)*(top[8+i] - top[6-i])
+c = (5*V + 32) >> 6     V = sum_{i=0..7} (i+1)*(left[8+i] - left[6-i])
+```
+
+## Chroma Prediction
+
+Chroma blocks (8x8 in 4:2:0) use 4 modes numbered differently from luma:
+0=DC, 1=Horizontal, 2=Vertical, 3=Plane. The same formulas apply at the
+chroma block size.
+
+## 8x8 Reference Sample Filtering (High Profile)
+
+Before Intra_8x8 prediction, the 25 reference samples pass through a
+3-tap lowpass filter to reduce blocking artifacts:
+
+```
+Before filtering:   M   A0  A1  A2 ... A7   B0 ... B7
+                    I0
+                    I1
+                    ...
+                    I7
+
+Filter:  p'[i] = (p[i-1] + 2*p[i] + p[i+1] + 2) >> 2
+
+After:   M'  A0' A1' A2' ... A7'  B0' ... B7'
+         I0'
+         I1'
+         ...
+         I7'
+```
+
+This filtering is unique to 8x8 and critical for pixel-exact output.
+When top is unavailable but left is available, substitution (`top = left[0]`)
+happens **before** filtering, and the filter runs on the replicated values.
+
+## Pipeline Position
+
+```
+parameters --> [intra] --> reconstruct --> deblock
 ```
 
 ## Key Files
 
-| File | Lines | Description |
-|------|-------|-------------|
-| `intra_4x4.py` | 489 | All nine Intra_4x4 prediction modes with neighbor availability handling and directional interpolation |
-| `intra_8x8.py` | 701 | All nine Intra_8x8 prediction modes for High profile, including low-pass reference sample filtering |
-| `intra_16x16.py` | 354 | Four Intra_16x16 modes: vertical, horizontal, DC, and plane (bi-linear gradient) |
-| `i_pcm.py` | 164 | I_PCM macroblock type parsing and `IMBType` dataclass: maps mb_type codes 0-25 to prediction parameters |
-| `chroma_pred.py` | 59 | Chroma prediction helpers: supported modes per chroma format, DC prediction for 4:2:2, plane for 4:4:4 |
+| File | Purpose |
+|------|---------|
+| `intra_4x4.py` | 9 modes, neighbor availability, `predict_intra_4x4()` entry point |
+| `intra_8x8.py` | 9 modes for High Profile, `lowpass_filter_8x8()`, `predict_intra_8x8()` |
+| `intra_16x16.py` | 4 modes (V/H/DC/Plane), `get_neighbors_for_macroblock()` |
+| `chroma_pred.py` | Chroma mode helpers, DC for 4:2:2, Plane for 4:4:4 |
+| `i_pcm.py` | I_PCM parsing (mb_type 25): raw 256+128 samples, `IMBType` |
 
-## Key Concepts
-
-**Neighbor Availability.** A neighbor is unavailable if it is outside the frame boundary or (with `constrained_intra_pred_flag`) belongs to an inter-coded macroblock. When neighbors are unavailable, the DC mode falls back to using only the available side, or defaults to 128 if none are available.
-
-**Directional Modes.** Each mode extrapolates at a specific angle. For example, Diagonal Down-Left (mode 3) at position `(y, x)` averages `top[x+y]`, `top[x+y+1]`, and `top[x+y+2]`, projecting samples along a 45-degree line from the top-right. Vertical-Right (mode 5) projects at approximately 26.6 degrees right of vertical.
-
-**I_16x16 Plane Mode.** The plane mode computes gradients H and V from the 16x16 neighbors:
-```
-H = sum_{x=0..7} (x+1) * (top[8+x] - top[6-x])
-V = sum_{y=0..7} (y+1) * (left[8+y] - left[6-y])
-a = 16 * (top[15] + left[15])
-b = (5*H + 32) >> 6
-c = (5*V + 32) >> 6
-pred[y,x] = Clip1((a + b*(x-7) + c*(y-7) + 16) >> 5)
-```
-
-**8x8 Reference Sample Filtering.** Before Intra_8x8 prediction, the 25 reference samples undergo low-pass filtering: `p'[i] = (p[i-1] + 2*p[i] + p[i+1] + 2) >> 2`. When top is unavailable but left is available, the top samples are substituted from `left[0]` before filtering. This filtering is unique to 8x8 and critical for pixel-exact output.
-
-**I_PCM.** Macroblock type 25 bypasses all prediction and transform. It contains 256 raw luma samples plus 64+64 chroma samples (in 4:2:0), read directly from the bitstream.
-
-## Example
+## Usage
 
 ```python
-from intra import predict_intra_4x4, Intra4x4Mode
+from intra.intra_4x4 import predict_intra_4x4, Intra4x4Mode
 import numpy as np
 
 top = np.array([120, 122, 125, 128], dtype=np.uint8)
 left = np.array([115, 118, 120, 122], dtype=np.uint8)
-top_left = np.uint8(118)
 
-pred = predict_intra_4x4(
-    mode=Intra4x4Mode.DC,
-    top=top, left=left, top_left=top_left,
-    top_available=True, left_available=True,
-)
-# pred is a (4, 4) uint8 array
+# DC prediction -- averages all 8 neighbors
+pred = predict_intra_4x4(mode=Intra4x4Mode.DC, top=top, left=left,
+                         top_available=True, left_available=True)
+# pred shape: (4, 4), dtype: uint8
 ```
 
 ## Spec Compliance Notes
 
-- For Intra_8x8, the Horizontal-Up (HU) prediction formula uses `zHU = x + 2*y`, not `y + 2*x`. The Horizontal-Down (HD) and Vertical-Right (VR) formulas for `zHD < -1` / `zVR < -1` use offsets `x-2y-3, x-2y-2, x-2y-1` referencing the corner pixel M at index -1.
-- When top neighbors are unavailable but left neighbors are available for Intra_8x8, the substitution `top = left[0]` and `top_left = left[0]` must happen before the low-pass filter, and the filter must be applied to the replicated values (not skipped).
-- The default pixel value of 128 is used when no neighbors are available for DC prediction, following the convention that 128 is the midpoint of the 8-bit range.
+- **HU formula:** `zHU = x + 2*y`, not `y + 2*x` (Section 8.3.2.2.9).
+- **HD/VR for zHD < -1:** indices are `x-2y-3, x-2y-2, x-2y-1`, referencing corner pixel M at index -1.
+- **8x8 substitution before filtering:** when top is unavailable, `top = left[0]` and `top_left = left[0]` must be set before the lowpass filter runs on those replicated values.
+- **Scaling lists default:** when both SPS and PPS scaling flags are 0, use flat matrices (all 16s), not Default_8x8_Intra.

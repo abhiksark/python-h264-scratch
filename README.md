@@ -59,7 +59,8 @@ Verified against ffmpeg on real internet videos — zero pixel difference across
 
 ## Decoding pipeline
 
-Each module maps to a stage of the H.264 spec:
+Each module maps to a stage of the H.264 spec. The full pipeline, from
+container bytes to RGB output:
 
 ```mermaid
 flowchart LR
@@ -96,6 +97,46 @@ flowchart LR
     style I fill:#2d2d3d,stroke:#555,color:#ccc
     style J fill:#2d2d3d,stroke:#555,color:#ccc
     style K fill:#2d2d3d,stroke:#555,color:#ccc
+```
+
+### How a frame is decoded
+
+The decoder processes one NAL unit at a time. SPS/PPS NALs are stored. Slice
+NALs trigger the full macroblock-by-macroblock decode loop. After all MBs in a
+picture are decoded, the deblocking filter runs across the entire frame, and
+the result is either stored in the decoded picture buffer (for reference frames)
+or output in display order.
+
+```mermaid
+flowchart TD
+    NAL["NAL unit stream"] --> DISP{NAL type?}
+    DISP -->|SPS/PPS| STORE["Store parameter sets"]
+    DISP -->|Slice| SHDR["Parse slice header"]
+    STORE --> NAL
+
+    SHDR --> ENT{Entropy mode?}
+    ENT -->|CAVLC| CAVLC["CAVLC MB loop"]
+    ENT -->|CABAC| CABAC["Init 460 contexts + CABAC MB loop"]
+
+    CAVLC --> STYPE{Slice type?}
+    CABAC --> STYPE
+    STYPE -->|I-slice| IMB["Intra prediction + residual"]
+    STYPE -->|P-slice| PMB["Motion compensation from L0 + residual"]
+    STYPE -->|B-slice| BMB["Bi-prediction from L0/L1 + residual"]
+
+    IMB --> FRAME["Frame buffer"]
+    PMB --> FRAME
+    BMB --> FRAME
+    FRAME --> DBLK["Deblocking filter"]
+    DBLK --> DPB{"Reference\nframe?"}
+    DPB -->|Yes| STORE_DPB["Add to DPB"]
+    DPB --> REORDER["Reorder by POC"]
+    STORE_DPB --> REORDER
+    REORDER --> OUTPUT["Output DecodedFrame"]
+
+    style SHDR fill:#1a3a1a,stroke:#4a4,color:#cfc
+    style STYPE fill:#3a2a1a,stroke:#a84,color:#fda
+    style OUTPUT fill:#1a2a3a,stroke:#48a,color:#adf
 ```
 
 ### How a macroblock is decoded
@@ -159,6 +200,27 @@ h264-decoder/
 └── docs/            # Architecture docs, spec mapping
 ```
 
+## Module overview
+
+Each module corresponds to a stage in the H.264 spec. They are listed here in
+pipeline order, from input to output.
+
+| Module | Spec Section | What it does |
+|--------|-------------|--------------|
+| [`container/`](container/) | ISO 14496-12/15 | MP4 demuxer: parses box hierarchy, extracts NALs from `avcC`, converts AVCC length-prefixed format to Annex B start codes |
+| [`bitstream/`](bitstream/) | Annex B, Sec 7.2 | NAL unit framing (start code detection, emulation prevention byte removal) and `BitReader` for exp-Golomb / fixed-width reads |
+| [`parameters/`](parameters/) | Sec 7.3.2 | SPS and PPS parsing: profile/level, picture dimensions, reference frame limits, scaling lists, VUI |
+| [`slice/`](slice/) | Sec 7.3.3 | Slice header parsing: slice type, QP, reference list modification, weighted prediction tables, MMCO commands |
+| [`entropy/`](entropy/) | Sec 9 | CAVLC (run-level VLC tables) and CABAC (binary arithmetic decoder with 460 context models, binarization, context derivation) |
+| [`dequant/`](dequant/) | Sec 8.5.12 | Inverse quantization with position-dependent scaling matrices, 4x4 and 8x8 scaling list support for High Profile |
+| [`transform/`](transform/) | Sec 8.5.12 | Integer 4x4 and 8x8 inverse DCT (butterfly), 4x4 Hadamard (luma DC, chroma DC) |
+| [`intra/`](intra/) | Sec 8.3.1-8.3.3 | Intra prediction: 4x4 (9 modes), 8x8 (9 modes with reference sample filtering), 16x16 (4 modes), chroma (4 modes) |
+| [`inter/`](inter/) | Sec 8.4 | Motion vector prediction (median), motion compensation (6-tap quarter-pel interpolation), B-frame bi-prediction, weighted prediction, direct mode |
+| [`reconstruct/`](reconstruct/) | Sec 8.5 | Macroblock assembly: prediction + dequant + transform + clip, for all MB types |
+| [`deblock/`](deblock/) | Sec 8.7 | In-loop deblocking filter: boundary strength calculation (bS 0-4), adaptive 4-tap / 3-tap filtering on block edges |
+| [`color/`](color/) | Annex E | YCbCr to RGB conversion: BT.601 and BT.709 matrices, 4:2:0/4:2:2/4:4:4 chroma upsampling |
+| [`decoder/`](decoder/) | Sec 7-8 | Top-level orchestration: NAL dispatch, I/P/B slice loops, DPB management, MMCO, POC calculation, frame reordering, error concealment |
+
 ## Setup
 
 ```bash
@@ -201,14 +263,41 @@ ffmpeg -skip_loop_filter all -i test_data/jellyfish_360_10s.mp4 \
 
 ## How it works
 
-This decoder implements every stage of H.264 decoding from the spec (ITU-T H.264 / ISO 14496-10):
+This decoder implements every stage of H.264 decoding from the spec (ITU-T
+H.264 / ISO 14496-10). Here is what each stage does and why it matters.
 
-- **Entropy decoding**: Both CAVLC (variable-length codes) and CABAC (context-adaptive binary arithmetic coding) with full context modeling
-- **Inverse quantization**: Position-dependent scaling with 8x8 scaling list support for High Profile
-- **Inverse transform**: Integer 4x4 and 8x8 butterfly transforms matching the JM reference decoder exactly
-- **Intra prediction**: All 9 modes for 4x4 and 8x8 blocks with lowpass reference sample filtering
-- **Inter prediction**: Motion compensation with quarter-pixel interpolation, B-frame bi-prediction, weighted prediction, and direct mode
-- **Deblocking filter**: Boundary strength calculation and adaptive filtering
+**Entropy decoding.** The bitstream is entropy-coded to reduce size. This
+decoder supports both CAVLC (context-adaptive variable-length codes, used in
+Baseline) and CABAC (context-adaptive binary arithmetic coding, used in
+Main/High). CABAC maintains 460 context models that adapt based on previously
+decoded symbols, achieving roughly 10% better compression than CAVLC.
+
+**Inverse quantization.** The encoder discards information by dividing
+transform coefficients by a quantization step size. The decoder multiplies back
+by the step size (scaled by position-dependent weighting matrices). High Profile
+adds 8x8 scaling lists for finer quality control.
+
+**Inverse transform.** H.264 uses integer approximations of the DCT, not
+floating-point. The 4x4 and 8x8 butterfly transforms here match the JM
+reference decoder exactly -- bit-identical output on every input. Hadamard
+transforms handle DC coefficients for luma 16x16 and chroma.
+
+**Intra prediction.** I-macroblocks predict pixel values from already-decoded
+neighbors in the same frame. Nine directional modes for 4x4 and 8x8 blocks
+(vertical, horizontal, diagonal down-left, etc.) plus four 16x16 modes. 8x8
+mode adds lowpass reference sample filtering to reduce prediction noise.
+
+**Inter prediction.** P and B macroblocks predict from previously decoded
+reference frames stored in the DPB. Motion vectors are predicted from neighbors
+(median prediction) and refined per-block. Quarter-pixel interpolation uses a
+6-tap FIR filter. B-frames add bi-prediction (weighted average of L0 and L1
+references), weighted prediction, and direct mode (MV derived from co-located
+blocks in the reference).
+
+**Deblocking filter.** Block-based coding creates visible edges at block
+boundaries. The in-loop deblocking filter smooths these edges adaptively:
+boundary strength (bS) ranges from 0 (no filtering) to 4 (strong filtering for
+intra edges), and the filter strength adapts to local QP and pixel gradient.
 
 ## Performance
 

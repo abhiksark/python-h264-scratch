@@ -1,93 +1,134 @@
-# Entropy
+# Entropy Decoding
 
-Implements both CAVLC (Context-Adaptive Variable-Length Coding) and CABAC (Context-Adaptive Binary Arithmetic Coding) entropy decoders for H.264 transform coefficients and syntax elements.
+Reverses the final compression layer in H.264. After prediction and transform,
+coefficients and syntax elements are entropy-coded using CAVLC or CABAC. This
+module decodes them back to integer arrays.
 
-**H.264 Spec Reference:** Section 9.2 (CAVLC), Section 9.3 (CABAC)
-
-## What It Does
-
-Entropy coding is the final layer of compression in H.264. After prediction and transform, the resulting coefficient values and syntax elements are entropy-coded using either CAVLC (Baseline/Main profile) or CABAC (Main/High profile). This module reverses that encoding to recover the original integer values.
-
-CAVLC encodes transform coefficients using context-dependent VLC tables. For each 4x4 block, it decodes five elements in order: `coeff_token` (giving TotalCoeff and TrailingOnes), trailing ones sign bits, level values (coefficient magnitudes), `total_zeros`, and `run_before` values (distributing zeros between coefficients). The VLC table selection depends on `nC`, the average of non-zero counts from neighboring blocks.
-
-CABAC is a more sophisticated binary arithmetic coder that achieves 10-15% better compression. It maintains 460 context models, each tracking a probability state (0-63) and a most probable symbol (MPS). Every syntax element is binarized into a sequence of binary decisions, each decoded against the appropriate context. The arithmetic engine maintains a range `codIRange` (kept in [256, 510] by renormalization) and an offset `codIOffset` read from the stream. At the macroblock level, CABAC decodes mb_type, sub_mb_type, motion vectors, reference indices, CBP, QP delta, and coefficient blocks.
+**H.264 Spec:** Section 9.2 (CAVLC), Section 9.3 (CABAC)
 
 ## Pipeline Position
 
-```mermaid
-flowchart LR
-    BS[bitstream] --> SL[slice]
-    SL --> ENT["**entropy**"]
-    ENT --> DQ[dequant]
-    ENT --> DEC[decoder]
-    style ENT fill:#f9a825,stroke:#333,color:#000
+```
+bitstream --> parameters --> slice --> [ENTROPY] --> dequant --> transform
+                                          |
+                                          +--> decoder (syntax elements)
 ```
 
-## Architecture
+## CAVLC vs CABAC
+
+```
+                CAVLC                          CABAC
+  +---------------------------------+  +---------------------------------+
+  | Variable-length code tables     |  | Binary arithmetic coding        |
+  | Selected by neighbor context    |  | 460 adaptive context models     |
+  | Baseline / Main profile         |  | Main / High profile             |
+  | ~10-15% larger bitstreams       |  | Best compression ratio          |
+  | entropy_coding_mode_flag = 0    |  | entropy_coding_mode_flag = 1    |
+  +---------------------------------+  +---------------------------------+
+```
+
+## CAVLC: Five-Step Block Decoding
+
+```mermaid
+flowchart LR
+    CT["1. coeff_token<br/>(TC, T1)"] --> SN["2. T1 signs"]
+    SN --> LV["3. levels<br/>(adaptive VLC)"]
+    LV --> TZ["4. total_zeros"]
+    TZ --> RB["5. run_before"]
+    RB --> BLK["4x4 array"]
+```
+
+Context **nC** selects the VLC table: `nC = (nA + nB + 1) >> 1` where nA/nB
+are left/top neighbor non-zero counts. Range -1 (chroma DC) through 8+ (fixed).
+
+### Worked Example
+
+```
+Step 1: coeff_token --> TotalCoeff=4, TrailingOnes=3
+Step 2: T1 signs    --> 3 bits: 1,0,0 -> reversed: [+1, -1, -1]
+Step 3: Levels      --> 1 non-T1 level: prefix=0, suffix=0
+        level_code=0, first-level +1 adjust --> level=+3
+Step 4: total_zeros --> VLC with TC=4: total_zeros=3
+Step 5: run_before  --> runs [1,0,1,1] distribute 3 zeros
+
+Result:  pos [0] [1] [2] [3] [4] [5] [6] ...
+              3   0  -1   0  -1   0  +1    (zeros to pos 15)
+```
+
+The suffix_length adapts: starts at 0 (or 1 when TC>10 and T1<3), increases
+when decoded levels exceed `3 << (suffix_length - 1)`.
+
+## CABAC: Arithmetic Coding Engine
 
 ```mermaid
 flowchart TD
-    subgraph CAVLC
-        CT[decode_coeff_token] --> T1[decode_trailing_ones_signs]
-        T1 --> LV[decode_levels]
-        LV --> TZ[decode_total_zeros]
-        TZ --> RB[decode_run_before]
-        RB --> BLK["CAVLCBlock"]
-    end
-    subgraph CABAC
-        AD["CABACDecoder"] --> CTX["CABACContext models"]
-        CTX --> SYN["cabac_syntax.py"]
-        SYN --> MBD["cabac_macroblock.py"]
-        SYN --> RES["cabac_residual.py"]
-    end
-    BLK --> COEFF[Coefficient Arrays]
-    RES --> COEFF
+    BS[Bitstream] --> AE["Arithmetic Engine<br/>codIRange / codIOffset"]
+    AE --> DEC["decode_decision(ctx)"]
+    AE --> BYP["decode_bypass()"]
+    AE --> TRM["decode_terminate()"]
+    DEC --> CTX["460 Contexts<br/>pStateIdx 0-63, valMPS"]
+    CTX -->|"transition"| CTX
 ```
+
+The engine partitions an interval into MPS/LPS sub-ranges:
+
+```
+  qIdx = (codIRange >> 6) & 3
+  rLPS = rangeTabLPS[pStateIdx][qIdx]
+  codIRange -= rLPS                        -- MPS gets upper portion
+
+  if codIOffset >= codIRange:              -- LPS decoded
+      codIOffset -= codIRange;  codIRange = rLPS
+      bin = 1 - valMPS
+      pStateIdx = transIdxLPS[pStateIdx]
+  else:                                    -- MPS decoded
+      bin = valMPS
+      pStateIdx = transIdxMPS[pStateIdx]
+
+  while codIRange < 256:                   -- renormalize to [256,510]
+      codIRange <<= 1
+      codIOffset = (codIOffset << 1) | read_bit()
+```
+
+Context init per-slice: `preCtxState = Clip3(1, 126, ((m*QP)>>4) + n)`.
+
+### CABAC Residual: Significance Map
+
+Coefficients use a two-pass decode -- scan for positions, then read levels:
+
+```
+  Pass 1: significant_coeff_flag[i] + last_significant_coeff_flag[i]
+  Pass 2: coeff_abs_level_minus1 (context+bypass) + coeff_sign_flag (bypass)
+```
+
+Binarization schemes: unary, truncated unary, UEGk (exp-golomb), fixed-length.
 
 ## Key Files
 
-| File | Lines | Description |
-|------|-------|-------------|
-| `cavlc.py` | 764 | Complete CAVLC decoder: coeff_token, levels, total_zeros, run_before, block assembly with zigzag reordering |
-| `cabac_arith.py` | 238 | Binary arithmetic decoder engine: `decode_decision`, `decode_bypass`, `decode_terminate`, renormalization |
-| `cabac_context.py` | 2066 | 460 CABAC context models: initialization from (m,n) tables, context index constants, state transitions |
-| `cabac_macroblock.py` | 2258 | MB-level CABAC: mb_type, sub_mb_type, motion vectors, ref_idx, CBP, intra modes, QP delta, residual dispatch |
-| `cabac_residual.py` | 857 | CABAC coefficient decoding: significance map, last coefficient flag, absolute levels, sign bypass bins |
-| `cabac_syntax.py` | 809 | Low-level CABAC syntax elements: binarization schemes, context index derivation for each element |
-| `cabac_binarize.py` | 395 | Binarization helpers: unary, truncated unary, fixed-length, and UEG (Unary/Exp-Golomb) schemes |
-| `tables.py` | 610 | VLC lookup tables for CAVLC: coeff_token tables (4 nC ranges + chroma DC), total_zeros, run_before, zigzag scans |
+| File | Purpose |
+|------|---------|
+| `cavlc.py` | CAVLC decoder: coeff_token, levels, total_zeros, run_before, zigzag |
+| `cabac_arith.py` | Arithmetic engine: decision, bypass, terminate, renormalization |
+| `cabac_context.py` | 460 context models with (m,n) initialization tables |
+| `cabac_binarize.py` | Binarization: unary, truncated unary, fixed-length, UEGk |
+| `cabac_syntax.py` | Syntax elements: mb_type, MVD, ref_idx, CBP, QP delta |
+| `cabac_macroblock.py` | MB-level CABAC: dispatches intra/inter decoding |
+| `cabac_residual.py` | Coefficient decoding: significance map, levels, signs |
+| `tables.py` | VLC lookup tables and zigzag scan patterns (4x4, 2x2, 8x8) |
 
-## Key Concepts
-
-**Context nC.** CAVLC selects its `coeff_token` table based on `nC = (nA + nB + 1) >> 1`, where nA and nB are non-zero coefficient counts from left and top neighbor blocks. For chroma DC blocks, `nC = -1` selects a special table.
-
-**Exp-Golomb Level Coding.** CAVLC levels use an adaptive VLC where `suffix_length` starts at 0 (or 1 for blocks with >10 coefficients) and increases as larger levels are encountered. The first non-trailing-one level has its magnitude incremented by 1 when `trailing_ones < 3`.
-
-**CABAC Arithmetic Engine.** The decoder partitions the probability interval into MPS and LPS ranges using `rangeTabLPS[pStateIdx][qCodIRangeIdx]`. After each decision, the context state transitions via `transIdxMPS` or `transIdxLPS` tables, adapting to the local statistics.
-
-**CABAC Context Initialization.** Each of the 460 contexts is initialized from per-slice-type (m, n) parameter pairs:
-```
-preCtxState = Clip3(1, 126, ((m * SliceQP) >> 4) + n)
-valMPS = 1 if preCtxState >= 64 else 0
-pStateIdx = preCtxState - 64 if valMPS else 63 - preCtxState
-```
-
-**Significance Map.** CABAC coefficient decoding uses a two-pass approach: first decode which scan positions are significant (`significant_coeff_flag`) and which is the last (`last_significant_coeff_flag`), then decode magnitudes and signs for the significant positions.
-
-## Example
+## API
 
 ```python
-from bitstream import BitReader
-from entropy import decode_residual_4x4, calculate_nC
+from entropy.cavlc import decode_residual_4x4, decode_chroma_dc, calculate_nC
 
-reader = BitReader(block_rbsp_data)
-nC = calculate_nC(nA=3, nB=2)  # Average of neighbor non-zero counts
-coeffs_4x4 = decode_residual_4x4(reader, nC)
-# coeffs_4x4 is a (4, 4) int32 array in raster order
+nC = calculate_nC(nA=3, nB=2)           # neighbor context
+coeffs = decode_residual_4x4(reader, nC) # (4,4) int32
+chroma = decode_chroma_dc(reader)        # (2,2) int32
 ```
 
 ## Spec Compliance Notes
 
-- CABAC `ref_idx` uses standard unary binarization (always with a trailing 0 bin), not truncated unary. The context increment is `condTermFlagA + 2 * condTermFlagB`, not the sum. These are frequently confused.
-- CABAC MVD bin0 context selection depends on the sum `|mvdA| + |mvdB|` from neighbors, mapped to context increments {<3:0, 3-32:1, >32:2}. Per-4x4-block MVDs must be stored in `mb_mvds_l0` for correct cross-MB neighbor lookups.
-- The `_compute_level_code` function implements the escape path for `level_prefix >= 15`: `level_code += (1 << (level_prefix - 3)) - 4096`. This is essential for decoding large coefficient values in high-quality streams.
+- CABAC `ref_idx`: standard unary (trailing 0), not truncated unary.
+  Context increment: `condTermFlagA + 2*condTermFlagB`.
+- CABAC MVD bin0 context: `|mvdA|+|mvdB|` mapped to {<3:0, 3-32:1, >32:2}.
+- CAVLC level escape: `level_code += (1<<(level_prefix-3)) - 4096` for prefix>=15.

@@ -1,72 +1,132 @@
-# Container
+# container/
 
-Parses MP4 (ISO 14496-12) container files to extract H.264 NAL units from video tracks. Converts from AVCC (length-prefixed) format to Annex B (start-code-delimited) format for the decoder pipeline.
+MP4 (ISO 14496-12) container demuxer. Parses the box hierarchy of MP4 files to
+extract H.264 NAL units from video tracks and converts them from AVCC
+(length-prefixed) format to Annex B (start-code-delimited) format for the
+decoder pipeline.
 
 **ISO 14496-12 (ISOBMFF), ISO 14496-15 (AVCC)**
 
-## What It Does
+## MP4 Box Hierarchy
 
-Real-world H.264 video is almost never distributed as raw Annex B bitstreams. Instead, it is packaged inside container formats like MP4 (MPEG-4 Part 12), MKV, or AVI. The MP4 container wraps H.264 NAL units in a box-based structure where SPS and PPS are stored in a special `avcC` (AVC Configuration) box, and each video sample contains length-prefixed NAL units rather than start-code-delimited ones.
+An MP4 file is a tree of nested boxes (also called atoms). Each box has a
+4-byte size, a 4-char type code, and payload data. Container boxes hold
+children; leaf boxes hold raw data. Here is the hierarchy this parser
+traverses for a typical H.264 video:
 
-This module parses the MP4 box hierarchy to locate the video track, extract the AVC decoder configuration (SPS/PPS from `avcC`), read the sample table (`stbl`) to find each frame's byte range and timing, and convert the length-prefixed NAL units to Annex B format by replacing the length prefix with `0x00000001` start codes. The result is a standard Annex B bitstream that the rest of the decoder pipeline can process.
+```
+MP4 File
++-- ftyp              File type and compatibility
++-- moov              Movie metadata (container)
+|   +-- mvhd          Movie header (timescale, duration)
+|   +-- trak          Track (container) -------- one per stream
+|   |   +-- tkhd      Track header
+|   |   +-- mdia      Media information (container)
+|   |   |   +-- mdhd  Media header (timescale)
+|   |   |   +-- hdlr  Handler: "vide" = video track  <--- track selection
+|   |   |   +-- minf  Media info (container)
+|   |   |       +-- stbl  Sample table (container)
+|   |   |           +-- stsd  Sample description
+|   |   |           |   +-- avc1  H.264 sample entry
+|   |   |           |       +-- avcC  SPS + PPS + NAL length size
+|   |   |           +-- stsz  Sample sizes  (bytes per frame)
+|   |   |           +-- stsc  Sample-to-chunk mapping
+|   |   |           +-- stco  Chunk offsets (32-bit)
+|   |   |           +-- co64  Chunk offsets (64-bit, large files)
+|   +-- trak          (audio track, subtitles, etc.)
++-- mdat              Media data (raw frame bytes live here)
+```
 
-The parser handles both 32-bit and 64-bit box sizes, navigates container boxes (moov, trak, mdia, minf, stbl), and processes the sample-to-chunk (`stsc`), sample size (`stsz`), and chunk offset (`stco`/`co64`) tables to locate each sample's raw bytes in the file.
+## The avcC Box
+
+In Annex B streams, SPS and PPS are inline NAL units with start codes. In MP4,
+they are stored out-of-band in the `avcC` (AVC Decoder Configuration Record)
+box inside the sample description:
+
+```
+avcC layout (ISO 14496-15 Section 5.2.4.1)
++--------+---------------------------------------------+
+| Byte 0 | configurationVersion = 1                    |
+| Byte 1 | AVCProfileIndication (e.g. 66=Baseline)     |
+| Byte 2 | profile_compatibility                       |
+| Byte 3 | AVCLevelIndication (e.g. 30 = Level 3.0)    |
+| Byte 4 | xxxxxx11 --> nal_length_size = (low 2 bits)+1|
+| Byte 5 | xxx00001 --> numOfSPS = low 5 bits          |
+| Bytes.. | [sps_length (2B), sps_nal_unit (N B)] x num |
+| Next   | numOfPPS                                     |
+| Bytes.. | [pps_length (2B), pps_nal_unit (N B)] x num |
++--------+---------------------------------------------+
+```
+
+The `nal_length_size` (typically 4) tells the parser how many bytes prefix each
+NAL unit in the sample data. This is critical -- some encoders use 1 or 2 byte
+lengths instead of 4.
+
+## AVCC vs Annex B: NAL Unit Format
+
+```
+AVCC (MP4 samples):                  Annex B (raw .264 streams):
++--------+------------------+       +--+--+--+--+------------------+
+| LEN(4) | NAL unit bytes   |       | 00 00 00 01 | NAL unit bytes |
++--------+------------------+       +--+--+--+--+------------------+
+Length prefix (big-endian)           Start code (0x00000001)
+```
+
+The conversion replaces each length prefix with the 4-byte start code.
 
 ## Pipeline Position
 
 ```mermaid
 flowchart LR
-    MP4["MP4 File"] --> CON["**container**"]
-    CON --> BS[bitstream]
-    BS --> P[parameters]
-    BS --> DEC[decoder]
+    MP4["MP4 File"] --> CON["container/"]
+    CON --> BS["bitstream/"]
+    BS --> DEC["decoder/"]
     style CON fill:#f9a825,stroke:#333,color:#000
 ```
 
-## Architecture
+## Data Flow
 
 ```mermaid
 flowchart TD
-    FILE[MP4 File Bytes] --> PB[parse_boxes]
-    PB --> MOOV[moov box]
-    MOOV --> TRAK[trak box]
-    TRAK --> MDIA[mdia box]
-    MDIA --> STBL[stbl box]
-    STBL --> STSC[stsc: sample-to-chunk]
-    STBL --> STSZ[stsz: sample sizes]
-    STBL --> STCO["stco/co64: chunk offsets"]
-    STBL --> STSD["stsd: sample description"]
-    STSD --> AVCC["avcC: SPS + PPS"]
-    AVCC --> ANNEXB["Convert to Annex B"]
-    STSC --> LOC["Locate sample bytes"]
-    STSZ --> LOC
+    FILE["MP4 file bytes"] --> PB["parse_boxes()"]
+    PB --> MOOV["find moov box"]
+    MOOV --> TRAK["find trak with hdlr='vide'"]
+    TRAK --> STSD["stsd -> avc1 -> avcC"]
+    TRAK --> STBL["stbl sample tables"]
+    STSD --> AVCC["parse_avcc() -> SPS, PPS, nal_length_size"]
+    STBL --> STSZ["parse_stsz() -> sample sizes"]
+    STBL --> STSC["parse_stsc() -> sample-to-chunk map"]
+    STBL --> STCO["parse_stco() -> chunk offsets"]
+    STSZ --> LOC["_compute_sample_offsets()"]
+    STSC --> LOC
     STCO --> LOC
-    LOC --> NALS["Length-prefixed NALs"]
-    NALS --> ANNEXB
+    LOC --> READ["Read sample bytes from mdat"]
+    READ --> CONV["length_prefixed_to_annex_b()"]
+    AVCC --> HDR["Emit SPS/PPS with start codes"]
+    HDR --> OUT["Annex B bitstream"]
+    CONV --> OUT
 ```
 
 ## Key Files
 
 | File | Lines | Description |
 |------|-------|-------------|
-| `mp4.py` | 529 | Complete MP4 parser: `Box` dataclass, recursive box parsing, `avcC` configuration extraction, sample table processing, AVCC-to-Annex-B conversion |
+| `mp4.py` | 529 | Complete MP4 parser: `Box` dataclass, recursive box parsing, `avcC` extraction, sample table processing, AVCC-to-Annex-B conversion |
 
-## Key Concepts
+## API Reference
 
-**Box Structure.** MP4 files are organized as a hierarchy of boxes (also called atoms). Each box has a 4-byte size, 4-byte type identifier (e.g., `moov`, `trak`, `stbl`), and payload data. Container boxes (like `moov` and `trak`) contain child boxes. The parser recursively descends into known container types.
-
-**avcC Configuration.** The AVC Decoder Configuration Record contains the NAL unit length size (minus 1), SPS NAL unit(s), and PPS NAL unit(s). These parameter sets are not embedded in the sample data -- they must be extracted from `avcC` and prepended to the bitstream. The `nal_length_size` (typically 4 bytes) tells the parser how many bytes prefix each NAL unit in sample data.
-
-**Sample Table.** Three interconnected tables locate each video frame:
-- `stsz` lists the byte size of each sample
-- `stsc` maps sample ranges to chunks (contiguous groups)
-- `stco` (or `co64` for large files) gives the file offset of each chunk
-
-Together, these allow computing the exact byte range for any sample.
-
-**AVCC to Annex B.** In the container, each NAL unit is prefixed by its byte length (typically 4 bytes, big-endian). The conversion replaces each length prefix with the standard 4-byte start code `0x00000001`, producing an Annex B stream that `extract_nal_units` can parse.
-
-**Track Selection.** An MP4 file can contain multiple tracks (video, audio, subtitles). The video track is identified by the `hdlr` box with handler type `vide`, or by the presence of `avc1`/`avc3` codec entries in the sample description.
+| Function | Purpose |
+|----------|---------|
+| `extract_h264_from_mp4(mp4_data)` | Top-level entry: returns Annex B bytes from complete MP4 |
+| `parse_boxes(data)` | Parse all top-level boxes in a byte buffer |
+| `parse_box(data, offset)` | Parse a single box at a given offset |
+| `find_box(boxes, type)` | Find first box of a given type in a list |
+| `find_box_recursive(boxes, type)` | Depth-first recursive box search |
+| `parse_avcc(data)` | Parse AVC Decoder Configuration Record |
+| `length_prefixed_to_annex_b(data, nal_length_size)` | Convert length-prefixed NALs to Annex B |
+| `parse_stsz(data)` | Parse sample size table |
+| `parse_stsc(data)` | Parse sample-to-chunk table |
+| `parse_stco(data)` / `parse_co64(data)` | Parse chunk offset tables (32/64-bit) |
 
 ## Example
 
@@ -76,7 +136,7 @@ from container.mp4 import extract_h264_from_mp4
 with open("video.mp4", "rb") as f:
     mp4_data = f.read()
 
-# Parse MP4 boxes, extract SPS/PPS from avcC, convert to Annex B
+# Parse MP4 boxes, extract SPS/PPS from avcC, convert all samples to Annex B
 annexb_stream = extract_h264_from_mp4(mp4_data)
 
 # Now decode with the standard pipeline
@@ -86,6 +146,6 @@ nals = extract_nal_units(annexb_stream)
 
 ## Spec Compliance Notes
 
-- The `avcC` box version 1 is supported, which covers the vast majority of H.264 MP4 files. The NAL unit length field size is read from `avcC` (typically 4 bytes) rather than hardcoded, as some encoders use 1 or 2 byte lengths.
-- Extended box sizes (64-bit) are handled for files larger than 4 GB, where the initial 32-bit size field is set to 1 and the actual size follows in the next 8 bytes. Box size 0 indicates the box extends to the end of the file.
-- The parser handles both `stco` (32-bit offsets) and `co64` (64-bit offsets) chunk offset tables, which is necessary for large files where chunk offsets exceed 4 GB.
+- `avcC` version 1 with variable NAL length sizes (1, 2, or 4 bytes).
+- Extended 64-bit box sizes for files larger than 4 GB.
+- Both `stco` (32-bit) and `co64` (64-bit) chunk offset tables.

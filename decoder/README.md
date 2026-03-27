@@ -1,83 +1,135 @@
-# Decoder
+# decoder/
 
-The main orchestration module that drives the complete H.264 decoding pipeline. Takes a raw bitstream or MP4 file and produces decoded YCbCr/RGB frames by coordinating all other modules: NAL parsing, parameter sets, slice headers, entropy decoding, prediction, transform, reconstruction, deblocking, and color conversion.
+Main orchestration module that drives the complete H.264 decoding pipeline.
+Takes a raw Annex B bitstream or MP4 file and produces decoded YCbCr/RGB
+frames by coordinating all other modules: NAL parsing, parameter sets, slice
+headers, entropy decoding, prediction, transform, reconstruction, deblocking,
+and color conversion.
 
-**H.264 Spec Reference:** Section 7 (Syntax and semantics), Section 8 (Decoding process)
+**H.264 Spec Reference: Section 7 (Syntax), Section 8 (Decoding process)**
 
-## What It Does
+## The Main Decode Loop
 
-This module is the top-level entry point for decoding. It maintains all decoder state -- parameter sets, reference picture buffer, picture order count, motion vector caches, non-zero coefficient counts -- and processes each NAL unit in sequence. For SPS and PPS NAL units, it parses and stores the parameter sets. For slice NAL units, it parses the slice header, initializes per-slice state, and then iterates over each macroblock in the slice, dispatching to the appropriate reconstruction path.
-
-For I-slices, each macroblock is sent to the reconstruct module which handles intra prediction and residual decoding. For P-slices, the decoder parses the macroblock type and partition structure, predicts motion vectors, performs motion compensation from reference frames, decodes residuals, and combines prediction with residual. For B-slices, the decoder additionally handles bi-prediction, direct mode MV derivation, and dual reference lists.
-
-CABAC and CAVLC entropy coding are both supported: CABAC slices initialize the arithmetic decoder and context models at slice start, then decode each macroblock's syntax elements through the CABAC machinery. After all macroblocks in a picture are decoded, the deblocking filter is applied, and the result is stored in the reference picture buffer (for reference frames) and output for display. POC calculation determines the correct display order.
-
-## Pipeline Position
-
-```mermaid
-flowchart TD
-    INPUT["Raw .264 / MP4"] --> DEC["**decoder**"]
-    DEC --> BS[bitstream]
-    DEC --> PARAMS[parameters]
-    DEC --> SL[slice]
-    DEC --> ENT[entropy]
-    DEC --> DQ[dequant]
-    DEC --> TF[transform]
-    DEC --> INTRA[intra]
-    DEC --> INTER[inter]
-    DEC --> REC[reconstruct]
-    DEC --> DB[deblock]
-    DEC --> COL[color]
-    DEC --> OUT["Decoded Frames"]
-    style DEC fill:#f9a825,stroke:#333,color:#000
-```
-
-## Architecture
+The decoder processes one NAL unit at a time. SPS and PPS NALs are stored.
+Slice NALs trigger the full per-macroblock decode pipeline. After all MBs in a
+picture are decoded, the deblocking filter runs, and the result is either
+stored in the decoded picture buffer (reference frames) or output for display.
 
 ```mermaid
 flowchart TD
-    NAL["NAL Unit Stream"] --> DISP{NAL Type?}
-    DISP -->|SPS/PPS| STORE["Store Parameters"]
-    DISP -->|Slice| SHDR["parse_slice_header"]
-    SHDR --> INIT["Init slice state"]
-    INIT --> MBLOOP["For each macroblock"]
-    MBLOOP --> ITYPE{Slice Type?}
-    ITYPE -->|I| IMB["decode_macroblock"]
-    ITYPE -->|P| PMB["_decode_p_macroblock"]
-    ITYPE -->|B| BMB["_decode_b_macroblock"]
-    ITYPE -->|CABAC| CMBI["_process_cabac_macroblock"]
-    IMB --> FRAME["Frame Buffer"]
-    PMB --> FRAME
-    BMB --> FRAME
-    CMBI --> FRAME
-    FRAME --> DBLK["Deblocking Filter"]
-    DBLK --> DPB["Reference Picture Buffer"]
-    DBLK --> OUTPUT["Output (display order)"]
+    INPUT["Input: .264 / .mp4 file"] --> DETECT{MP4?}
+    DETECT -->|Yes| DEMUX["container/ -> Annex B"]
+    DETECT -->|No| ITER["iter_nal_units()"]
+    DEMUX --> ITER
+
+    ITER --> DISP{NAL type?}
+    DISP -->|SPS| STORE_SPS["Store in sps_dict"]
+    DISP -->|PPS| STORE_PPS["Store in pps_dict"]
+    DISP -->|Slice| PARSE["Parse slice header"]
+    STORE_SPS --> DISP
+    STORE_PPS --> DISP
+
+    PARSE --> ALLOC["Allocate frame buffers + MV caches"]
+    ALLOC --> ENTROPY{Entropy mode?}
+    ENTROPY -->|CAVLC| CAVLC_LOOP["CAVLC MB loop"]
+    ENTROPY -->|CABAC| CABAC_INIT["Init arithmetic decoder + 460 contexts"]
+    CABAC_INIT --> CABAC_LOOP["CABAC MB loop"]
+
+    CAVLC_LOOP --> SLICE_TYPE{Slice type?}
+    CABAC_LOOP --> SLICE_TYPE
+    SLICE_TYPE -->|I| I_MB["decode_macroblock()"]
+    SLICE_TYPE -->|P| P_MB["_decode_p_macroblock()"]
+    SLICE_TYPE -->|B| B_MB["_decode_b_macroblock()"]
+
+    I_MB --> FRAME["Frame buffer"]
+    P_MB --> FRAME
+    B_MB --> FRAME
+
+    FRAME --> DEBLOCK["Deblocking filter"]
+    DEBLOCK --> DPB_CHECK{Reference frame?}
+    DPB_CHECK -->|Yes| DPB["Add to DPB"]
+    DPB_CHECK --> REORDER["Reorder by POC"]
+    DPB --> REORDER
+    REORDER --> OUTPUT["Yield DecodedFrame"]
 ```
+
+## Decode Order vs Display Order
+
+H.264 decodes frames in a different order than it displays them. B-frames
+reference both past and future frames, so the "future" reference must be
+decoded first. The Picture Order Count (POC) tells us the correct display
+sequence.
+
+```
+Decode order:   I0    P3    B1    B2    P6    B4    B5
+                 |     |     |     |     |     |     |
+Display order:  I0    B1    B2    P3    B4    B5    P6
+                POC=0  POC=2 POC=4 POC=6 POC=8 POC=10 POC=12
+```
+
+The `POCCalculator` (in `poc.py`) implements three POC types from the spec:
+- **Type 0**: Explicit LSB in each slice header, MSB derived with wraparound
+  detection. Most common in practice.
+- **Type 1**: Delta-based, uses a reference frame number cycle.
+- **Type 2**: Directly from `frame_num` -- no B-frames possible.
+
+At IDR boundaries, all POC state resets to zero.
+
+## Decoded Picture Buffer (DPB)
+
+The DPB stores reference frames that P and B macroblocks use for motion
+compensation. Frames enter the DPB after decoding and stay until evicted.
+
+```
+DPB management:
++-------+-------+-------+-------+
+| Slot0 | Slot1 | Slot2 | Slot3 |  max_num_ref_frames = 4
+| I0    | P3    | P6    |  ---  |
++-------+-------+-------+-------+
+     |       |       |
+     v       v       v
+  L0 list for P-slice: [P6, P3, I0]  (descending frame_num)
+  L0 list for B-slice: [P3, I0]      (POC <= current, descending)
+  L1 list for B-slice: [P6]          (POC > current, ascending)
+```
+
+**MMCO** (Memory Management Control Operations) from the slice header control
+the DPB explicitly:
+- Op 1: Mark a short-term reference as unused (by picNumX)
+- Op 3: Assign a long-term frame index
+- Op 5: Reset all references (acts like a mini-IDR)
+
+Critical ordering: MMCO must be applied BEFORE adding the new reference frame
+to the DPB. Without this, B-reference frames from earlier GOPs remain and
+evict needed I/P references.
 
 ## Key Files
 
 | File | Lines | Description |
 |------|-------|-------------|
-| `decoder.py` | 5349 | Main decoder class: NAL dispatch, I/P/B-slice macroblock loops, CAVLC and CABAC paths, frame assembly, reference management |
-| `poc.py` | 341 | Picture Order Count calculator: POC types 0, 1, and 2, stateful MSB/LSB tracking for display ordering |
-| `i8x8.py` | 1071 | I_8x8 macroblock decoder for High profile: 8x8 prediction, reference sample filtering, transform, scaling list integration |
-| `mmco.py` | 298 | Memory Management Control Operations: mark short-term unused, assign long-term index, reset, DPB size enforcement |
-| `error_concealment.py` | 496 | Error handling: concealment strategies (temporal, spatial, zero), corrupt MB detection, missing MB detection |
-| `frame.py` | 84 | `FrameAssembler` class: accumulates macroblock data into full Y/Cb/Cr frame buffers from slice-by-slice decoding |
-| `mbaff.py` | 484 | MBAFF (Macroblock-Adaptive Frame-Field) coding support structures |
+| `decoder.py` | ~5300 | Main `H264Decoder` class: NAL dispatch, I/P/B macroblock loops, CAVLC and CABAC paths, frame assembly, reference management |
+| `poc.py` | 341 | `POCCalculator`: POC types 0/1/2, stateful MSB/LSB tracking |
+| `mmco.py` | 298 | `MMCOProcessor`: mark unused, assign long-term, reset, DPB limits |
+| `i8x8.py` | 1071 | I_8x8 decoder for High Profile: 8x8 prediction, reference sample filtering, scaling lists |
+| `error_concealment.py` | 496 | Concealment strategies (temporal/spatial/zero), corrupt MB detection |
+| `frame.py` | 84 | `FrameAssembler`: accumulates MB data into full Y/Cb/Cr buffers |
+| `mbaff.py` | 484 | MBAFF (Macroblock-Adaptive Frame-Field) support structures |
 
-## Key Concepts
+## Error Handling
 
-**Decoder State.** The decoder maintains per-frame state including: the current SPS and PPS, a `ReferenceFrameBuffer` (DPB), two `MVCache` instances (L0 and L1), non-zero coefficient count arrays, per-MB QP tracking, and a `POCCalculator`. State is reset at IDR boundaries.
+Two modes controlled by `error_resilience`:
+- **Strict** (default): exceptions propagate immediately.
+- **Resilient**: errors logged, corrupt NALs skipped. Concealment strategies
+  (temporal copy from DPB, spatial interpolation, zero-fill) patch missing MBs.
 
-**POC Calculation.** Three modes determine display order. Type 0 (most common) tracks `pic_order_cnt_msb` and uses `pic_order_cnt_lsb` from the slice header with wraparound detection. At IDR boundaries, both MSB and LSB reset to 0. The POC drives reference list sorting for B-frames.
+## API Reference
 
-**MMCO Processing.** Memory Management Control Operations (decoded from the slice header) control the DPB. Operation 1 marks a short-term reference as unused. Operation 3 assigns a long-term frame index. Operation 5 resets all references (like a mini-IDR). MMCO must be applied before adding the new reference frame to the DPB.
-
-**CABAC Slice Flow.** For CABAC slices: (1) initialize the arithmetic decoder from the bitstream, (2) initialize 460 context models using slice type and QP, (3) for each MB, decode `mb_skip_flag`, `mb_type`, and all syntax elements via context-based arithmetic decoding, (4) dispatch to `_reconstruct_intra_mb_cabac` or `_reconstruct_inter_mb_cabac`.
-
-**Reference List Construction.** L0 for P-slices: short-term refs in descending frame_num order. L0 for B-slices: refs with POC <= current sorted by descending POC, then refs with POC > current by ascending POC. L1 for B-slices: the reverse ordering. Both lists can be modified by ref_pic_list_modification commands.
+| Method | Purpose |
+|--------|---------|
+| `H264Decoder.decode_file(path)` | Decode `.264` or `.mp4`, yields `DecodedFrame` |
+| `H264Decoder.decode_bytes(data)` | Decode Annex B bytes, yields `DecodedFrame` |
+| `DecodedFrame.to_rgb()` | Convert YCbCr frame to RGB `(H, W, 3)` uint8 |
+| `DecodedFrame.luma` / `.cb` / `.cr` | Raw YUV 4:2:0 planes |
 
 ## Example
 
@@ -86,17 +138,15 @@ from decoder.decoder import H264Decoder
 
 decoder = H264Decoder()
 
-with open("video.264", "rb") as f:
-    bitstream = f.read()
-
-for i, frame in enumerate(decoder.decode_bytes(bitstream)):
-    # frame.luma is (H, W) uint8
-    # frame.cb, frame.cr are (H/2, W/2) uint8
-    print(f"Frame {i}: {frame.luma.shape}, POC={frame.poc}")
+# Decode from MP4 (auto-detected) or raw Annex B
+for i, frame in enumerate(decoder.decode_file("video.mp4")):
+    print(f"Frame {i}: {frame.width}x{frame.height}, POC={frame.poc}")
+    rgb = frame.to_rgb()  # (H, W, 3) uint8 array
 ```
 
 ## Spec Compliance Notes
 
-- MMCO operations must be applied BEFORE adding the new reference frame to the DPB. Without this ordering, B-reference frames from earlier GOPs remain in the DPB and evict needed I/P references.
-- CABAC skip MBs must clear `mb_coeffs` (not just nz_counts and dc_cbf), otherwise stale coefficient values from previous MBs cause incorrect deblocking filter bS calculations.
-- CABAC intra MBs in P/B-slices must: (1) store canonical intra mb_type (subtract 5 for P-slice, 23 for B-slice offsets), (2) call `mv_cache.mark_intra()` so neighbors see ref=-1 rather than unavailable, (3) update nz_counts and QP. Missing any of these causes cascading errors in subsequent MBs.
+- MMCO applied BEFORE adding the new reference to the DPB.
+- CABAC skip MBs clear `mb_coeffs` to prevent stale deblocking bS values.
+- CABAC intra MBs in P/B-slices subtract type offset, mark MV cache intra.
+- Reference lists follow H.264 8.2.4 with modification command support.
